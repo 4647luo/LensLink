@@ -153,20 +153,6 @@ App 会自动比较版本号，有新版时显示「在 GitHub 下载最新安�
 
 ---
 
-## 从源码构建
-
-环境：JDK 21、Android SDK 34、Gradle 8.11.1。
-
-```bash
-./gradlew assembleDebug
-```
-
-产物：`app/build/outputs/apk/debug/app-debug.apk`。
-
-Android Studio 直接打开仓库根目录即可运行。
-
----
-
 ## 权限说明
 
 - **网络 / Wi‑Fi**：连接相机热点与 PTP。

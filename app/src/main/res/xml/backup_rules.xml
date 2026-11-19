@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- 普通设置可以恢复，但下面这些包含相机配对身份、已知相机 IP/蓝牙 MAC、
+         最近 GPS 位置和运行日志，不随云备份/换机迁移带走。 -->
+    <exclude domain="file" path="nikon-traces/" />
+    <exclude domain="file" path="nikon-photo-inbox/" />
+    <exclude domain="file" path="douk-logs/" />
+    <exclude domain="sharedpref" path="nikon_transport.xml" />
+    <exclude domain="sharedpref" path="douk_settings.xml" />
+    <exclude domain="sharedpref" path="douk_nikon_ble.xml" />
+</full-backup-content>

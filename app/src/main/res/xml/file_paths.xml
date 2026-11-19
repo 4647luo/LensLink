@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 只允许分享缓存目录里的诊断 ZIP -->
+    <cache-path name="diagnostics" path="diagnostics/" />
+</paths>

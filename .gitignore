@@ -1,0 +1,34 @@
+*.iml
+*.log
+.DS_Store
+Thumbs.db
+
+# Gradle and Android Studio output
+.gradle/
+**/build/
+/local.properties
+/.idea/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing material and local secrets
+*.jks
+*.keystore
+*.p12
+*.pfx
+keystore.properties
+signing.properties
+.env
+.env.*
+
+# Device-specific and diagnostic data
+/logs/
+/nikon-traces/
+/user-data/
+Nikon-STA-*.zip
+*.trace
+
+# Built application packages are published as release artifacts, not source
+*.apk
+*.aab

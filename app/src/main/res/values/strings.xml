@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">连镜</string>
+    <string name="app_name_en" translatable="false">LensLink</string>
+</resources>

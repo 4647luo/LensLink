@@ -1,0 +1,1445 @@
+package com.lutcamera.lutcamerapro.ui.douk
+
+import android.app.Activity
+import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import androidx.core.content.FileProvider
+import android.net.Uri
+import android.provider.MediaStore
+import com.lutcamera.lutcamerapro.log.DoukHttp
+import okhttp3.Request
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.DriveFileRenameOutline
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.Place
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.RotateRight
+import androidx.compose.material.icons.rounded.SaveAlt
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.StarBorder
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.IntentSenderRequest
+import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import java.util.Locale
+import kotlinx.coroutines.withContext
+import java.io.File
+
+/**
+ * 收藏只是本地标记，不动原图：存在 SharedPreferences 里，按「来源:键」去重。
+ */
+internal object GalleryFavorites {
+    private const val PREFS = "douk_gallery_favorites"
+
+    fun all(context: Context): Set<String> =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getStringSet("keys", emptySet())!!.toSet()
+
+    fun toggle(context: Context, key: String): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val current = prefs.getStringSet("keys", emptySet())!!.toMutableSet()
+        val nowOn = if (key in current) {
+            current.remove(key)
+            false
+        } else {
+            current.add(key)
+            true
+        }
+        prefs.edit().putStringSet("keys", current).apply()
+        return nowOn
+    }
+}
+
+/**
+ * 全屏看图页，照小米相册 5.x 的样子：
+ * 顶部是「← 日期 / 时间」+ 旋转视图，底部是一条浮起来的圆角操作条
+ * （发送 / 收藏 / 编辑 / 删除 / 更多），相机内的照片多一个「保存」。
+ * 点一下图片把上下两条 UI 收掉，再点一下回来；点「更多」弹出贴按钮的窄卡：
+ * 保存到 / 详情 / 重命名。
+ */
+@Composable
+internal fun PhotoViewerScreen(
+    item: GalleryItem,
+    bitmap: ImageBitmap?,
+    state: DoukState,
+    onDismiss: () -> Unit,
+    onDeleted: () -> Unit,
+    onChanged: () -> Unit,
+    onSwipe: (Int) -> Unit = {},
+    showOriginal: Boolean = false
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var scale by remember { mutableStateOf(1f) }
+    var offsetX by remember { mutableStateOf(0f) }
+    var offsetY by remember { mutableStateOf(0f) }
+    // 点一下图片进「纯看图」：顶栏和底部条一起收起来，再点一下回来
+    var uiHidden by remember { mutableStateOf(false) }
+    // 右上角那个按钮不再是分享，改成把当前这张转 90° 看（不改文件）
+    var rotation by remember { mutableStateOf(0f) }
+    var editing by remember { mutableStateOf(false) }
+    // 网格里的是 320–400px 的缩略图，全屏要单独加载一张大的，否则放大就糊
+    var hd by remember { mutableStateOf<ImageBitmap?>(null) }
+    // 「显示原图」：这张单独从相机拉全尺寸（或跟「始终显示原图」总开关走）
+    var wantOriginal by remember { mutableStateOf(false) }
+    var loadingOriginal by remember { mutableStateOf(false) }
+    var favorite by remember { mutableStateOf(item.stableKey in GalleryFavorites.all(context)) }
+    var more by remember { mutableStateOf(false) }
+    var detail by remember { mutableStateOf(false) }
+    var addTo by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    // 「更多」那一层的空白点击和图片的单点会撞在同一次触摸上，用一个时间戳把后者挡掉
+    var lastDismissAt by remember { mutableStateOf(0L) }
+    // 双击判定：两次轻点间隔小于 320ms 就当双击放大
+    var lastTapAt by remember { mutableStateOf(0L) }
+
+    // 提示条自己消失，免得一直挂在图片下面
+    androidx.compose.runtime.LaunchedEffect(message) {
+        if (message != null) {
+            kotlinx.coroutines.delay(3000)
+            message = null
+        }
+    }
+
+    fun appFile(): File? = if (item.origin == "app") GalleryFileOps.locateAppFile(item.fileName) else null
+
+    fun phoneUri(): Uri? = if (item.origin == "phone") {
+        val collection = if (item.isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        ContentUris.withAppendedId(collection, item.key.toLong())
+    } else null
+
+    /** 视频交给系统播放器；相机内还没落盘的先提示保存，避免点了没反应 */
+    fun playVideo() {
+        val uri: Uri = when (item.origin) {
+            "phone" -> phoneUri() ?: return
+            "app" -> {
+                val file = appFile() ?: run { message = "视频文件找不到"; return }
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            }
+            else -> {
+                message = "相机内视频请先点「保存」存到手机，再播放"
+                return
+            }
+        }
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "video/*")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            )
+        }.onFailure { message = "没有可用的视频播放器" }
+    }
+
+    suspend fun fetchOriginal() {
+        loadingOriginal = true
+        message = "正在从相机取原图…"
+        hd = withContext(Dispatchers.IO) { state.cameraOriginalBitmap(item.key) }
+        loadingOriginal = false
+        message = if (hd == null) "取原图失败，先显示缩略图" else null
+    }
+
+    androidx.compose.runtime.LaunchedEffect(item.stableKey) {
+        // 横滑换到另一张时，缩放、旋转、浮层、收藏状态全部按新这张重置
+        scale = 1f; offsetX = 0f; offsetY = 0f; rotation = 0f
+        uiHidden = false; more = false; detail = false; editing = false
+        wantOriginal = false
+        favorite = item.stableKey in GalleryFavorites.all(context)
+        // 先把网格里已经解码好的缩略图直接铺上，用户点开就是有画面的；
+        // 高清图再在后台替换。以前这里先 hd=null 等 decode，5120 万像素的
+        // 原图要几百毫秒，看起来就是「点开先黑一下」。
+        hd = bitmap
+        if (item.origin == "cam" && !item.isVideo && showOriginal) {
+            // 「始终显示原图」总开关：每张打开就直接拉全尺寸
+            fetchOriginal()
+        } else {
+            val large = withContext(Dispatchers.IO) { loadLargeBitmap(context, item) }
+            if (large != null) hd = large
+        }
+    }
+
+    fun share() {
+        val uri = phoneUri() ?: appFile()?.let { file ->
+            // 应用内的图片在 MediaStore 里有记录时才能给出 content uri
+            runCatching {
+                context.contentResolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Images.Media._ID),
+                    "${MediaStore.Images.Media.DISPLAY_NAME}=?",
+                    arrayOf(file.name), null
+                )?.use { c ->
+                    if (c.moveToFirst()) ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0)
+                    ) else null
+                }
+            }.getOrNull()
+        }
+        if (uri == null) {
+            message = "这张还没进手机相册，先在「更多」里添加到手机相册再发送"
+            return
+        }
+        runCatching {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = GalleryFileOps.mimeOf(item.fileName)
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(send, "发送照片"))
+        }.onFailure { message = "没有可以接收图片的应用" }
+    }
+
+    fun deleteNow() {
+        val file = appFile()
+        if (file == null) {
+            message = when (item.origin) {
+                "phone" -> "手机相册里的照片请到系统相册删除"
+                else -> "相机里的照片请到相机上删除"
+            }
+            return
+        }
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                val gone = file.delete()
+                if (gone) {
+                    runCatching {
+                        android.media.MediaScannerConnection.scanFile(
+                            context, arrayOf(file.absolutePath), null, null
+                        )
+                    }
+                    state.galleryRefreshTick++
+                }
+                gone
+            }
+            if (ok) onDeleted() else message = "删除失败，文件可能被占用"
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    // 一个手势状态机管完：双指缩放、单指横滑换图、单指上滑分享、单击收 UI、双击放大
+                    .pointerInput(item.stableKey) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            val downAt = System.currentTimeMillis()
+                            var pointers = 1
+                            var zoomed = false
+                            var totalX = 0f
+                            var totalY = 0f
+                            var moved = false
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                pointers = maxOf(pointers, event.changes.count { it.pressed })
+                                val zoomChange = event.calculateZoom()
+                                val pan = event.calculatePan()
+                                if (pointers >= 2 || zoomChange != 1f) zoomed = true
+                                if (zoomed) {
+                                    val next = (scale * zoomChange).coerceIn(1f, 6f)
+                                    if (next <= 1f) {
+                                        offsetX = 0f; offsetY = 0f
+                                    } else {
+                                        val maxX = (size.width * (next - 1)) / 2f
+                                        val maxY = (size.height * (next - 1)) / 2f
+                                        offsetX = (offsetX + pan.x).coerceIn(-maxX, maxX)
+                                        offsetY = (offsetY + pan.y).coerceIn(-maxY, maxY)
+                                    }
+                                    scale = next
+                                    event.changes.forEach { it.consume() }
+                                } else {
+                                    totalX += pan.x
+                                    totalY += pan.y
+                                    if (kotlin.math.abs(totalX) > 24f || kotlin.math.abs(totalY) > 24f) moved = true
+                                }
+                                if (!event.changes.any { it.pressed }) break
+                            }
+                            val elapsed = System.currentTimeMillis() - downAt
+                            val horizontal = kotlin.math.abs(totalX)
+                            val vertical = kotlin.math.abs(totalY)
+                            when {
+                                // 已经缩放过的这一手只管缩放，不触发换图和分享
+                                zoomed -> Unit
+                                // 单指横滑：往左看下一张，往右看上一张
+                                pointers == 1 && scale <= 1.01f &&
+                                    horizontal > size.width * 0.2f && vertical < size.width * 0.16f ->
+                                    onSwipe(if (totalX < 0f) 1 else -1)
+                                // 单指上滑：直接拉起分享面板
+                                pointers == 1 && totalY < -size.height * 0.16f &&
+                                    horizontal < size.width * 0.16f -> share()
+                                // 轻点：先判双击放大，再判收 / 显示上下两条 UI
+                                elapsed < 280L && !moved -> {
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastTapAt < 320L) {
+                                        if (scale > 1f) {
+                                            scale = 1f; offsetX = 0f; offsetY = 0f
+                                        } else {
+                                            scale = 2.5f
+                                        }
+                                        lastTapAt = 0L
+                                    } else {
+                                        lastTapAt = now
+                                        // 刚点空白关掉「更多」的那一下，不要再顺手把 UI 收起来
+                                        if (now - lastDismissAt > 150L) {
+                                            uiHidden = !uiHidden
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                val shown = hd ?: bitmap
+                if (shown != null) {
+                    BoxWithConstraints(
+                        modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
+                    ) {
+                        // 转到 90/270 度时把可用宽高对调，否则竖图旋转后会撑出屏幕
+                        val quarter = (rotation % 180f) != 0f
+                        val w = if (quarter) maxHeight else maxWidth
+                        val h = if (quarter) maxWidth else maxHeight
+                        Image(
+                            bitmap = shown,
+                            contentDescription = item.fileName,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(w, h)
+                                .graphicsLayer {
+                                    scaleX = scale; scaleY = scale
+                                    translationX = offsetX; translationY = offsetY
+                                    rotationZ = rotation
+                                }
+                        )
+                    }
+                } else {
+                    Text("原图未加载", fontSize = 13.sp, color = Color.White.copy(alpha = 0.7f))
+                }
+
+                if (item.isVideo && !uiHidden) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(Color.Black.copy(alpha = 0.55f))
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null
+                            ) { playVideo() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.PlayArrow,
+                            contentDescription = "播放视频",
+                            tint = Color.White,
+                            modifier = Modifier.size(38.dp)
+                        )
+                    }
+                }
+            }
+
+            // 顶部：日期 + 时间，右侧把「分享」换成「旋转视图」
+            if (!uiHidden) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Rounded.ArrowBack, contentDescription = "返回", tint = Color.White)
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = GalleryFileOps.shortDateText(item.dateMillis) ?: "相机内照片",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                        GalleryFileOps.timeText(item.dateMillis)?.let {
+                            Text(it, fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+                        }
+                    }
+                    IconButton(onClick = { rotation = (rotation + 90f) % 360f }) {
+                        Icon(
+                            Icons.Rounded.RotateRight,
+                            contentDescription = "旋转视图",
+                            tint = Color.White
+                        )
+                    }
+                }
+            }
+
+            // 底部浮起的操作条：发送 / 收藏（星星） / 编辑 / 删除 / 更多
+            if (!uiHidden) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = 12.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(percent = 50))
+                            .background(Color.White.copy(alpha = 0.96f))
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        PillAction(
+                            icon = if (favorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+                            label = if (favorite) "已收藏" else "收藏",
+                            tint = if (favorite) DoukColors.accent else Color(0xFF4A4A4A),
+                            onClick = {
+                                favorite = GalleryFavorites.toggle(context, item.stableKey)
+                                message = if (favorite) "已加入收藏" else "已取消收藏"
+                            }
+                        )
+                        PillAction(
+                            icon = Icons.Rounded.Edit,
+                            label = "编辑",
+                            onClick = { editing = true }
+                        )
+                        PillAction(
+                            icon = Icons.Rounded.DeleteOutline,
+                            label = "删除",
+                            onClick = { confirmDelete = true }
+                        )
+                        PillAction(
+                            icon = Icons.Rounded.MoreHoriz,
+                            label = "更多",
+                            onClick = { more = true }
+                        )
+                    }
+                }
+            }
+
+            // 提示条独立浮在操作条上方，避免和 pill 抢同一块布局打架
+            message?.let {
+                Text(
+                    it,
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.9f),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(bottom = 132.dp, start = 24.dp, end = 24.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black.copy(alpha = 0.66f))
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
+
+            if (more) {
+                // 参考图那样：窄卡贴在「更多」按钮右上方，不是一个居中的大长条；
+                // 底下铺一层透明点击层，点空白就收起来
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            lastDismissAt = System.currentTimeMillis()
+                            more = false
+                        }
+                )
+                MoreMenuCard(
+                    sendLabel = if (item.fromUsb) "保存" else "发送",
+                    canRename = item.origin == "app",
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .navigationBarsPadding()
+                        .padding(end = 20.dp, bottom = 104.dp)
+                        .width(204.dp),
+                    onSend = {
+                        more = false
+                        if (item.fromUsb) {
+                            if (!saving) {
+                                saving = true
+                                state.saveUsbPhoto(context, item.key, item.fileName) {
+                                    message = it
+                                    saving = false
+                                }
+                            }
+                        } else {
+                            share()
+                        }
+                    },
+                    onAddTo = { more = false; addTo = true },
+                    onDetail = { more = false; detail = true },
+                    onRename = { more = false; renaming = true },
+                    onShowOriginal = if (item.origin == "cam" && !item.isVideo && hd == null) {
+                        {
+                            more = false
+                            wantOriginal = true
+                            scope.launch { fetchOriginal() }
+                        }
+                    } else null,
+                    onDismiss = { more = false }
+                )
+            }
+
+            if (confirmDelete) {
+                ConfirmSheet(
+                    title = "删除",
+                    body = "确认删除这 1 项内容？删除只作用于应用下载目录里的副本，相机与手机相册的原图不受影响。",
+                    confirmText = "删除",
+                    onConfirm = { confirmDelete = false; deleteNow() },
+                    onDismiss = { confirmDelete = false }
+                )
+            }
+
+            if (addTo) {
+                AddToSheet(
+                    item = item,
+                    readFiles = {
+                        when (item.origin) {
+                            "cam" -> {
+                                val out = ArrayList<Pair<String, ByteArray>>()
+                                state.cameraPhotoBytes(item.key)?.let { out.add(item.fileName to it) }
+                                item.extraHandles.forEach { (h, n) ->
+                                    state.cameraPhotoBytes(h)?.let { out.add(n to it) }
+                                }
+                                out
+                            }
+                            "usb" -> {
+                                val out = ArrayList<Pair<String, ByteArray>>()
+                                state.usbPhotoBytes(context, item.key)?.let { out.add(item.fileName to it) }
+                                item.extraHandles.forEach { (h, n) ->
+                                    state.usbPhotoBytes(context, h)?.let { out.add(n to it) }
+                                }
+                                out
+                            }
+                            "app" -> listOfNotNull(
+                                GalleryFileOps.locateAppFile(item.fileName)
+                                    ?.let { item.fileName to it.readBytes() }
+                            )
+                            else -> listOfNotNull(
+                                runCatching {
+                                    ContentUris.withAppendedId(
+                                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, item.key.toLong()
+                                    )
+                                }.getOrNull()?.let { uri ->
+                                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                                        ?.let { item.fileName to it }
+                                }
+                            )
+                        }
+                    },
+                    onResult = {
+                        message = it
+                        addTo = false
+                    },
+                    onDismiss = { addTo = false }
+                )
+            }
+        }
+    }
+
+    if (editing) {
+        PhotoEditorScreen(
+            item = item,
+            source = hd ?: bitmap,
+            onDismiss = { editing = false },
+            onSaved = { newName ->
+                editing = false
+                message = "已保存为 $newName"
+                // 编辑器写出的是新文件，先让图库重新扫，再把大图换成编辑后的结果
+                onChanged()
+                scope.launch {
+                    hd = withContext(Dispatchers.IO) { loadLargeBitmap(context, item) }
+                }
+            }
+        )
+    }
+
+    if (detail) {
+        DetailPage(
+            item = item,
+            onDismiss = { detail = false }
+        )
+    }
+
+    if (renaming) {
+        RenameDialog(
+            current = item.fileName,
+            onDismiss = { renaming = false },
+            onConfirm = { newName ->
+                renaming = false
+                val result = GalleryFileOps.renameAppFile(context, item.fileName, newName)
+                if (result.isSuccess) {
+                    message = "已重命名为 $newName"
+                    onChanged()
+                } else {
+                    message = result.exceptionOrNull()?.message ?: "重命名失败"
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PillAction(
+    icon: ImageVector,
+    label: String,
+    tint: Color = Color(0xFF4A4A4A),
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .heightIn(min = 50.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(23.dp))
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(label, fontSize = 11.sp, color = tint)
+    }
+}
+
+/** 「更多」弹出的分组菜单：白色窄卡、最大圆角，照参考图贴在「更多」上方。 */
+@Composable
+private fun MoreMenuCard(
+    sendLabel: String?,
+    canRename: Boolean,
+    modifier: Modifier = Modifier,
+    onSend: () -> Unit,
+    onAddTo: () -> Unit,
+    onDetail: () -> Unit,
+    onRename: () -> Unit,
+    onShowOriginal: (() -> Unit)? = null,
+    onDismiss: () -> Unit
+) {
+    Column(
+        modifier = modifier
+            .doukCardSurface(RoundedCornerShape(24.dp))
+            .padding(vertical = 8.dp)
+    ) {
+        if (sendLabel != null) {
+            MenuRow(
+                if (sendLabel == "保存") Icons.Rounded.SaveAlt else Icons.Rounded.Share,
+                sendLabel,
+                onSend
+            )
+        }
+        MenuRow(Icons.Rounded.Add, "保存到", onAddTo)
+        if (onShowOriginal != null) {
+            MenuRow(Icons.Rounded.Image, "显示原图", onShowOriginal)
+        }
+        MenuRow(Icons.Rounded.Info, "详情", onDetail)
+        if (canRename) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp)
+                    .height(1.dp)
+                    .background(Color(0xFFEDEDED))
+            )
+            MenuRow(Icons.Rounded.DriveFileRenameOutline, "重命名", onRename)
+        }
+    }
+}
+
+@Composable
+private fun MenuRow(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = label, tint = Color(0xFF333333), modifier = Modifier.size(20.dp))
+        Spacer(modifier = Modifier.width(14.dp))
+        Text(label, fontSize = 15.sp, color = Color(0xFF222222))
+    }
+}
+
+/** 底部浮起的确认面板（删除用），照参考图的圆角大面板。 */
+@Composable
+private fun ConfirmSheet(
+    title: String,
+    body: String,
+    confirmText: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.35f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(12.dp)
+                .doukCardSurface(RoundedCornerShape(24.dp))
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF222222))
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(body, fontSize = 13.sp, color = Color(0xFF666666), textAlign = TextAlign.Start, lineHeight = 20.sp)
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                SheetButton("取消", Color(0xFFF2F2F2), Color(0xFF333333), Modifier.weight(1f), onDismiss)
+                SheetButton(confirmText, Color(0xFFF9E7E7), Color(0xFFD9363E), Modifier.weight(1f), onConfirm)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetButton(
+    text: String,
+    bg: Color,
+    fg: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(vertical = 13.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text, fontSize = 15.sp, color = fg, fontWeight = FontWeight.Medium)
+    }
+}
+
+/** 保存到：按来源给不同出口。相机内三处落盘，手机内/应用内可复制或移动，避免重复保存。 */
+@Composable
+private fun AddToSheet(
+    item: GalleryItem,
+    readFiles: suspend () -> List<Pair<String, ByteArray>>,
+    onResult: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    val isCamera = item.origin == "cam" || item.origin == "usb"
+    val appDir = "Pictures/Douk/" + (item.album ?: "连镜")
+
+    fun allowed(name: String): Boolean {
+        if (!isCamera || item.isVideo) return true
+        val ext = name.substringAfterLast('.', "").lowercase()
+        return when (DoukPrefs.saveFormat) {
+            "JPG" -> ext in setOf("jpg", "jpeg", "heic", "heif")
+            "RAW" -> ext in setOf("nef", "nrw", "dng")
+            "JPG + RAW" -> ext in setOf("jpg", "jpeg", "heic", "heif", "nef", "nrw", "dng")
+            else -> true
+        }
+    }
+
+    /** 读文件 → 按格式挑 → 写进目标（相册目录或 SAF 目录） */
+    fun deliver(provider: suspend () -> List<Pair<String, ByteArray>>, dir: String?, tree: Uri?, label: String) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val files = runCatching { provider() }.getOrNull().orEmpty()
+            val picked = files.filter { allowed(it.first) }
+            if (picked.isEmpty()) {
+                busy = false
+                onResult(
+                    if (files.isEmpty()) "没能读取到原图，请重试"
+                    else "按「从相机下载的格式」（${DoukPrefs.saveFormat}）没有可保存的文件"
+                )
+                return@launch
+            }
+            var ok = 0
+            var lastErr = "未知错误"
+            withContext(Dispatchers.IO) {
+                picked.forEach { (name, bytes) ->
+                    val result = if (tree != null) {
+                        GalleryFileOps.writeBytesToTree(context, tree, name, bytes)
+                    } else {
+                        GalleryFileOps.writeBytesToGallery(
+                            context, dir ?: GalleryFileOps.PHONE_FOLDER, name, bytes
+                        )
+                    }
+                    if (result.isSuccess) ok++ else lastErr = result.exceptionOrNull()?.message ?: lastErr
+                }
+            }
+            busy = false
+            onResult(
+                when {
+                    ok == picked.size -> "已保存到$label（${ok} 个文件）"
+                    ok > 0 -> "部分保存：$ok/${picked.size}，$lastErr"
+                    else -> "保存失败：$lastErr"
+                }
+            )
+        }
+    }
+
+    val deleteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { res ->
+        if (res.resultCode == Activity.RESULT_OK && pendingDelete.isNotEmpty()) {
+            runCatching { pendingDelete.forEach { context.contentResolver.delete(it, null, null) } }
+            pendingDelete = emptyList()
+            onResult("已移动到应用相册，手机相册那份已删除")
+        } else {
+            pendingDelete = emptyList()
+            onResult("已复制到应用相册；手机相册原图保留")
+        }
+    }
+
+    fun saveFromSource(label: String, galleryDir: String, movePhone: Boolean = false) {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val files = runCatching { readFiles() }.getOrNull().orEmpty()
+            if (files.isEmpty()) {
+                busy = false
+                onResult("没能读取到原图，请重试")
+                return@launch
+            }
+            var ok = 0
+            var lastErr = "未知错误"
+            withContext(Dispatchers.IO) {
+                files.forEach { (name, bytes) ->
+                    val r = GalleryFileOps.writeBytesToGallery(context, galleryDir, name, bytes)
+                    if (r.isSuccess) ok++ else lastErr = r.exceptionOrNull()?.message ?: lastErr
+                }
+            }
+            busy = false
+            if (!movePhone || ok == 0) {
+                onResult(
+                    if (ok == files.size) "已保存到$label（$ok 个文件）"
+                    else "已保存 $ok/${files.size}：$lastErr"
+                )
+                return@launch
+            }
+            val uri = ContentUris.withAppendedId(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, item.key.toLong()
+            )
+            val deleted = runCatching { context.contentResolver.delete(uri, null, null) }.isSuccess
+            if (deleted) {
+                onResult("已移动到应用相册，手机相册那份已删除")
+            } else if (android.os.Build.VERSION.SDK_INT >= 30) {
+                pendingDelete = listOf(uri)
+                val sender = MediaStore.createDeleteRequest(context.contentResolver, listOf(uri)).intentSender
+                deleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+            } else {
+                onResult("已复制到应用相册；系统版本不支持自动删原图，请在手机相册手动删除")
+            }
+        }
+    }
+
+    fun moveAppToAlbum() {
+        if (busy) return
+        busy = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                GalleryFileOps.moveAppFileToAlbum(context, item.fileName, appDir)
+            }
+            busy = false
+            onResult(
+                result.fold(
+                    { "已移动到应用相册：${it.name}" },
+                    { "移动失败：${it.message}" }
+                )
+            )
+        }
+    }
+
+    val pickFolder = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            deliver({ readFiles() }, null, uri, "自定义文件夹")
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.35f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(12.dp)
+                .doukCardSurface(RoundedCornerShape(24.dp))
+                .padding(horizontal = 20.dp, vertical = 18.dp)
+        ) {
+            Text("保存到", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF222222))
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                when {
+                    isCamera -> "按「从相机下载的格式」（${DoukPrefs.saveFormat}）只保存选中的文件，RAW+JPG 会按设置挑。"
+                    item.origin == "phone" -> "手机里的照片可以复制一份进应用，也可以移动进应用，不再重复保存。"
+                    else -> "应用里的照片可以另存到手机相册，或整理进应用相册；移动不重复占空间。"
+                },
+                fontSize = 12.sp,
+                color = Color(0xFF888888)
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+
+            if (isCamera) {
+                AddRow("应用相册", "$appDir · 图库「应用内」可见") {
+                    deliver({ readFiles() }, appDir, null, "应用相册")
+                }
+                AddRow("手机相册", GalleryFileOps.PHONE_ALBUM + " · 系统相册可见") {
+                    deliver({ readFiles() }, GalleryFileOps.PHONE_ALBUM, null, "手机相册")
+                }
+                AddRow("自定义文件夹", "选任意文件夹，直接存原文件") { pickFolder.launch(null) }
+            } else if (item.origin == "phone") {
+                AddRow("保存到应用相册", "$appDir · 复制一份，手机相册原图保留") {
+                    saveFromSource("应用相册", appDir)
+                }
+                AddRow("移动到应用内", "复制后删掉手机相册那份，不重复占空间") {
+                    saveFromSource("应用相册", appDir, movePhone = true)
+                }
+            } else {
+                AddRow("保存到手机相册", GalleryFileOps.PHONE_ALBUM + " · 系统相册可见") {
+                    saveFromSource("手机相册", GalleryFileOps.PHONE_ALBUM)
+                }
+                AddRow("移动到应用相册", "$appDir · 整理进相册，原位置不再保留") {
+                    moveAppToAlbum()
+                }
+            }
+
+            if (busy) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("正在下载/写入，请稍等…", fontSize = 12.sp, color = Color(0xFF139B6A))
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
+                Text("取消", fontSize = 13.sp, color = Color(0xFF666666))
+            }
+        }
+    }
+}
+
+@Composable
+private fun AddRow(title: String, subtitle: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFF7F7F7))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF222222))
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(subtitle, fontSize = 11.sp, color = Color(0xFF999999))
+        }
+        Icon(Icons.Rounded.Add, contentDescription = null, tint = Color(0xFF999999), modifier = Modifier.size(18.dp))
+    }
+    Spacer(modifier = Modifier.height(8.dp))
+}
+
+/** 详情页：左边灰色标签、右边蓝色值，和参考图一致。 */
+@Composable
+private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var meta by remember { mutableStateOf<GalleryFileOps.Meta?>(null) }
+
+    androidx.compose.runtime.LaunchedEffect(item.stableKey) {
+        meta = withContext(Dispatchers.IO) {
+            when (item.origin) {
+                "app" -> GalleryFileOps.locateAppFile(item.fileName)
+                    ?.let { f -> GalleryFileOps.metaOfFile(f, item.fileName) }
+                "phone" -> GalleryFileOps.metaOfUri(
+                    context,
+                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, item.key.toLong()),
+                    item.fileName,
+                    item.sizeBytes,
+                    null
+                )
+                else -> null
+            }
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.White)
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+        ) {
+            Box(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                IconButton(onClick = onDismiss, modifier = Modifier.align(Alignment.CenterStart)) {
+                    Icon(Icons.Rounded.ArrowBack, contentDescription = "返回", tint = Color(0xFF222222))
+                }
+                Text(
+                    "详情",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF222222),
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+
+            val m = meta
+            DetailRow(
+                "拍摄时间",
+                GalleryFileOps.dateText(m?.takenAt ?: item.dateMillis) ?: "相机内未提供拍摄时间"
+            )
+            DetailRow(
+                "文件信息",
+                buildString {
+                    append(item.fileName)
+                    append("\n")
+                    append(GalleryFileOps.fileSizeText(item.sizeBytes))
+                    m?.let { meta2 ->
+                        if (meta2.width != null && meta2.height != null) {
+                            append("   ${meta2.width}×${meta2.height}px")
+                        }
+                    }
+                }
+            )
+            if (m?.camera != null || m?.exposureLine != null) {
+                DetailRow(
+                    "拍摄参数",
+                    listOfNotNull(m?.camera, m?.lens, m?.exposureLine).joinToString("\n")
+                )
+            }
+            DetailRow(
+                "文件路径",
+                when (item.origin) {
+                    "app" -> m?.path ?: "内部存储/${GalleryFileOps.PHONE_FOLDER}/${item.fileName}"
+                    "phone" -> m?.path ?: item.fileName
+                    else -> "相机机身存储 · 通过 PTP 读取，未落到本机"
+                }
+            )
+            // IPTC 字段一个都没有就整行不显示，不再写「这张没有写入 IPTC」这种废话
+            val iptcLines = buildList {
+                m?.title?.let { add("标题：$it") }
+                m?.keywords?.let { add("关键词：$it") }
+                m?.artist?.let { add("作者：$it") }
+                m?.copyright?.let { add("版权：$it") }
+            }
+            if (iptcLines.isNotEmpty()) {
+                DetailRow("IPTC", iptcLines.joinToString("\n"))
+            }
+            // 有 EXIF GPS 才给「拍摄地点」和下面那张小地图
+            val latValue = m?.lat
+            val lonValue = m?.lon
+            if (latValue != null && lonValue != null) {
+                val openMap = {
+                    val geo = Uri.parse("geo:$latValue,$lonValue?q=$latValue,$lonValue")
+                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, geo)) }
+                        .onFailure {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse("https://maps.google.com/?q=$latValue,$lonValue"))
+                                )
+                            }
+                        }
+                    Unit
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(
+                        "拍摄地点：",
+                        fontSize = 13.sp,
+                        color = Color(0xFFAAAAAA),
+                        maxLines = 1,
+                        modifier = Modifier.width(100.dp)
+                    )
+                    Icon(
+                        Icons.Rounded.Place,
+                        contentDescription = null,
+                        tint = Color(0xFF3A7BD5),
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        String.format(Locale.US, "%.5f, %.5f", latValue, lonValue),
+                        fontSize = 13.sp,
+                        color = Color(0xFF3A7BD5),
+                        lineHeight = 20.sp
+                    )
+                }
+                MapThumb(
+                    lat = latValue,
+                    lon = lonValue,
+                    onClick = openMap,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp)
+                        .height(172.dp)
+                )
+            }
+            Spacer(modifier = Modifier.height(30.dp))
+        }
+    }
+}
+
+@Composable
+private fun DetailRow(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Text(
+                "$label：",
+                fontSize = 13.sp,
+                color = Color(0xFFAAAAAA),
+                maxLines = 1,
+                modifier = Modifier.width(100.dp)
+            )
+            Text(value, fontSize = 13.sp, color = Color(0xFF3A7BD5), lineHeight = 20.sp)
+        }
+        DetailDivider()
+    }
+}
+
+/** 详情页行之间的细分隔线，照小米相册那种几乎看不见的浅灰。 */
+@Composable
+private fun DetailDivider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 20.dp, end = 20.dp)
+            .height(0.6.dp)
+            .background(Color(0xFFF1F1F1))
+    )
+}
+
+/** 详情页里带一个可点动作的行（比如经纬度后面的「地图查看」）。 */
+/**
+ * 详情页里的迷你地图：按经纬度取 3×3 张地图瓦片拼一张，裁出中间一条，
+ * 正中间压一个定位针。点一下交给系统地图打开。
+ *
+ * 瓦片走高德公开瓦片接口（国内可直连）；OpenStreetMap 在国内网络下基本拉不到，
+ * 所以不用它。坐标先做 WGS-84 → GCJ-02 转换，否则针会偏几百米。
+ * 8 秒内没凑齐就别再等，直接显示灰底提示，不假装有图。
+ */
+@Composable
+private fun MapThumb(
+    lat: Double,
+    lon: Double,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var map by remember(lat, lon) { mutableStateOf<ImageBitmap?>(null) }
+    var failed by remember(lat, lon) { mutableStateOf(false) }
+    BoxWithConstraints(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFF2F2F2))
+    ) {
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val wPx = with(density) { maxWidth.toPx().toInt() }
+        val hPx = with(density) { maxHeight.toPx().toInt() }
+        androidx.compose.runtime.LaunchedEffect(lat, lon, wPx, hPx) {
+            val loaded = withContext(Dispatchers.IO) {
+                kotlinx.coroutines.withTimeoutOrNull(9000L) { loadTileMap(lat, lon, wPx, hPx) }
+            }
+            if (loaded != null) map = loaded else failed = true
+        }
+        map?.let {
+            Image(
+                bitmap = it,
+                contentDescription = "地图预览",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        if (map == null) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    if (failed) "这里暂时画不出地图，点一下用系统地图看" else "地图加载中…",
+                    fontSize = 12.sp,
+                    color = Color(0xFF999999)
+                )
+            }
+        }
+        Icon(
+            Icons.Rounded.Place,
+            contentDescription = null,
+            tint = Color(0xFFD9363E),
+            modifier = Modifier.align(Alignment.Center).size(24.dp)
+        )
+        Box(modifier = Modifier.fillMaxSize().clickable(onClick = onClick))
+    }
+}
+
+/** WGS-84 → GCJ-02：国内地图瓦片用的是加密坐标，不转换定位针会偏 300–600 米。 */
+private fun wgs84ToGcj02(lat: Double, lon: Double): Pair<Double, Double> {
+    // 国外坐标不做偏移
+    if (lon < 73.66 || lon > 135.05 || lat < 3.86 || lat > 53.55) return lat to lon
+    val a = 6378245.0
+    val ee = 0.00669342162296594323
+    var dLat = transformLat(lon - 105.0, lat - 35.0)
+    var dLon = transformLon(lon - 105.0, lat - 35.0)
+    val radLat = lat / 180.0 * Math.PI
+    var magic = Math.sin(radLat)
+    magic = 1 - ee * magic * magic
+    val sqrtMagic = Math.sqrt(magic)
+    dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI)
+    dLon = (dLon * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI)
+    return (lat + dLat) to (lon + dLon)
+}
+
+private fun transformLat(x: Double, y: Double): Double {
+    var ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x))
+    ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+    ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0
+    ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0
+    return ret
+}
+
+private fun transformLon(x: Double, y: Double): Double {
+    var ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x))
+    ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+    ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0
+    ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0
+    return ret
+}
+
+/** 把中心点周围的 3×3 张瓦片拼起来，按卡片宽高比裁中间一条，中心就是给定坐标。 */
+private fun loadTileMap(lat: Double, lon: Double, wPx: Int, hPx: Int): ImageBitmap? {
+    if (wPx <= 0 || hPx <= 0) return null
+    return try {
+        val (gLat, gLon) = wgs84ToGcj02(lat, lon)
+        val z = 16
+        val n = Math.pow(2.0, z.toDouble())
+        val tx = (gLon + 180.0) / 360.0 * n
+        val rad = Math.toRadians(gLat)
+        val ty = (1.0 - kotlin.math.ln(kotlin.math.tan(rad) + 1.0 / kotlin.math.cos(rad)) / Math.PI) / 2.0 * n
+        val cx = kotlin.math.floor(tx).toInt()
+        val cy = kotlin.math.floor(ty).toInt()
+        val tile = 256
+        val full = android.graphics.Bitmap.createBitmap(
+            tile * 3, tile * 3, android.graphics.Bitmap.Config.ARGB_8888
+        )
+        val canvas = android.graphics.Canvas(full)
+        val paint = android.graphics.Paint()
+        var fails = 0
+        for (dy in -1..1) {
+            for (dx in -1..1) {
+                if (fails >= 4) break
+                val bmp = downloadTile(
+                    "https://webrd0${(dx + 2).coerceIn(1, 4)}.is.autonavi.com/appmaptile" +
+                        "?lang=zh_cn&size=1&scale=1&style=8&x=${cx + dx}&y=${cy + dy}&z=$z"
+                )
+                if (bmp == null) {
+                    fails++
+                    continue
+                }
+                fails = 0
+                canvas.drawBitmap(bmp, ((dx + 1) * tile).toFloat(), ((dy + 1) * tile).toFloat(), paint)
+            }
+        }
+        if (fails >= 4) return null
+        // 定位针在拼接图里的位置（拼接图以中心瓦片为第 2 列第 2 行）
+        val pinX = (tx - cx + 1.0) * tile
+        val pinY = (ty - cy + 1.0) * tile
+        val cropW = full.width
+        val cropH = (cropW.toFloat() * hPx / wPx).toInt().coerceIn(64, full.height)
+        // 横向上整幅拼图都保留，竖向上让定位针落在正中
+        val top = (pinY - cropH / 2.0).toInt().coerceIn(0, maxOf(0, full.height - cropH))
+        android.graphics.Bitmap.createBitmap(full, 0, top, cropW, cropH).asImageBitmap()
+    } catch (t: Throwable) {
+        null
+    }
+}
+
+private fun downloadTile(url: String): android.graphics.Bitmap? = runCatching {
+    val request = Request.Builder()
+        .url(url)
+        .header("User-Agent", "Mozilla/5.0 (Linux; Android) LensLink/1.0")
+        .header("Referer", "https://www.amap.com/")
+        .build()
+    DoukHttp.client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) return@runCatching null
+        response.body?.byteStream()?.use { stream ->
+            android.graphics.BitmapFactory.decodeStream(stream)
+        }
+    }
+}.getOrNull()
+
+/** 全屏用的大图：应用内直接解原文件到长边 1600，手机内让系统按 1600 出缩略。相机内没有本地文件。 */
+private fun loadLargeBitmap(context: Context, item: GalleryItem): ImageBitmap? = runCatching {
+    when (item.origin) {
+        "app" -> {
+            val file = GalleryFileOps.locateAppFile(item.fileName)
+            if (file == null) {
+                null
+            } else {
+                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+                var sample = 1
+                while (bounds.outWidth / sample > 1600) sample *= 2
+                val bmp = android.graphics.BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+                ) ?: return@runCatching null
+                GalleryFileOps.applyExifOrientation(bmp, GalleryFileOps.exifOrientationOf(file)).asImageBitmap()
+            }
+        }
+        "phone" -> {
+            val collection = if (item.isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val uri = ContentUris.withAppendedId(collection, item.key.toLong())
+            context.contentResolver.loadThumbnail(uri, android.util.Size(1600, 1600), null)?.asImageBitmap()
+        }
+        else -> null
+    }
+}.getOrNull()
+
+@Composable
+private fun RenameDialog(
+    current: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    val ext = current.substringAfterLast('.', "")
+    var base by remember { mutableStateOf(current.substringBeforeLast('.')) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("重命名", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = base,
+                    onValueChange = { base = it.take(80) },
+                    singleLine = true,
+                    label = { Text("文件名") },
+                    suffix = if (ext.isNotEmpty()) { { Text(".$ext") } } else null
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "只改应用下载目录里的这一份，相机和系统相册里的原图不受影响。",
+                    fontSize = 11.sp,
+                    color = Color(0xFF999999)
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = base.isNotBlank() && "$base.$ext" != current,
+                onClick = { onConfirm(if (ext.isNotEmpty()) "$base.$ext" else base) }
+            ) { Text("确定") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}

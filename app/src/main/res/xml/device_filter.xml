@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB PTP 相机（当前仅保留尼康） -->
+    <usb-device vendor-id="1200" />
+    <usb-device class="6" />
+</resources>

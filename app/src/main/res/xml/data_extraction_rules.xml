@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- 与 backup_rules 保持一致：配对身份、设备地址、GPS 与日志不进云备份。 -->
+        <exclude domain="file" path="nikon-traces/" />
+        <exclude domain="file" path="nikon-photo-inbox/" />
+        <exclude domain="file" path="douk-logs/" />
+        <exclude domain="sharedpref" path="nikon_transport.xml" />
+        <exclude domain="sharedpref" path="douk_settings.xml" />
+        <exclude domain="sharedpref" path="douk_nikon_ble.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="nikon-traces/" />
+        <exclude domain="file" path="nikon-photo-inbox/" />
+        <exclude domain="file" path="douk-logs/" />
+        <exclude domain="sharedpref" path="nikon_transport.xml" />
+        <exclude domain="sharedpref" path="douk_settings.xml" />
+        <exclude domain="sharedpref" path="douk_nikon_ble.xml" />
+    </device-transfer>
+</data-extraction-rules>

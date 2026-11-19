@@ -1,0 +1,573 @@
+package com.lutcamera.lutcamerapro.ui.douk
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.Bluetooth
+import androidx.compose.material.icons.rounded.Wifi
+import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Tune
+import com.lutcamera.lutcamerapro.log.DoukLog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import dev.chrisbanes.haze.hazeSource
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.navigation.NavDestination.Companion.hierarchy
+import androidx.navigation.NavGraph.Companion.findStartDestination
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
+import com.lutcamera.lutcamerapro.network.nikon.ble.DoukBleKeepAliveService
+import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient
+import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleRemoteClient
+import com.lutcamera.lutcamerapro.ui.screens.connect.nikon.NikonViewModel
+
+private data class DoukTab(val label: String, val route: String, val icon: ImageVector)
+
+@Composable
+fun DoukRoot() {
+    val context = LocalContext.current
+    // 手势导航时我们在 MainActivity 里隐藏了系统导航条（避开 ROM 强制的浅色底），
+    // 这里补一条和系统手势提示线同形的小胶囊，视觉上仍然有“返回桌面”的提示。
+    val gestureNavigation = remember {
+        runCatching {
+            android.provider.Settings.Secure.getInt(context.contentResolver, "navigation_mode", 0) == 2
+        }.getOrDefault(false)
+    }
+    val vm = remember { NikonViewModel() }
+    val usb = remember { DoukUsbConnector(context.applicationContext) }
+    val ble = remember { NikonBleGpsClient(context.applicationContext) }
+    val bleRemote = remember { NikonBleRemoteClient(context.applicationContext) }
+    val state = remember(vm, usb, ble, bleRemote) { DoukState(vm, usb, ble, bleRemote) }
+
+    // USB PTP 的 StateFlow 同步成 Compose 状态，页面才能实时刷新
+    val usbConnected by usb.connected.collectAsStateWithLifecycle()
+    LaunchedEffect(usbConnected) {
+        state.usbConnected = usbConnected
+        if (usbConnected) {
+            state.refreshUsbBody()
+        } else {
+            state.usbBattery = null
+            state.usbStorage = null
+            state.usbIso = null
+            state.usbPhotos = emptyList()
+        }
+    }
+    LaunchedEffect(Unit) { usb.connectIfPermitted() }
+
+    // PTP/IP 连接阶段（含失败原因）同步成 Compose 状态，用户能直接看到卡在哪一步
+    val ptpStage by vm.connectionStage.collectAsStateWithLifecycle()
+    LaunchedEffect(ptpStage) {
+        state.connectionStageMirror = ptpStage
+    }
+
+    // 相机只给最小能力集时进入“待配对”，把状态同步到页面
+    val pairingNeeded by vm.ptpClient.pairingRequired.collectAsStateWithLifecycle()
+    LaunchedEffect(pairingNeeded) {
+        state.pairingRequired = pairingNeeded
+    }
+
+    // 蓝牙 GPS / 蓝牙遥控 / Wi‑Fi / USB 任一路在线就拉前台服务，
+    // 防止切到后台被系统冻结或回收；全部断开才停。
+    val blePhase by ble.phase.collectAsStateWithLifecycle()
+    val bleRemotePhase by bleRemote.phase.collectAsStateWithLifecycle()
+    LaunchedEffect(blePhase, bleRemotePhase, state.isConnected) {
+        val activeLinks = buildList {
+            if (blePhase == NikonBleGpsClient.Phase.READY) add("蓝牙 GPS")
+            if (bleRemotePhase == NikonBleRemoteClient.Phase.READY) add("蓝牙遥控")
+            if (state.isConnected) add("Wi‑Fi / USB 相机")
+        }
+        if (activeLinks.isNotEmpty()) {
+            DoukBleKeepAliveService.start(context, "正在保持 ${activeLinks.joinToString("、")} 连接")
+        } else {
+            DoukBleKeepAliveService.stop(context)
+        }
+    }
+
+    DisposableEffect(vm) {
+        onDispose {
+            vm.disconnect()
+            usb.release()
+            ble.dispose()
+        }
+    }
+    val nav = rememberNavController()
+    val currentEntry by nav.currentBackStackEntryAsState()
+    val currentRoute = currentEntry?.destination?.route
+    var showAddDevice by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
+    // 控制页点最新照片缩略图 → 独立的「相机内」图库整屏，不经过底部 tab
+    var showCameraGallery by remember { mutableStateOf(false) }
+    // 在图库页再点一次底部「图库」，就把「照片 / 相册」条从底部弹出来
+    var gallerySwitchTick by remember { mutableStateOf(0) }
+    // 在设备页再点一次底部「设备」，就在 Douk 栏上方弹出「蓝牙 / Wi‑Fi|USB」两个按钮
+    var showDeviceServiceBar by remember { mutableStateOf(false) }
+    var deviceServiceMode by remember { mutableStateOf("wifi") }
+    // 离开设备页只收起切换条，不再复位服务模式：
+    // 用户点了「蓝牙」后，下次回到设备页仍应停在蓝牙卡片，而不是被强行拉回 Wi‑Fi|USB。
+    LaunchedEffect(currentRoute) {
+        if (currentRoute != "device") {
+            showDeviceServiceBar = false
+        }
+    }
+    // 运行日志落盘需要 Context；Application 已安装，这里只作为兜底（重复调用无副作用）
+    LaunchedEffect(Unit) { DoukLog.install(context) }
+
+    // 未连接相机时每 30 秒静默扫一次「连接过的设备」，设置里开着自动连接就直接连上
+    LaunchedEffect(state) { state.startAutoConnectLoop(context) }
+    DisposableEffect(state) {
+        onDispose { state.stopAutoConnectLoop() }
+    }
+
+    // 蓝牙 GPS 不再随 Wi-Fi 相机自动连接：尼康同一时间只允许一路连接，
+    // 自动抢占会导致 BLE 连上又被顶掉，界面反复横跳。需要 GPS 时到设备页手动连一次。
+
+    // Android 13+ 的通知权限：连上相机要拉前台服务，没有这条权限通知不显示，
+    // 用户就不知道 app 还在后台跑。放在「第一次真的连上相机」时问，启动时不打扰。
+    val notifPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+    var askedNotification by remember { mutableStateOf(false) }
+
+    // 启动时恢复上次选的外观：主题色 + 深色模式（未选过则跟随系统）
+    val systemDark = isSystemInDarkTheme()
+    LaunchedEffect(Unit) {
+        DoukColors.applyAccent(DoukPrefs.themeColor)
+        DoukColors.applyGlass(DoukPrefs.glassEffect)
+        DoukColors.applyMaterial(DoukPrefs.materialAlpha, DoukPrefs.materialBlur)
+        state.showBleGpsCard = DoukPrefs.showBleGpsCard
+        state.showBleRemoteCard = DoukPrefs.showBleRemoteCard
+        when (DoukPrefs.darkMode) {
+            "深色" -> DoukColors.applyDark(true)
+            "浅色" -> DoukColors.applyDark(false)
+            else -> DoukColors.applyDark(systemDark)
+        }
+        state.showAddDeviceButton = DoukPrefs.showAddDeviceButton
+    }
+
+    // 全屏监视开/关时同步启停相机取景：不开监视就不占着相机的 LiveView 事务
+    LaunchedEffect(state.previewFullscreen) {
+        if (state.previewFullscreen) vm.startPreview() else vm.stopPreview()
+    }
+
+    // 「识别到连接过的设备自动连接」交给 DoukState 的自动连接循环：
+    // 先扫 300ms 端口确认在线，再直接进 PTP 握手。旧实现在启动时无条件拿历史 IP
+    // 做 2×1.5 秒预检，相机不在线时每次冷启动都白等 4 秒，且和自动扫描重复。
+
+    // Wi‑Fi 会话期间用更短的心跳阻止相机待机；断开后恢复默认间隔
+    LaunchedEffect(state.isConnected, state.connectMode) {
+        state.applyWifiPowerSave()
+    }
+
+    // 连上就把这台相机记进「已连接过的设备」，下次开机可自动连
+    LaunchedEffect(state.isConnected) {
+        if (!state.isConnected) return@LaunchedEffect
+        val ip = state.lastTargetIp
+        if (ip.isNotBlank()) DoukPrefs.rememberDevice(ip, state.profile.name)
+        // 连上 Wi-Fi / USB 后不再自动抢蓝牙：相机同一时间只允许一路连接，
+        // 蓝牙 GPS 需要时由设备页「搜索相机蓝牙」手动建立，避免两条链路互相顶掉。
+
+        // 第一次连上时补通知权限：此后拉前台服务，通知才看得见
+        if (!askedNotification && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            askedNotification = true
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    DoukTheme {
+        Surface(
+            color = Color.Transparent,
+            modifier = Modifier
+                .fillMaxSize()
+                .background(DoukColors.backgroundBrush)
+        ) {
+            Box(Modifier.fillMaxSize()) {
+            // 最底层的背景源：只有渐变，没有文字/图标。卡片默认只取这一层，
+            // 所以不会把卡片自己的标题、按钮文字一起糊掉。
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(DoukColors.backgroundBrush)
+                    .hazeSource(DoukColors.hazeState, zIndex = -1f)
+            )
+            if (showAddDevice) {
+                // 这两页在主 Scaffold 之外，edge-to-edge 下要自己让开系统栏
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                    AddDeviceScreen(
+                        state = state,
+                        onBack = { showAddDevice = false },
+                        onConnected = {
+                            showAddDevice = false
+                            nav.navigate("control") {
+                                launchSingleTop = true
+                            }
+                        }
+                    )
+                }
+            } else if (showLog) {
+                BackHandler { showLog = false }
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                    DoukLogScreen(onBack = { showLog = false })
+                }
+            } else if (showCameraGallery) {
+                BackHandler { showCameraGallery = false }
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                    GalleryScreen(state = state, startInCamera = true)
+                }
+            } else if (state.previewFullscreen) {
+                // 全屏监看挂在根层：连底栏一起盖掉，才叫全屏
+                BackHandler { state.previewFullscreen = false }
+                FullscreenPreview(state)
+            } else if (state.showCopyrightSheet) {
+                // 版权与 IPTC：独立的设置页，可从机身读入
+                BackHandler { state.showCopyrightSheet = false }
+                CopyrightScreen(state = state, onBack = { state.showCopyrightSheet = false })
+            } else {
+                Scaffold(
+                    // 让根层 Surface 的渐变一直铺到系统导航条下面；否则 Scaffold 的实色底
+                    // 会在底栏和手势条之间切出一条颜色不同的白带。
+                    containerColor = Color.Transparent
+                ) { padding ->
+                    // 底栏不再占 Scaffold 的 bottomBar 槽位：内容铺满整屏，
+                    // Douk 栏作为一层浮在内容上方，页面滚到最底部时会从胶囊下方穿过。
+                    // haze 节点放在这一层：页面内容先画进 RenderNode，底栏/卡片的 hazeChild
+                    // 再从同一份内容里取真实高斯模糊，而不是自己画半透明白底。
+                    Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+                        // 页面内容单独做一层 haze 源：底栏是它的兄弟节点，不在源里，
+                        // 所以底栏只糊「页面上的文字和图标」，不会糊自己。
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .hazeSource(DoukColors.hazeState, zIndex = 0f)
+                        ) {
+                        NavHost(navController = nav, startDestination = "device") {
+                            composable("device") {
+                                DeviceScreen(
+                                    state = state,
+                                    onAddDevice = { showAddDevice = true },
+                                    onOpenControl = { nav.navigate("control") { launchSingleTop = true } },
+                                    serviceMode = if (showDeviceServiceBar) deviceServiceMode else null
+                                )
+                            }
+                            composable("control") {
+                                ControlScreen(
+                                    state = state,
+                                    onBack = { nav.popBackStack() },
+                                    onOpenCameraGallery = { showCameraGallery = true }
+                                )
+                            }
+                            composable("gallery") {
+                                GalleryScreen(
+                                    state = state,
+                                    switchTick = gallerySwitchTick,
+                                    onSwitchConsumed = { gallerySwitchTick = 0 }
+                                )
+                            }
+                            composable("settings") {
+                                DoukSettingsScreen(state = state)
+                            }
+                        }
+                        }
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                        ) {
+                            androidx.compose.animation.AnimatedVisibility(
+                                visible = showDeviceServiceBar
+                            ) {
+                                DeviceServiceSwitcher(
+                                    mode = deviceServiceMode,
+                                    onSelect = { deviceServiceMode = it }
+                                )
+                            }
+                            DoukBottomBar(
+                                nav = nav,
+                                state = state,
+                                onGalleryReselect = { gallerySwitchTick++ },
+                                onDeviceReselect = {
+                                    // 再点一次设备是开关：显示时收起，收起时显示。
+                                    // 收起时保留当前服务模式，避免用户刚切到蓝牙又被拉回 Wi‑Fi|USB。
+                                    if (currentRoute == "device") {
+                                        showDeviceServiceBar = !showDeviceServiceBar
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                }
+            }
+            if (gestureNavigation) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 6.dp)
+                        .width(108.dp)
+                        .height(3.dp)
+                        .background(
+                            if (DoukColors.isDark) Color.White.copy(alpha = 0.62f)
+                            else Color.Black.copy(alpha = 0.32f),
+                            RoundedCornerShape(percent = 50)
+                        )
+                )
+            }
+            }
+        }
+    }
+}
+
+/**
+ * 设备页再次点底部「设备」后浮在 Douk 栏上方的两段切换：
+ * 蓝牙 = GPS 推送与相机遥控；Wi‑Fi|USB = 电量/储存与当前链路状态。
+ * 相机实物照片不参与切换，两种界面都固定显示在顶部。
+ */
+@Composable
+private fun DeviceServiceSwitcher(
+    mode: String,
+    onSelect: (String) -> Unit
+) {
+    val pill = RoundedCornerShape(percent = 50)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 4.dp)
+            .clip(pill)
+            .doukCardSurface(pill)
+            .padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        ServiceSwitchSegment(
+            label = "蓝牙",
+            icon = Icons.Rounded.Bluetooth,
+            selected = mode == "bluetooth",
+            modifier = Modifier.weight(1f),
+            onClick = { onSelect("bluetooth") }
+        )
+        ServiceSwitchSegment(
+            label = "Wi‑Fi | USB",
+            icon = Icons.Rounded.Wifi,
+            selected = mode == "wifi",
+            modifier = Modifier.weight(1f),
+            onClick = { onSelect("wifi") }
+        )
+    }
+}
+
+@Composable
+private fun ServiceSwitchSegment(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val pill = RoundedCornerShape(percent = 50)
+    Row(
+        modifier = modifier
+            .clip(pill)
+            .then(
+                if (selected) Modifier
+                    .background(DoukColors.accent.copy(alpha = if (DoukColors.glass) 0.16f else 0.10f), pill)
+                    .border(1.dp, DoukColors.accent.copy(alpha = 0.26f), pill)
+                else Modifier
+            )
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            )
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            icon,
+            contentDescription = label,
+            tint = if (selected) DoukColors.accent else DoukColors.textSecondary,
+            modifier = Modifier.size(17.dp)
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            label,
+            style = DoukType.title,
+            color = if (selected) DoukColors.accent else DoukColors.textPrimary,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun DoukBottomBar(
+    nav: androidx.navigation.NavHostController,
+    state: DoukState,
+    onGalleryReselect: () -> Unit = {},
+    onDeviceReselect: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val tabs = listOf(
+        DoukTab("设备", "device", Icons.Rounded.CameraAlt),
+        DoukTab("控制", "control", Icons.Rounded.Tune),
+        DoukTab("图库", "gallery", Icons.Rounded.PhotoLibrary),
+        DoukTab("设置", "settings", Icons.Rounded.Settings)
+    )
+    val entry by nav.currentBackStackEntryAsState()
+    val current = entry?.destination
+
+    // 真正的悬浮胶囊：四角留白、整条圆角，浮在页面内容上方。
+    // 系统导航条的安全区由外层 Scaffold 的 padding 让开，这里不再重复加。
+    val pill = RoundedCornerShape(percent = 50)
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 12.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                // 玻璃开启时不要投影：半透明卡片会把背后的影子透出来，像多了一层方块
+                .then(
+                    if (DoukColors.glass) Modifier
+                    // 20dp 的投影会在手势条上方压出一圈灰带，看起来像另一块底板；
+                    // 收到 12dp，只保留胶囊边缘的一点点浮起感。
+                    else Modifier.shadow(12.dp, pill, clip = false)
+                )
+                .clip(pill)
+                // 玻璃开启时不再垫 96% 实色底，否则真实模糊会被整块盖住；
+                // 底栏背后的页面文字/图标由 hazeChild 直接高斯模糊。
+                .then(
+                    if (DoukColors.glass) Modifier
+                    else Modifier.background(DoukColors.surface, pill)
+                )
+                .then(
+                    if (DoukColors.glass) Modifier.doukGlassDock(pill)
+                    else Modifier.doukCardSurface(pill)
+                )
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceAround,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            tabs.forEach { tab ->
+                val selected = current?.hierarchy?.any { it.route == tab.route } == true
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(pill)
+                        .then(
+                            if (selected) {
+                                // 选中的 tab：一层均匀的淡主色玻璃 + 细描边，
+                                // 不做渐变，避免胶囊出现左边深右边浅的色块
+                                Modifier
+                                    .background(
+                                        DoukColors.accent.copy(
+                                            alpha = if (DoukColors.glass) 0.14f else 0.10f
+                                        ),
+                                        pill
+                                    )
+                                    .border(
+                                        1.dp,
+                                        DoukColors.accent.copy(alpha = if (DoukColors.glass) 0.26f else 0.18f),
+                                        pill
+                                    )
+                            } else Modifier
+                        )
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            // 已经停在这一页、又点的是「图库」，就弹「照片 / 相册」选择条
+                            if (selected && tab.route == "gallery") {
+                                onGalleryReselect()
+                            } else if (selected && tab.route == "device") {
+                                // 再点一次设备：在 Douk 栏上方切换「蓝牙 / Wi‑Fi|USB」
+                                onDeviceReselect()
+                            } else if (tab.route == "device") {
+                                // 「设备」是起始页：如果 restoreState，会把上次停在 control 的状态一起还原，
+                                // 表现就是点设备标签却回到控制页（有时像“设备页打不开”）。
+                                nav.navigate("device") {
+                                    popUpTo(nav.graph.findStartDestination().id) { inclusive = false }
+                                    launchSingleTop = true
+                                    restoreState = false
+                                }
+                            } else {
+                                nav.navigate(tab.route) {
+                                    popUpTo(nav.graph.findStartDestination().id) { saveState = true }
+                                    launchSingleTop = true
+                                    restoreState = true
+                                }
+                            }
+                        }
+                        .padding(vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = tab.icon,
+                        contentDescription = tab.label,
+                        tint = if (selected) DoukColors.accent else DoukColors.textTertiary,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        text = tab.label,
+                        style = DoukType.tab,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (selected) DoukColors.accent else DoukColors.textSecondary
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+

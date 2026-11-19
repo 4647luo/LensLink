@@ -1,0 +1,95 @@
+name: Bug report / 问题反馈
+description: 连接、控制、图库、GPS 或崩溃问题；请附上应用内生成的诊断日志
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先做这一步：导出诊断日志
+        打开「连镜 LensLink」→ 设置 → 关于 → **反馈与建议**：
+        - 想自己保存：点「只保存诊断日志」，得到 `LensLink-diagnostics-*.zip`
+        - 想直接发邮件：点「写邮件并附上日志」，收件人已填 `lianjingup@outlook.com`
+
+        **把 ZIP 拖进下面的附件框**（GitHub 支持 .zip）。没有日志的问题通常无法定位，会被要求补发。
+        诊断包不含照片、视频、LUT 原文件；但含本机 IP、相机型号/序列号、配对记录，请确认可以公开后再上传。
+
+  - type: input
+    id: app-version
+    attributes:
+      label: 应用版本
+      description: 设置 → 关于 里显示的版本号，例如 3.37-preset
+      placeholder: 3.37-preset
+    validations:
+      required: true
+
+  - type: input
+    id: camera
+    attributes:
+      label: 相机型号与固件
+      placeholder: Nikon Z50_2 / V1.11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: 连接方式
+      options:
+        - Wi-Fi 相机热点（AP）
+        - 手机热点（STA）
+        - 同一路由器
+        - USB PTP
+        - 蓝牙 GPS
+        - 未连接 / 启动即崩溃
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从打开应用开始，一步一步写；写清点的是哪个页面、哪个按钮
+      placeholder: |
+        1. 相机切到「连接至智能设备」
+        2. 应用点「设备 → 搜索」
+        3. 连接成功后点「控制 → 快门」
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      placeholder: 应该拍下一张并显示最新缩略图
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 有报错文案就原样抄下来；闪退请写清是打开就崩还是某一步崩
+      placeholder: 点快门没有反应，日志里出现 WRITE_REJECTED code=0x2019
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断日志
+      description: 把 LensLink-diagnostics-*.zip 拖到这里；文件较大也可以贴网盘链接
+      placeholder: 拖入 ZIP 或贴链接
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认诊断包可以公开（不含私人照片或敏感信息）
+          required: true
+        - label: 我已搜索过现有 Issue，没有重复
+          required: true

@@ -1,0 +1,117 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.jetbrains.kotlin.android)
+}
+
+android {
+    namespace = "com.lutcamera.lutcamerapro"
+    // 回退到 34，与你的 Gradle 插件 8.5.1 完美匹配
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.lutcamera.lutcamerapro"
+        minSdk = 29
+        // 回退到 34
+        targetSdk = 34
+        versionCode = 1
+        versionName = "0.0.1"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary = true
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = "1.8"
+        // Haze 1.2.0 用 Kotlin 2.1 编译；项目 Kotlin 仍是 1.9，读它的 metadata 需要跳过版本检查。
+        // 只影响编译期读取，不改变项目自身的 Kotlin 版本。
+        freeCompilerArgs += "-Xskip-metadata-version-check"
+    }
+    buildFeatures {
+        compose = true
+        // ACRA 需要读取 BuildConfig 里的版本号/包名
+        buildConfig = true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.1"
+    }
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+dependencies {
+    // Haze 1.5.4 会把 androidx.activity 抬到 1.10.1（要求 compileSdk 35）。
+    // 本项目仍用 AGP 8.5.1 + compileSdk 34，Haze 代码本身没有用到 1.10 的 API，
+    // 所以把 activity 三个构件锁回项目原有的 1.9.0，避免为了模糊去改整条构建链。
+    configurations.all {
+        resolutionStrategy {
+            force(
+                "androidx.activity:activity:1.9.0",
+                "androidx.activity:activity-ktx:1.9.0",
+                "androidx.activity:activity-compose:1.9.0"
+            )
+        }
+    }
+    implementation("com.google.code.gson:gson:2.10.1")
+    // 日志门面 + 文件日志 + 崩溃收集 + 网络日志
+    implementation("com.jakewharton.timber:timber:5.0.1")
+    implementation("com.elvishew:xlog:1.11.0")
+    implementation("ch.acra:acra-core:5.11.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    // 引入完整的 Material 扩展图标库
+    implementation("androidx.compose.material:material-icons-extended")
+    // 弃用可能包含超前 Alpha 版本的 libs.xxx，直接指定 100% 兼容 API 34 的稳定版
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
+    // collectAsStateWithLifecycle：页面不在前台时停收 StateFlow，省电也少无用重组
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
+    implementation("androidx.activity:activity-compose:1.9.0")
+
+    // 使用稳定的 Compose BOM，统一锁定 UI 库的稳定版本
+    implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+
+    // 真正的背景高斯模糊：Haze 用 RenderNode + RenderEffect 把卡片/底栏后面的内容模糊，
+    // 不是靠半透明+渐变模拟。0.6.1 对应 Compose 1.6（当前 BOM 2024.04.01）。
+    implementation("dev.chrisbanes.haze:haze:1.2.0")
+
+    // 我们新增的页面导航依赖
+    implementation("androidx.navigation:navigation-compose:2.7.7")
+
+    // 测试相关的库同样使用稳定版或原有的 libs
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.04.01"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
+
+
+
+
+

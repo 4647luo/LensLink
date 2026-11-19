@@ -1,0 +1,150 @@
+package com.lutcamera.lutcamerapro.ui.douk
+
+/**
+ * 尼康 Z 卡口机型能力表。
+ *
+ * 四种连接方式并不是每台机器都齐活的，差异来自官方菜单结构本身：
+ *
+ * - **二代机**（Z7II / Z6II / Z7 / Z6 / Z5 / Z50 / Zfc / Z30）：网络菜单里只有
+ *   「连接至智能设备 → Wi-Fi 连接」，相机自己开热点（AP 直连）。**没有 STA 模式**，
+ *   也没有「USB 数据连接」菜单（插线默认就是 PTP）。
+ * - **三代机**（Z9 / Z8 / Z6III / Z5II / Zf / Z50II / ZR）：菜单扩成
+ *   「配对（Bluetooth） / 选择照片以上传 / Wi-Fi 连接（AP mode） / Wi-Fi 连接（STA mode） /
+ *   关机时上传」。STA 让相机加入手机所在的路由器，不用切热点；蓝牙用于定位推送；
+ *   USB 则要在「设定菜单 → USB 数据连接」里先选 MTP/PTP，否则只被识别成读卡器。
+ * - **单反**（D6 / D780）：只有 USB PTP 可用；无线要靠 WT 传输器，不走机身自带 Wi-Fi。
+ *
+ * 机型字符串取自 PTP `GetDeviceInfo`，尼康写法不统一（`Z 50_2` / `Z50_2` / `Z 6_3`），
+ * 所以识别前统一去掉空格与下划线。
+ */
+object NikonModelSpec {
+
+    enum class Gen { THIRD, SECOND, DSLR }
+
+    data class Spec(
+        val id: String,
+        val label: String,
+        val gen: Gen,
+        val sta: Boolean,
+        val usbMtpMenu: Boolean,
+        val bleGps: Boolean,
+        val note: String
+    ) {
+        val generation: String
+            get() = when (gen) {
+                Gen.THIRD -> "三代机"
+                Gen.SECOND -> "二代机"
+                Gen.DSLR -> "单反"
+            }
+        val ap: Boolean get() = gen != Gen.DSLR
+    }
+
+    private val third = listOf(
+        Spec("z9", "Z9", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "机身 Wi-Fi 6 + 有线 LAN，STA 与 AP 都可用，蓝牙可推定位"),
+        Spec("z8", "Z8", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "相机 C 固件 3.00 起开放 STA 与蓝牙定位"),
+        Spec("z63", "Z6III", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "原生支持 STA 模式，部分版本 USB 需手动切 MTP/PTP"),
+        Spec("z52", "Z5II", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "原生支持 STA 与蓝牙定位"),
+        Spec("zf", "Z f", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "相机 C 固件 3.00 起支持 STA"),
+        Spec("z502", "Z50II", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "DX 三代机，STA 与蓝牙定位齐全"),
+        Spec("zr", "ZR", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
+            note = "视频向机型，网络菜单与 Z6III 同构")
+    )
+
+    private val second = listOf(
+        Spec("z72", "Z7II", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点；蓝牙仅供 SnapBridge 配对，不能当 GPS 通道用"),
+        Spec("z62", "Z6II", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点；USB 插线即 PTP，没有 USB 数据连接菜单"),
+        Spec("z7", "Z7", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点"),
+        Spec("z6", "Z6", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点"),
+        Spec("z5", "Z5", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点"),
+        Spec("z50", "Z50", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点"),
+        Spec("zfc", "Z fc", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点"),
+        Spec("z30", "Z30", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
+            note = "只有直连热点")
+    )
+
+    private val dslr = listOf(
+        Spec("d6", "D6", Gen.DSLR, sta = false, usbMtpMenu = true, bleGps = false,
+            note = "无线需 WT-6 传输器；机身自带 Wi-Fi 不提供 PTP/IP 智能设备模式"),
+        Spec("d780", "D780", Gen.DSLR, sta = false, usbMtpMenu = true, bleGps = false,
+            note = "USB PTP 可用；无线同样依赖 WT 传输器")
+    )
+
+    val catalog: List<Spec> = third + second + dslr
+
+    /** 机型清单，用于界面上直接列出型号（不出现「三代机 / 二代机」这类说法）。 */
+    val wirelessStaNames: String = third.joinToString("、") { it.label }
+    val computerNames: String = second.joinToString("、") { it.label }
+
+    /** `Z 50_2` / `Z50_2` / `Z 6_3` 统一成 `z502` / `z63` 这种纯字母数字串。 */
+    private fun norm(model: String): String =
+        model.lowercase().filter { it.isLetterOrDigit() }
+
+    fun of(model: String?): Spec? {
+        if (model.isNullOrBlank()) return null
+        val key = norm(model)
+        return catalog.firstOrNull { it.id == key }
+            ?: catalog.firstOrNull { key.contains(it.id) }
+    }
+
+    /** 三种无线/有线方式的机型专属步骤。 */
+    fun steps(spec: Spec?, mode: ConnectMode): String = when (mode) {
+        ConnectMode.WIFI_STA -> if (spec?.sta == true)
+            "${spec.label}：MENU → 网络菜单 → 连接至智能设备 → Wi-Fi 连接（STA）→ 建立配置，选手机热点或同一路由器的 SSID 并输密码；" +
+                "相机加入后 IP 由热点分配，点「搜索相机设备」会自动探测 15740 端口。"
+        else if (spec != null)
+            "${spec.label} 的网络菜单没有 STA 选项，连不上路由器/热点。请改用「Wi-Fi AP 直连」。"
+        else
+            "STA 要机身菜单里有 Wi-Fi 连接（STA）这一项：相机 → 网络菜单 → 连接至智能设备 → 加入手机热点。" +
+                "菜单里只有「Wi-Fi 连接」而没有 STA 选项时，改用「Wi-Fi AP 直连」。"
+
+        ConnectMode.WIFI_AP ->
+            "相机 MENU → 网络菜单 → 连接至智能设备 → Wi-Fi 连接 → 建立连接，机身屏幕显示 NIKON_… 名称和 8 位密码；" +
+                "手机连这个热点、输入密码。系统提示「无法访问互联网」时选保持连接，并关掉「WLAN+ / 智能网络切换」，否则会自动切回有网的路由器。"
+
+        ConnectMode.USB_PTP -> if (spec?.usbMtpMenu == true)
+            "${spec.label}：设定菜单 → USB 数据连接 → 选「连接至计算机（照相机控制）」或 MTP/PTP；" +
+                "机身屏幕出现「连接至计算机」就表示已进入 PTP，选了「MTP」或「优先上传」都拿不到控制通道。"
+        else
+            "插线即进入 PTP，不需要改菜单；机身屏幕出现「连接至计算机」就表示已被识别。"
+
+        ConnectMode.BLUETOOTH -> if (spec?.bleGps == true)
+            "${spec.label}：网络菜单 → 连接至智能设备 → 配对（Bluetooth）→ 开始配对，保持蓝牙连接项为 ON；" +
+                "配对成功后本机可把手机定位推给相机，拍出的照片带 GPS。"
+        else
+            "蓝牙 GPS 推送要求机身的蓝牙提供标准 BLE 定位通道；只在 SnapBridge 里配对的机型推不了，请用 SnapBridge 管理定位。"
+    }
+
+    /** 机型明确不支持某方式时返回一句拦截提示，支持则返回 null。 */
+    fun blocked(spec: Spec?, mode: ConnectMode): String? {
+        if (spec == null) return null
+        return when (mode) {
+            ConnectMode.WIFI_STA -> if (!spec.sta) "${spec.label} 不支持 STA 模式" else null
+            ConnectMode.WIFI_AP -> if (!spec.ap) "${spec.label} 不带机身 Wi-Fi 直连" else null
+            ConnectMode.USB_PTP -> null
+            ConnectMode.BLUETOOTH -> if (!spec.bleGps) "${spec.label} 的蓝牙不能推 GPS" else null
+        }
+    }
+
+    /** 一行能力摘要，用在机型卡片上（只讲能力，不提几代机）。 */
+    fun summary(spec: Spec): String = buildString {
+        append(if (spec.sta) "支持 STA 局域网" else "仅直连热点")
+        append(" · ")
+        append(if (spec.bleGps) "蓝牙可推 GPS" else "蓝牙仅 SnapBridge")
+        if (spec.usbMtpMenu) {
+            append(" · USB 需选连接至计算机")
+        }
+    }
+}

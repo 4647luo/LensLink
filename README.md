@@ -158,12 +158,12 @@ App 会自动比较版本号，有新版时显示「在 GitHub 下载最新安�
 环境：JDK 21、Android SDK 34、Gradle 8.11.1。
 
 ```bash
-gradle -p Douk assembleDebug
+./gradlew assembleDebug
 ```
 
-产物：`Douk/app/build/outputs/apk/debug/app-debug.apk`。
+产物：`app/build/outputs/apk/debug/app-debug.apk`。
 
-Android Studio 打开 `Douk` 目录即可运行。
+Android Studio 直接打开仓库根目录即可运行。
 
 ---
 

@@ -22,6 +22,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
@@ -73,9 +76,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -102,8 +107,13 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+
+/** 图库缩略图解码上限：快速滚动时同时解码太多 320px 图会突然卡一下 */
+private val GalleryDecodeGate = Semaphore(3)
 
 internal enum class GallerySource(val label: String, val hint: String) {
     CAMERA("相机内", "机身存储，经 USB 或 Wi-Fi 读取"),
@@ -137,7 +147,9 @@ internal data class GalleryItem(
     /** 同一张照片的全部格式（RAW+JPG 合并成一条时是 ["nef","jpg"]），筛选与角标都用它 */
     val formats: List<String> = emptyList(),
     /** 合并后除主图外的其它句柄（RAW 等），保存时一并写出；键是 handle，值是文件名 */
-    val extraHandles: List<Pair<Int, String>> = emptyList()
+    val extraHandles: List<Pair<Int, String>> = emptyList(),
+    /** 应用内同一张 RAW/JPG 配对时，除主图外需要一起预览/删除的文件名 */
+    val extraFiles: List<String> = emptyList()
 ) {
     /** 去重后的格式集合，单格式时就是 ext */
     val formatSet: List<String> get() = formats.ifEmpty { listOf(ext) }.map { it.lowercase() }.distinct()
@@ -566,8 +578,8 @@ fun GalleryScreen(
                 }
             }
         }
-        // 悬浮 Douk 栏会盖住最底部的一行；140dp = 胶囊高度 + 手势区余量
-        Spacer(modifier = Modifier.height(168.dp))
+        // 网格自己的 contentPadding 已经留了 124dp 底部空白（滚到底时越过胶囊），这里只收边。
+        Spacer(modifier = Modifier.height(4.dp))
     }
 
         // 「照片 / 相册」：从底部 dock 的「图库」二次点击弹出，浮在 dock 上方
@@ -600,12 +612,11 @@ fun GalleryScreen(
                 TextButton(onClick = {
                     confirmDelete = false
                     deleting = true
-                    val names = currentItems.filter { it.stableKey in selected }.map { it.fileName }
+                    val targets = currentItems.filter { it.stableKey in selected }
+                    val names = targets.flatMap { listOf(it.fileName) + it.extraFiles }.distinct()
                     scope.launch {
                         withContext(Dispatchers.IO) {
-                            names.forEach { name ->
-                                scanAppImages().firstOrNull { it.name == name }?.delete()
-                            }
+                            GalleryFileOps.deleteAppFiles(context, names)
                         }
                         state.galleryRefreshTick++
                         deleting = false
@@ -921,21 +932,25 @@ private fun AppGallery(
 
     val ctx = LocalContext.current
     LaunchedEffect(refreshTick) {
-        val list = withContext(Dispatchers.IO) { scanAppImages() }
-        files = list
+        val groups = withContext(Dispatchers.IO) { groupAppFiles(scanAppImages()) }
+        files = groups.flatMap { listOf(it.main) + it.extras }
         // 先把列表铺出来：宽高（构图筛选才用到）放到后台慢慢补，
         // 否则照片一多，readImageBounds 会把首屏一直卡在「正在扫描…」。
-        val baseItems = list.mapIndexed { index, file ->
+        val baseItems = groups.mapIndexed { index, group ->
+            val mainExt = group.main.name.substringAfterLast('.', "").lowercase()
+            val extraExts = group.extras.map { it.name.substringAfterLast('.', "").lowercase() }
             GalleryItem(
                 key = index,
-                fileName = file.name,
-                sizeBytes = file.length(),
-                isRaw = file.name.lowercase().endsWith(".nef"),
+                fileName = group.main.name,
+                sizeBytes = group.main.length(),
+                isRaw = (mainExt in setOf("nef", "nrw", "dng")) || extraExts.any { it in setOf("nef", "nrw", "dng") },
                 fromUsb = false,
                 origin = "app",
-                dateMillis = file.lastModified().takeIf { it > 0 },
-                album = file.parentFile?.name,
-                isVideo = file.name.substringAfterLast('.', "").lowercase() in APP_VIDEO_EXTS
+                dateMillis = group.dateMillis.takeIf { it > 0 },
+                album = group.main.parentFile?.name,
+                isVideo = mainExt in APP_VIDEO_EXTS,
+                formats = (listOf(mainExt) + extraExts).filter { it.isNotBlank() },
+                extraFiles = group.extras.map { it.name }
             )
         }
         items = baseItems
@@ -945,14 +960,14 @@ private fun AppGallery(
             // 公共目录里没进过媒体库的文件，有些机型读出来是残缺的（EXIF/GPS 全是 0），先登记一次
             runCatching {
                 android.media.MediaScannerConnection.scanFile(
-                    ctx, list.map { it.absolutePath }.toTypedArray(), null, null
+                    ctx, files.map { it.absolutePath }.toTypedArray(), null, null
                 )
             }
         }
         launch(Dispatchers.IO) {
-            val bounds = HashMap<Int, Pair<Int, Int>>(list.size)
-            list.forEachIndexed { index, file ->
-                readImageBounds(file)?.let { bounds[index] = it }
+            val bounds = HashMap<Int, Pair<Int, Int>>(groups.size)
+            groups.forEachIndexed { index, group ->
+                readImageBounds(group.main)?.let { bounds[index] = it }
                 if (index > 0 && index % 24 == 0) {
                     val snapshot = HashMap(bounds)
                     withContext(Dispatchers.Main) {
@@ -1011,7 +1026,7 @@ private fun AppGallery(
         onToggle = onToggle,
         loadThumb = { item ->
             withContext(Dispatchers.IO) {
-                files.getOrNull(item.key)?.let { decodeFileThumb(it) }
+                GalleryFileOps.locateAppFile(item.fileName)?.let { decodeFileThumb(it) }
             }
         }
     )
@@ -1259,6 +1274,8 @@ private fun PhotoGrid(
     val sections = remember(items) { buildSections(items) }
     val selectionMode = selected.isNotEmpty()
     val gridState = rememberLazyGridState()
+    var columns by remember { mutableIntStateOf(DoukPrefs.galleryColumns) }
+    val liveColumns by rememberUpdatedState(columns)
     val totalGridItems = sections.size + items.size + if (hasMore) 1 else 0
 
     LaunchedEffect(gridState, items, hasMore) {
@@ -1272,11 +1289,42 @@ private fun PhotoGrid(
 
     LazyVerticalGrid(
         state = gridState,
-        columns = GridCells.Fixed(4),
-        modifier = Modifier.fillMaxSize(),
+        columns = GridCells.Fixed(columns),
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    var accum = 1f
+                    var handled = false
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.changes.size >= 2 && !handled) {
+                            accum *= event.calculateZoom()
+                            val target = when {
+                                accum > 1.25f -> 3
+                                accum < 0.8f -> 6
+                                else -> null
+                            }
+                            if (target != null) {
+                                if (liveColumns != target) {
+                                    columns = target
+                                    DoukPrefs.galleryColumns = target
+                                }
+                                handled = true
+                                event.changes.forEach { it.consume() }
+                            }
+                        }
+                        if (!event.changes.any { it.pressed }) break
+                    }
+                }
+            },
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
-        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp)
+        // 底部留出比透明胶囊更高的一块：网格可以滚到胶囊下面，滚到底时最后一行完整露出来
+        contentPadding = PaddingValues(
+            start = 2.dp, end = 2.dp, top = 2.dp, bottom = 124.dp
+        )
     ) {
         sections.forEach { section ->
             item(
@@ -1352,7 +1400,7 @@ private fun ThumbCell(
 ) {
     LaunchedEffect(item.stableKey) {
         if (!thumbs.containsKey(item.stableKey)) {
-            loader()?.let { thumbs[item.stableKey] = it }
+            GalleryDecodeGate.withPermit { loader() }?.let { thumbs[item.stableKey] = it }
         }
     }
     val bitmap = thumbs[item.stableKey]
@@ -1452,10 +1500,42 @@ private fun ThumbCell(
 private val APP_IMAGE_EXTS = setOf("jpg", "jpeg", "png", "heic", "heif", "nef", "nrw", "dng")
 private val APP_VIDEO_EXTS = setOf("mp4", "mov")
 
+private data class AppGroup(
+    val main: File,
+    val extras: List<File>,
+    val dateMillis: Long
+)
+
+private fun appFileBaseName(name: String): String =
+    name.substringBeforeLast('.', name)
+
+/** 把同目录、同文件主干的 JPG/RAW/HEIF 等合并成一条；视频不与图片配对。 */
+private fun groupAppFiles(files: List<File>): List<AppGroup> {
+    return files.groupBy { file ->
+        (file.parentFile?.absolutePath ?: "") to appFileBaseName(file.name)
+    }.map { (_, members) ->
+        val images = members.filter { it.name.substringAfterLast('.', "").lowercase() in APP_IMAGE_EXTS }
+        val videos = members.filter { it.name.substringAfterLast('.', "").lowercase() in APP_VIDEO_EXTS }
+        val main = images.firstOrNull { it.name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "heic", "heif", "png") }
+            ?: images.firstOrNull()
+            ?: videos.firstOrNull()
+            ?: members.first()
+        val extras = members.filterNot { it == main }
+        AppGroup(
+            main = main,
+            extras = extras,
+            dateMillis = members.maxOfOrNull { it.lastModified() } ?: main.lastModified()
+        )
+    }.sortedByDescending { it.dateMillis }
+}
+
 private fun scanAppImages(): List<File> {
     val roots = listOf(
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Douk"),
-        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Douk")
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Douk"),
+        // 0.0.139 之前自动下载/保护文件都写进 LutCameraPro，旧照片也要能在图库里看到
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "LutCameraPro"),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCameraPro")
     )
     // 递归扫：保存到应用相册的会落进 Pictures/Douk/<目录名>/，只扫根目录会漏掉
     return roots.filter { it.exists() }.flatMap { root ->
@@ -1939,7 +2019,7 @@ private fun AlbumGridPanel(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
             contentPadding = PaddingValues(
-                start = DoukSpace.page, end = DoukSpace.page, top = 14.dp, bottom = 24.dp
+                start = DoukSpace.page, end = DoukSpace.page, top = 14.dp, bottom = 124.dp
             )
         ) {
             items(cards, key = { it.name }, contentType = { "album" }) { card ->
@@ -1955,19 +2035,23 @@ private fun AlbumCardCell(card: AlbumCard, onClick: () -> Unit) {
     var cover by remember(card.name) { mutableStateOf<ImageBitmap?>(null) }
 
     LaunchedEffect(card.name) {
-        cover = withContext(Dispatchers.IO) { loadAlbumCover(context, card) }
+        cover = GalleryDecodeGate.withPermit {
+            withContext(Dispatchers.IO) { loadAlbumCover(context, card) }
+        }
     }
 
     Column(
         modifier = Modifier
-            .clip(RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(16.dp))
+            .doukCardSurface(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
+            .padding(7.dp)
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(1f)
-                .clip(RoundedCornerShape(14.dp))
+                .clip(RoundedCornerShape(12.dp))
                 .background(DoukColors.surfaceMuted)
         ) {
             cover?.let {
@@ -1979,19 +2063,21 @@ private fun AlbumCardCell(card: AlbumCard, onClick: () -> Unit) {
                 )
             }
         }
-        Spacer(modifier = Modifier.height(6.dp))
+        Spacer(modifier = Modifier.height(7.dp))
         Text(
             card.name,
             fontSize = 14.sp,
             fontWeight = FontWeight.Medium,
             color = DoukColors.textPrimary,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 3.dp)
         )
         Text(
             "${card.count} 张",
             fontSize = 11.sp,
-            color = DoukColors.textTertiary
+            color = DoukColors.textTertiary,
+            modifier = Modifier.padding(horizontal = 3.dp, vertical = 1.dp)
         )
     }
 }

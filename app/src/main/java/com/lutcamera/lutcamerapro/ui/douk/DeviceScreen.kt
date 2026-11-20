@@ -63,7 +63,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -89,7 +88,11 @@ fun DeviceScreen(
     state: DoukState,
     onAddDevice: () -> Unit,
     onOpenControl: () -> Unit,
-    serviceMode: String? = null
+    // 当前显示哪一组服务卡片：null = 初始设备页，"wifi" = Wi‑Fi|USB 页，"bluetooth" = 蓝牙页。
+    // 它和切换条是否展开是两件事：收起切换条后，页面仍停留在用户刚选的那一页。
+    serviceMode: String? = null,
+    // 底部「蓝牙 / Wi‑Fi|USB」切换条是否正在显示，只决定要不要给浮层让出 72dp。
+    serviceBarVisible: Boolean = false
 ) {
     var showManual by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -197,14 +200,22 @@ fun DeviceScreen(
             onManual = { showManual = true }
         )
 
-        PullIndicator(pull = pull, threshold = pullThreshold, refreshing = refreshing, seconds = searchSeconds)
+        // pull 用 lambda 传给指示条：拖拽时只重组顶部这一小块，
+        // 不再让整页（含照片、卡片、蓝牙列表）跟着每一个手指位移重组。
+        PullIndicator(
+            pullProvider = { pull },
+            threshold = pullThreshold,
+            refreshing = refreshing,
+            secondsProvider = { searchSeconds }
+        )
 
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 // 设备页切换条是浮层；显示时把滚动视口底部让出 72dp，
                 // 否则最后一张蓝牙/存储卡会被「蓝牙 | Wi‑Fi|USB」压住。
-                .padding(bottom = if (serviceMode != null) 72.dp else 0.dp)
+                // 收起切换条后只收回这 72dp，不改变当前显示的服务页。
+                .padding(bottom = if (serviceBarVisible) 72.dp else 0.dp)
                 .verticalScroll(scrollState)
                 .padding(horizontal = DoukSpace.page)
         ) {
@@ -350,15 +361,22 @@ private fun TopBarAction(icon: ImageVector, label: String, onClick: () -> Unit) 
 
 /** 下拉刷新的胶囊指示：随位移展开，达到阈值后提示松手 */
 @Composable
-private fun PullIndicator(pull: Float, threshold: Float, refreshing: Boolean, seconds: Int) {
+private fun PullIndicator(
+    pullProvider: () -> Float,
+    threshold: Float,
+    refreshing: Boolean,
+    secondsProvider: () -> Int
+) {
+    val pull = pullProvider()
     if (!refreshing && pull <= 0f) return
+    val seconds = secondsProvider()
     val density = LocalDensity.current
     val height = if (refreshing) 40.dp else with(density) { pull.coerceAtMost(threshold).toDp() }
     Box(modifier = Modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
         Row(
             modifier = Modifier
                 .clip(DoukShapes.pill)
-                .background(DoukColors.surfaceMuted)
+                .doukCardSurface(DoukShapes.pill, baseColor = DoukColors.surfaceMuted)
                 .padding(horizontal = DoukSpace.sm, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -434,13 +452,7 @@ private fun PhotoHero(photo: ImageBitmap?, connected: Boolean, modelName: String
                 modifier = Modifier
                     .fillMaxSize()
                     .clip(DoukShapes.card)
-                    .background(
-                        if (DoukColors.darkState.value) {
-                            Brush.linearGradient(listOf(Color(0xFF22252B), Color(0xFF14161A)))
-                        } else {
-                            Brush.linearGradient(listOf(Color(0xFFF1F2F5), Color(0xFFFAFBFC)))
-                        }
-                    )
+                    .background(DoukColors.surfaceMuted)
             ) {
                 // 没设照片时的占位：一圈很淡的主色光晕 + 相机图标，不写字
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -743,7 +755,7 @@ private fun BleRemoteCard(state: DoukState, context: android.content.Context) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(DoukShapes.cardSmall)
-                            .background(DoukColors.surfaceMuted)
+                            .doukCardSurface(DoukShapes.cardSmall, baseColor = DoukColors.surfaceMuted)
                             .clickable {
                                 withPermission {
                                     if (state.ble.phase.value == NikonBleGpsClient.Phase.READY) state.ble.disconnect()
@@ -985,7 +997,7 @@ private fun BleGpsCard(state: DoukState, context: android.content.Context) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(DoukShapes.cardSmall)
-                        .background(DoukColors.surfaceMuted)
+                        .doukCardSurface(DoukShapes.cardSmall, baseColor = DoukColors.surfaceMuted)
                         .clickable { withBlePermission { state.ble.connect(camera) } }
                         .padding(horizontal = DoukSpace.sm, vertical = DoukSpace.sm),
                     verticalAlignment = Alignment.CenterVertically
@@ -1122,7 +1134,7 @@ private fun GpsStatTile(label: String, value: String, modifier: Modifier = Modif
     Column(
         modifier = modifier
             .clip(DoukShapes.cardSmall)
-            .background(DoukColors.surfaceMuted)
+            .doukCardSurface(DoukShapes.cardSmall, baseColor = DoukColors.surfaceMuted)
             .padding(horizontal = 10.dp, vertical = 9.dp)
     ) {
         Text(label, style = DoukType.label, color = DoukColors.textTertiary, maxLines = 1)

@@ -50,6 +50,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import dev.chrisbanes.haze.hazeSource
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -64,6 +65,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.lutcamera.lutcamerapro.network.nikon.ble.DoukBleKeepAliveService
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleRemoteClient
@@ -150,6 +153,9 @@ fun DoukRoot() {
     // 在设备页再点一次底部「设备」，就在 Douk 栏上方弹出「蓝牙 / Wi‑Fi|USB」两个按钮
     var showDeviceServiceBar by remember { mutableStateOf(false) }
     var deviceServiceMode by remember { mutableStateOf("wifi") }
+    // 一旦用户切过服务页，内容就和切换条解绑：收起切换条只是藏掉两个按钮，
+    // 当前页（蓝牙卡片 / Wi‑Fi|USB 卡片）继续显示，不再弹回初始设备页。
+    var deviceServicePinned by remember { mutableStateOf(false) }
     // 离开设备页只收起切换条，不再复位服务模式：
     // 用户点了「蓝牙」后，下次回到设备页仍应停在蓝牙卡片，而不是被强行拉回 Wi‑Fi|USB。
     LaunchedEffect(currentRoute) {
@@ -159,6 +165,14 @@ fun DoukRoot() {
     }
     // 运行日志落盘需要 Context；Application 已安装，这里只作为兜底（重复调用无副作用）
     LaunchedEffect(Unit) { DoukLog.install(context) }
+
+    // 内置的 5 个尼康 N-Log 转 Rec709 LUT：首启复制到资源目录，之后资源页/监视直接可选
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { runCatching { BundledLuts.installIfNeeded(context) } }
+    }
+
+    // 监看面板「接管相机」按钮的亮起状态要和持久化值一致（默认关闭 = 不接管、相机屏幕照常显示）
+    LaunchedEffect(state) { state.syncTakeoverFromPref() }
 
     // 未连接相机时每 30 秒静默扫一次「连接过的设备」，设置里开着自动连接就直接连上
     LaunchedEffect(state) { state.startAutoConnectLoop(context) }
@@ -182,6 +196,7 @@ fun DoukRoot() {
         DoukColors.applyAccent(DoukPrefs.themeColor)
         DoukColors.applyGlass(DoukPrefs.glassEffect)
         DoukColors.applyMaterial(DoukPrefs.materialAlpha, DoukPrefs.materialBlur)
+        DoukColors.applyContrast(DoukPrefs.uiContrast)
         state.showBleGpsCard = DoukPrefs.showBleGpsCard
         state.showBleRemoteCard = DoukPrefs.showBleRemoteCard
         when (DoukPrefs.darkMode) {
@@ -190,11 +205,17 @@ fun DoukRoot() {
             else -> DoukColors.applyDark(systemDark)
         }
         state.showAddDeviceButton = DoukPrefs.showAddDeviceButton
+        state.reloadMonitorPrefs()
     }
 
-    // 全屏监视开/关时同步启停相机取景：不开监视就不占着相机的 LiveView 事务
-    LaunchedEffect(state.previewFullscreen) {
-        if (state.previewFullscreen) vm.startPreview() else vm.stopPreview()
+    // 全屏监视开/关时同步启停相机取景：不开监视就不占着相机的 LiveView 事务。
+    // 关键：连接是异步的，用户可能在「未连接」时先进了监视页；只监听 previewFullscreen
+    // 会错过连接完成的那一刻，导致监视页一直停在「等待相机画面」的黑屏。
+    LaunchedEffect(state.previewFullscreen, state.isConnected) {
+        when {
+            !state.previewFullscreen -> vm.stopPreview()
+            state.isConnected -> vm.startPreview()
+        }
     }
 
     // 「识别到连接过的设备自动连接」交给 DoukState 的自动连接循环：
@@ -232,17 +253,16 @@ fun DoukRoot() {
                 .background(DoukColors.backgroundBrush)
         ) {
             Box(Modifier.fillMaxSize()) {
-            // 最底层的背景源：只有渐变，没有文字/图标。卡片默认只取这一层，
-            // 所以不会把卡片自己的标题、按钮文字一起糊掉。
+            // 背景只负责铺色；不再单独做 hazeSource，避免底栏模糊时多抓一层全屏画面。
             Box(
                 Modifier
                     .fillMaxSize()
                     .background(DoukColors.backgroundBrush)
-                    .hazeSource(DoukColors.hazeState, zIndex = -1f)
             )
             if (showAddDevice) {
-                // 这两页在主 Scaffold 之外，edge-to-edge 下要自己让开系统栏
-                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                // 这两页在主 Scaffold 之外，edge-to-edge 下要自己让开系统栏。
+                // 页面上没有悬浮底栏，不做 hazeSource，省掉一次全屏 RenderNode 捕获。
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                     AddDeviceScreen(
                         state = state,
                         onBack = { showAddDevice = false },
@@ -256,12 +276,12 @@ fun DoukRoot() {
                 }
             } else if (showLog) {
                 BackHandler { showLog = false }
-                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                     DoukLogScreen(onBack = { showLog = false })
                 }
             } else if (showCameraGallery) {
                 BackHandler { showCameraGallery = false }
-                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().hazeSource(DoukColors.hazeState)) {
+                Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                     GalleryScreen(state = state, startInCamera = true)
                 }
             } else if (state.previewFullscreen) {
@@ -276,13 +296,20 @@ fun DoukRoot() {
                 Scaffold(
                     // 让根层 Surface 的渐变一直铺到系统导航条下面；否则 Scaffold 的实色底
                     // 会在底栏和手势条之间切出一条颜色不同的白带。
-                    containerColor = Color.Transparent
+                    containerColor = Color.Transparent,
+                    // 底栏不占 Scaffold 的 bottomBar 槽位：内容一直铺到屏幕最底部，
+                    // 滚动时从透明胶囊下面穿过去（胶囊背后的真实模糊才有东西可糊）。
+                    // 用户要求的「最下面那块增长一点」由各页自己的收尾间距负责（> 胶囊高度），
+                    // 所以滚到最底时最后一块内容会整体越过胶囊，不会被切掉。
+                    bottomBar = {}
                 ) { padding ->
-                    // 底栏不再占 Scaffold 的 bottomBar 槽位：内容铺满整屏，
-                    // Douk 栏作为一层浮在内容上方，页面滚到最底部时会从胶囊下方穿过。
-                    // haze 节点放在这一层：页面内容先画进 RenderNode，底栏/卡片的 hazeChild
-                    // 再从同一份内容里取真实高斯模糊，而不是自己画半透明白底。
-                    Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        // 内容只让开顶部状态栏；底部不再让出 100+dp，否则网格/卡片会被裁在胶囊那条线上。
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = padding.calculateTopPadding())
+                        ) {
                         // 页面内容单独做一层 haze 源：底栏是它的兄弟节点，不在源里，
                         // 所以底栏只糊「页面上的文字和图标」，不会糊自己。
                         Box(
@@ -290,13 +317,18 @@ fun DoukRoot() {
                                 .fillMaxSize()
                                 .hazeSource(DoukColors.hazeState, zIndex = 0f)
                         ) {
-                        NavHost(navController = nav, startDestination = "device") {
+                        NavHost(
+                            navController = nav,
+                            startDestination = "device",
+                            modifier = Modifier.fillMaxSize()
+                        ) {
                             composable("device") {
                                 DeviceScreen(
                                     state = state,
                                     onAddDevice = { showAddDevice = true },
                                     onOpenControl = { nav.navigate("control") { launchSingleTop = true } },
-                                    serviceMode = if (showDeviceServiceBar) deviceServiceMode else null
+                                    serviceMode = if (showDeviceServiceBar || deviceServicePinned) deviceServiceMode else null,
+                                    serviceBarVisible = showDeviceServiceBar
                                 )
                             }
                             composable("control") {
@@ -318,6 +350,7 @@ fun DoukRoot() {
                             }
                         }
                         }
+                        }
                         Column(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
@@ -328,7 +361,11 @@ fun DoukRoot() {
                             ) {
                                 DeviceServiceSwitcher(
                                     mode = deviceServiceMode,
-                                    onSelect = { deviceServiceMode = it }
+                                    onSelect = {
+                                        deviceServiceMode = it
+                                        // 记下用户这次选的服务页；之后即使收起切换条也保持不跳页
+                                        deviceServicePinned = true
+                                    }
                                 )
                             }
                             DoukBottomBar(
@@ -347,6 +384,34 @@ fun DoukRoot() {
                         }
                     }
                 }
+            }
+            // 保护文件导入确认：设备页有一份，这里补一份全局的。
+            // 用户连上相机后通常停在控制/图库页，只在设备页弹的话确认框永远看不到，
+            // 自动导入就一直卡在「等待确认」上，表现就是保护文件从来不导入。
+            if (state.lockedImportPrompt && currentRoute != "device") {
+                val onlyNew = DoukPrefs.lockedNewOnly
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { state.dismissLockedImport() },
+                    title = {
+                        Text(if (onlyNew) "导入连接后新增的锁定照片？" else "导入相机里所有锁定照片？")
+                    },
+                    text = {
+                        Text(
+                            if (onlyNew) "只导入本次连接相机之后新拍/新锁定的文件，已经锁定过的旧文件不会重复导入。"
+                            else "导入相机里所有标了保护/锁定的文件，逐张保存到应用图库，耗时取决于数量。"
+                        )
+                    },
+                    confirmButton = {
+                        androidx.compose.material3.TextButton(
+                            onClick = { state.confirmLockedImport() }
+                        ) { Text("开始导入", color = DoukColors.accent) }
+                    },
+                    dismissButton = {
+                        androidx.compose.material3.TextButton(
+                            onClick = { state.dismissLockedImport() }
+                        ) { Text("暂不", color = DoukColors.textSecondary) }
+                    }
+                )
             }
             if (gestureNavigation) {
                 Box(

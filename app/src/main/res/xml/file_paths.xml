@@ -2,4 +2,6 @@
 <paths>
     <!-- 只允许分享缓存目录里的诊断 ZIP -->
     <cache-path name="diagnostics" path="diagnostics/" />
+    <!-- 应用内下载的更新 APK，交给系统安装器读取 -->
+    <cache-path name="updates" path="updates/" />
 </paths>

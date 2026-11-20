@@ -87,7 +87,7 @@ fun CopyrightScreen(state: DoukState, onBack: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(DoukShapes.cardSmall)
-                    .background(DoukColors.accentSoft)
+                    .doukCardSurface(DoukShapes.cardSmall, tint = DoukColors.accentSoft)
                     .clickable {
                         if (!state.isConnected) {
                             status = "未连接相机，读不到机身版权"

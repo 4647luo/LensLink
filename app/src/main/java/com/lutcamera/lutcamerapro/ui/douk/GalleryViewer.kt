@@ -264,8 +264,7 @@ internal fun PhotoViewerScreen(
     }
 
     fun deleteNow() {
-        val file = appFile()
-        if (file == null) {
+        if (item.origin != "app") {
             message = when (item.origin) {
                 "phone" -> "手机相册里的照片请到系统相册删除"
                 else -> "相机里的照片请到相机上删除"
@@ -274,18 +273,14 @@ internal fun PhotoViewerScreen(
         }
         scope.launch {
             val ok = withContext(Dispatchers.IO) {
-                val gone = file.delete()
-                if (gone) {
-                    runCatching {
-                        android.media.MediaScannerConnection.scanFile(
-                            context, arrayOf(file.absolutePath), null, null
-                        )
-                    }
-                    state.galleryRefreshTick++
-                }
-                gone
+                GalleryFileOps.deleteAppFiles(context, listOf(item.fileName) + item.extraFiles)
             }
-            if (ok) onDeleted() else message = "删除失败，文件可能被占用"
+            if (ok) {
+                state.galleryRefreshTick++
+                onDeleted()
+            } else {
+                message = "删除失败，文件可能被占用"
+            }
         }
     }
 
@@ -1118,6 +1113,13 @@ private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
                     else -> "相机机身存储 · 通过 PTP 读取，未落到本机"
                 }
             )
+            // EXIF：机身、镜头、曝光三要素、白平衡、色彩空间等，两列标签/值逐行排
+            if (!m?.exifRows.isNullOrEmpty()) {
+                DetailRow(
+                    "EXIF",
+                    m!!.exifRows.joinToString("\n") { (key, value) -> "$key：$value" }
+                )
+            }
             // IPTC 字段一个都没有就整行不显示，不再写「这张没有写入 IPTC」这种废话
             val iptcLines = buildList {
                 m?.title?.let { add("标题：$it") }

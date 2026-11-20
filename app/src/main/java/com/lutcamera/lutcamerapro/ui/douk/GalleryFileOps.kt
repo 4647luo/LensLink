@@ -41,22 +41,82 @@ object GalleryFileOps {
         val copyright: String?,
         /** 拍摄地点（EXIF GPS），没有就留 null，详情页据此决定要不要给「地图查看」 */
         val lat: Double? = null,
-        val lon: Double? = null
+        val lon: Double? = null,
+        /** 详情页「EXIF」一段：相机/镜头/曝光/白平衡等键值对，按读取顺序展示 */
+        val exifRows: List<Pair<String, String>> = emptyList()
     )
 
     private const val APP_ROOT = "Douk"
     private const val PHONE_ALBUM_ROOT = "LensLink"
 
-    /** 应用自己的两个目录：Pictures/Douk 与 DCIM/Douk。 */
+    /** 应用自己的目录：Pictures/Douk 与 DCIM/Douk，外加 0.0.139 之前的 LutCameraPro 旧目录。 */
     fun appRoots(): List<File> = listOf(
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), APP_ROOT),
-        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), APP_ROOT)
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), APP_ROOT),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "LutCameraPro"),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCameraPro")
     )
 
     fun locateAppFile(fileName: String): File? =
         appRoots().filter { it.exists() }.flatMap { root ->
             root.walkTopDown().maxDepth(3).filter { it.isFile && it.name == fileName }.toList()
         }.firstOrNull()
+
+    /**
+     * 判重名：去掉扩展名、去掉「 (1)」「 (2)」这类系统重名后缀，统一小写。
+     * 同名即视为同一张照片——「仅缩略图」模式存下来的副本尺寸和机身原图不一致，
+     * 只比大小会漏判，进而多下一份 (1).JPG，这里只认名字。
+     */
+    fun diskBaseName(fileName: String): String =
+        fileName.substringBeforeLast('.', fileName).lowercase()
+            .replace(Regex(""" \(\d+\)$"""), "")
+
+    /**
+     * 扫一遍应用内所有落盘文件（含 0.0.139 之前的 LutCameraPro 旧目录），做成文件名索引。
+     * 保护文件导入前先比对这份索引，就能跳过「以前下过但没进过去重记录」的照片，
+     * 不会再生成 xxx (1).JPG 这种重复副本。
+     */
+    fun appFileNameIndex(): Set<String> {
+        val names = HashSet<String>()
+        appRoots().filter { it.exists() }.forEach { root ->
+            runCatching {
+                root.walkTopDown().maxDepth(3).filter { it.isFile }.forEach { file ->
+                    names += diskBaseName(file.name)
+                }
+            }
+        }
+        return names
+    }
+
+    /**
+     * 删除应用内文件：直接 File.delete 与 MediaStore 记录删除双保险。
+     * Android 10+ 公共目录只靠 File.delete 经常返回失败，必须同时清媒体库条目。
+     */
+    fun deleteAppFiles(context: Context, names: List<String>): Boolean {
+        var removed = false
+        names.distinct().forEach { name ->
+            val file = locateAppFile(name)
+            if (file != null) {
+                removed = runCatching { file.delete() }.getOrDefault(false) || removed
+            }
+            val collections = listOf(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            )
+            collections.forEach { collection ->
+                val deleted = runCatching {
+                    context.contentResolver.delete(
+                        collection,
+                        "${MediaStore.Images.Media.DISPLAY_NAME}=?",
+                        arrayOf(name)
+                    )
+                }.getOrDefault(0)
+                removed = deleted > 0 || removed
+            }
+        }
+        return removed
+    }
 
     /** 应用内相册：直接子目录算一个相册，根目录下的散图归到「应用相册」。 */
     fun appAlbums(): List<Album> {
@@ -105,12 +165,17 @@ object GalleryFileOps {
         val taken = exif?.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)?.let { parseExifDate(it) }
         val width = exif?.let { it.getAttributeInt(ExifInterface.TAG_PIXEL_X_DIMENSION, 0) }?.takeIf { it > 0 }
         val height = exif?.let { it.getAttributeInt(ExifInterface.TAG_PIXEL_Y_DIMENSION, 0) }?.takeIf { it > 0 }
-        val exposure = buildList {
-            exif?.getAttribute(ExifInterface.TAG_F_NUMBER)?.let { add("f/$it") }
-            exif?.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)?.let { add("${it}s") }
-            exif?.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.let { add("ISO $it") }
-            exif?.getAttribute(ExifInterface.TAG_FOCAL_LENGTH)?.let { add("${it}mm") }
-        }.joinToString(" · ").takeIf { it.isNotBlank() }
+        // 摘要行与 EXIF 段用同一套格式化：快门写 1/50s、焦距写 18mm，别把 "0.02"、"180/10" 直接抛给用户
+        val exposure = exif?.let { e ->
+            buildList {
+                rationalText(e.getAttribute(ExifInterface.TAG_F_NUMBER))?.let { add("f/${trimNum(it)}") }
+                rationalText(e.getAttribute(ExifInterface.TAG_EXPOSURE_TIME))?.let { t ->
+                    add(if (t > 0.0 && t < 0.5) "1/${Math.round(1.0 / t)}s" else "${trimNum(t)}s")
+                }
+                e.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.let { add("ISO $it") }
+                rationalText(e.getAttribute(ExifInterface.TAG_FOCAL_LENGTH))?.let { add("${trimNum(it)}mm") }
+            }.joinToString(" · ").takeIf { it.isNotBlank() }
+        }
         // exifinterface 没有暴露 Windows 的 XPTitle，标题与关键词走描述与注释两栏
         val title = exif?.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION)?.trim()?.takeIf { it.isNotBlank() }
         val keywords = exif?.getAttribute(ExifInterface.TAG_USER_COMMENT)?.trim()?.takeIf { it.isNotBlank() }
@@ -147,8 +212,88 @@ object GalleryFileOps {
             artist = artist,
             copyright = copyright,
             lat = latD,
-            lon = lonD
+            lon = lonD,
+            exifRows = exifRowsOf(exif)
         )
+    }
+
+    /** EXIF 里能读到的相机参数，按拍摄者看得懂的顺序排；读不到的不占行。 */
+    private fun exifRowsOf(exif: ExifInterface?): List<Pair<String, String>> {
+        if (exif == null) return emptyList()
+        fun tag(tagName: String) = exif.getAttribute(tagName)?.trim()?.takeIf { it.isNotBlank() }
+        val rows = mutableListOf<Pair<String, String>>()
+        fun add(key: String, value: String?) { if (!value.isNullOrBlank()) rows += key to value }
+
+        add("相机", listOfNotNull(tag(ExifInterface.TAG_MAKE), tag(ExifInterface.TAG_MODEL))
+            .joinToString(" ").takeIf { it.isNotBlank() })
+        add("镜头", tag(ExifInterface.TAG_LENS_MODEL))
+        add("曝光程序", exifEnum(tag(ExifInterface.TAG_EXPOSURE_PROGRAM),
+            mapOf("0" to "未定义", "1" to "手动", "2" to "程序自动", "3" to "光圈优先",
+                "4" to "快门优先", "5" to "创意程序", "6" to "人像模式", "7" to "风景模式", "8" to "运动模式")))
+        add("快门", rationalText(tag(ExifInterface.TAG_EXPOSURE_TIME))?.let { t ->
+            if (t > 0.0 && t < 0.5) "1/${Math.round(1.0 / t)}s" else "${trimNum(t)}s"
+        })
+        add("光圈", rationalText(tag(ExifInterface.TAG_F_NUMBER))?.let { "f/${trimNum(it)}" })
+        add("ISO", tag(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.let { "ISO $it" })
+        val focal = rationalText(tag(ExifInterface.TAG_FOCAL_LENGTH))
+        val focal35 = rationalText(tag(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM))
+        add("焦距", listOfNotNull(
+            focal?.let { "${trimNum(it)}mm" },
+            focal35?.takeIf { it > 0.0 }?.let { "（等效 ${trimNum(it)}mm）" }
+        ).joinToString(" ").takeIf { it.isNotBlank() })
+        add("曝光补偿", rationalText(tag(ExifInterface.TAG_EXPOSURE_BIAS_VALUE))?.let { ev ->
+            val sign = if (ev > 0.0) "+" else ""
+            "$sign${trimNum(ev)} EV"
+        })
+        add("测光", exifEnum(tag(ExifInterface.TAG_METERING_MODE),
+            mapOf("0" to "未知", "1" to "平均", "2" to "中央重点", "3" to "点测光",
+                "4" to "多点", "5" to "评价", "6" to "局部", "255" to "其它")))
+        add("白平衡", exifEnum(tag(ExifInterface.TAG_WHITE_BALANCE),
+            mapOf("0" to "自动", "1" to "手动")))
+        add("闪光灯", exifEnum(tag(ExifInterface.TAG_FLASH),
+            mapOf("0" to "未闪光", "1" to "已闪光", "5" to "已闪光（未检测到反光）",
+                "7" to "已闪光（检测到反光）", "9" to "强制闪光", "16" to "关闭",
+                "24" to "自动", "25" to "自动闪光", "32" to "无闪光功能")))
+        add("色彩空间", exifEnum(tag(ExifInterface.TAG_COLOR_SPACE),
+            mapOf("1" to "sRGB", "65535" to "Adobe RGB")))
+        add("拍摄时间", tag(ExifInterface.TAG_DATETIME_ORIGINAL))
+        add("数字化时间", tag(ExifInterface.TAG_DATETIME_DIGITIZED))
+        add("处理软件", tag(ExifInterface.TAG_SOFTWARE))
+        add("方向", exifEnum(tag(ExifInterface.TAG_ORIENTATION),
+            mapOf("1" to "正常", "2" to "水平翻转", "3" to "旋转 180°", "4" to "垂直翻转",
+                "5" to "旋转 90° 并水平翻转", "6" to "旋转 90°", "7" to "旋转 270° 并水平翻转",
+                "8" to "旋转 270°")))
+        val px = tag(ExifInterface.TAG_PIXEL_X_DIMENSION)
+        val py = tag(ExifInterface.TAG_PIXEL_Y_DIMENSION)
+        if (px != null && py != null) add("像素尺寸", "${px}×${py}px")
+        val altitude = exif.getAltitude(Double.NaN)
+        if (!altitude.isNaN()) add("海拔", "${"%.1f".format(altitude)}m")
+        return rows
+    }
+
+    /** EXIF 枚举值（库读出来是 "1"、"65535" 这种字符串）翻译成中文，查不到就原样返回。 */
+    private fun exifEnum(raw: String?, labels: Map<String, String>): String? {
+        val value = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return labels[value] ?: value
+    }
+
+    /** EXIF 数值常是 "180/10"、"-1/3" 这种分数字符串，转成可比较的小数。 */
+    private fun rationalText(raw: String?): Double? {
+        val value = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val slash = value.indexOf('/')
+        return if (slash > 0) {
+            val numerator = value.substring(0, slash).trim().toDoubleOrNull()
+            val denominator = value.substring(slash + 1).trim().toDoubleOrNull()
+            if (numerator != null && denominator != null && denominator != 0.0) numerator / denominator else null
+        } else value.toDoubleOrNull()
+    }
+
+    /** 去掉多余小数：18.0 → 18，1.53 → 1.5 */
+    private fun trimNum(value: Double): String {
+        val rounded = Math.round(value * 10.0) / 10.0
+        return if (Math.abs(rounded - Math.round(rounded)) < 0.0001) {
+            Math.round(rounded).toString()
+        } else String.format(java.util.Locale.US, "%.1f", rounded)
     }
 
     /**
@@ -350,6 +495,22 @@ object GalleryFileOps {
                 }
             }
         }
+        // 相册里的图同样能读到 EXIF：用 uri 开流给 ExifInterface，读不到就留空
+        val exif = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { ExifInterface(it) }
+        }.getOrNull()
+        val camera = exif?.getAttribute(ExifInterface.TAG_MODEL)?.trim()?.takeIf { it.isNotBlank() }
+        val lens = exif?.getAttribute(ExifInterface.TAG_LENS_MODEL)?.trim()?.takeIf { it.isNotBlank() }
+        val exposure = exif?.let { e ->
+            buildList {
+                rationalText(e.getAttribute(ExifInterface.TAG_F_NUMBER))?.let { add("f/${trimNum(it)}") }
+                rationalText(e.getAttribute(ExifInterface.TAG_EXPOSURE_TIME))?.let { t ->
+                    add(if (t > 0.0 && t < 0.5) "1/${Math.round(1.0 / t)}s" else "${trimNum(t)}s")
+                }
+                e.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)?.let { add("ISO $it") }
+                rationalText(e.getAttribute(ExifInterface.TAG_FOCAL_LENGTH))?.let { add("${trimNum(it)}mm") }
+            }.joinToString(" · ").takeIf { it.isNotBlank() }
+        }
         return Meta(
             fileName = fileName,
             sizeBytes = sizeBytes,
@@ -357,9 +518,13 @@ object GalleryFileOps {
             width = width,
             height = height,
             takenAt = taken,
-            camera = null, lens = null, exposureLine = null,
-            title = null, keywords = null, artist = null, copyright = null,
-            lat = lat, lon = lon
+            camera = camera, lens = lens, exposureLine = exposure,
+            title = exif?.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION)?.trim()?.takeIf { it.isNotBlank() },
+            keywords = exif?.getAttribute(ExifInterface.TAG_USER_COMMENT)?.trim()?.takeIf { it.isNotBlank() },
+            artist = exif?.getAttribute(ExifInterface.TAG_ARTIST)?.trim()?.takeIf { it.isNotBlank() },
+            copyright = exif?.getAttribute(ExifInterface.TAG_COPYRIGHT)?.trim()?.takeIf { it.isNotBlank() },
+            lat = lat, lon = lon,
+            exifRows = exifRowsOf(exif)
         )
     }
 
@@ -544,7 +709,7 @@ object GalleryFileOps {
         SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(raw)?.time
     }.getOrNull()
 
-    fun dateText(millis: Long?): String? = millis?.let {        SimpleDateFormat("yyyy年M月d日  星期", Locale.CHINA).format(Date(it)) +
+    fun dateText(millis: Long?): String? = millis?.let {        SimpleDateFormat("yyyy年M月d日  EEEE", Locale.CHINA).format(Date(it)) +
             "\n" + SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))
     }
 

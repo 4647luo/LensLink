@@ -286,3 +286,42 @@ internal object FilterLibrary {
         return Lut3D(size, data)
     }
 }
+
+/**
+ * 内置尼康 N-Log 转 Rec709 LUT：随 APK 打包在 assets/luts，
+ * 首启（或升级后第一次启动）复制到 filesDir/lut，资源页/监视 LUT 列表立刻能用。
+ * 已经存在的同名文件不覆盖，用户自己换过的版本不会被抹掉。
+ */
+internal object BundledLuts {
+    private const val ASSET_DIR = "luts"
+    private const val CATEGORY = "尼康 N-Log"
+
+    fun installIfNeeded(context: Context) {
+        val dir = DoukPrefs.lutDir(context)
+        val names = runCatching { context.assets.list(ASSET_DIR) }
+            .getOrNull()
+            ?.filter { it.endsWith(".cube", ignoreCase = true) }
+            ?: return
+        names.forEach { name ->
+            val target = File(dir, name)
+            if (target.exists() && target.length() > 1024) {
+                if (DoukPrefs.filterCategory(name) == "未分类") DoukPrefs.setFilterCategory(name, CATEGORY)
+                return@forEach
+            }
+            runCatching {
+                context.assets.open("$ASSET_DIR/$name").use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+                DoukPrefs.setFilterCategory(name, CATEGORY)
+                com.lutcamera.lutcamerapro.log.DoukLog.i(
+                    "Lut", "BUNDLED_INSTALL", "file" to name, "bytes" to target.length()
+                )
+            }.onFailure {
+                com.lutcamera.lutcamerapro.log.DoukLog.w(
+                    "Lut", "BUNDLED_FAIL", "file" to name, "err" to it.message
+                )
+                target.delete()
+            }
+        }
+    }
+}

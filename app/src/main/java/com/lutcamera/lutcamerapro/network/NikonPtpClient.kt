@@ -80,10 +80,36 @@ class NikonPtpClient {
     val canControlCamera: Boolean get() = connection?.let { !it.restricted } ?: false
     @Volatile var autoTransferJpeg = false
     /**
-     * 空闲保活间隔。Wi‑Fi 连接且设置里开启「保持相机唤醒」时由 UI 调成 6 秒，
-     * 其他情况保持 15 秒；只发 0x1001 这类只读心跳，不写相机菜单。
+     * 空闲保活间隔。固定 15 秒，只发 0x1001 这类只读心跳，不写相机菜单。
+     * 0.0.143 起取消「Wi‑Fi 下压到 6 秒」的老做法：那是把相机反复唤醒的元凶。
      */
     @Volatile var keepAliveIntervalMs: Long = 15_000L
+    /**
+     * 是否允许接管相机（0x9435/0x90C2）：false 时取景只发 0x9201，
+     * 机身屏幕继续显示画面，也不出「已连接至智能设备」；由监看里的「接管相机」开关控制。
+     */
+    @Volatile var takeoverHostControl: Boolean = false
+    /**
+     * 传感器像素尺寸：0x9205 ChangeAfArea 要的是传感器坐标，不是取景 JPEG 坐标。
+     * 连上后按机身型号查表，查不到就按 6000×4000 估算（D7200 级别，偏差可接受）。
+     */
+    @Volatile private var sensorWidthPx: Int = 6000
+    @Volatile private var sensorHeightPx: Int = 4000
+
+    /** 机身型号 → 传感器分辨率（用于 ChangeAfArea 坐标换算） */
+    private fun sensorSizeForModel(model: String): Pair<Int, Int> {
+        val m = model.uppercase().replace(" ", "")
+        return when {
+            m.contains("Z9") || m.contains("Z8") || m.contains("Z7") -> 8256 to 5504
+            m.contains("Z50") || m.contains("Z30") || m.contains("ZFC") -> 5568 to 3712
+            m.contains("Z6") -> 6048 to 4024
+            m.contains("Z5") -> 6016 to 4016
+            m.contains("Z") -> 6048 to 4024
+            m.contains("D850") || m.contains("D500") || m.contains("D7500") -> 5568 to 3712
+            m.contains("D7") || m.contains("D6") -> 6000 to 4000
+            else -> 6000 to 4000
+        }
+    }
     private var watchJob: Job? = null
     private var liveViewJob: Job? = null
     private val liveControl = Mutex()
@@ -244,6 +270,11 @@ class NikonPtpClient {
                 c.pollEvents = 0x90c7 in device.operations
                 trace?.note("${c.label} CAPABILITIES restricted=${c.restricted} operations=${device.operations.joinToString { "0x" + it.toString(16) }} properties=${device.properties.joinToString { "0x" + it.toString(16) }}")
                 _cameraLabel.value = "${device.model} · ${device.firmware}"
+                sensorSizeForModel(device.model).let { (w, h) ->
+                    sensorWidthPx = w
+                    sensorHeightPx = h
+                    DoukLog.i("NikonPtp", "SENSOR_SIZE", "model" to device.model, "size" to "${w}x$h")
+                }
                 DoukLog.i("NikonPtp", "CAPABILITIES", "model" to device.model, "firmware" to device.firmware,
                     "commands" to device.operations.size, "props" to device.properties.size, "restricted" to c.restricted)
                 // 把机身公布的操作码整份落盘：排查图库/取景为什么被拒时按这个对表
@@ -684,7 +715,7 @@ class NikonPtpClient {
         val decoder = launch(Dispatchers.Default) {
             for (jpeg in frames) {
                 val start = System.nanoTime()
-                val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: continue
+                val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, LiveViewQuality.decodeOptions()) ?: continue
                 decodeNanos.addAndGet(System.nanoTime() - start)
                 decoded.incrementAndGet()
                 width = bitmap.width; height = bitmap.height
@@ -710,13 +741,13 @@ class NikonPtpClient {
                 lastReceived=r; lastDecoded=d; lastBytes=b; lastRequest=rq; lastDecode=dq; lastTime=now
             }
         }
+        var level = 0
         try {
-            // Z 系取景必须先进主机控制，否则 0x9201 会被拒或取帧一律 0xA00B
-            enterHostControl(c)
-            val started = operation(0x9201, expected = c).response.code
-            Log.i(TAG, "LIVEVIEW_START 0x9201 -> 0x${"%04X".format(started)}")
-            DoukLog.i("LiveView", "START", "cmd" to "0x9201", "code" to "0x%04X".format(started))
-            if (started != 0x2001 && started != 0x2019) throw CameraResponse(started)
+            // 先决条件按「是否接管相机」分两条路：
+            // - 接管：完整 0x9435(1)/0x90C2(1)/0xD1A6=0，机身进入遥控界面；
+            // - 不接管（默认）：绝不动 0x9435/0x90C2，先直接 0x9201，取不到帧再逐级升级，
+            //   这样相机屏幕仍然显示实时画面，也不会弹「已连接至智能设备」。
+            level = prepareLiveView(c)
             ready(c)
             var retries = 0
             var reactivations = 0
@@ -794,9 +825,81 @@ class NikonPtpClient {
             frames.close(); decoder.cancel(); reporter.cancel()
             if (connection === c) {
                 _isLiveViewActive.value = false
-                runCatching { leaveHostControl(c) }
+                runCatching { endLiveViewSession(c, level) }
             }
         }
+    }
+
+    /**
+     * 取景前的准备，返回真正用上的方案：
+     * 0 = 纯取景（机身屏幕照常显示，默认）、1 = 只切相机模式、2 = 切应用模式、
+     * 3 = 完整接管（用户主动点「接管相机」）。
+     *
+     * 尼康各机型对「不接管能不能取景」并不一致：Z50II 只发 0x9201 就能出帧，
+     * 部分机型要求 0x90C2，还有些必须 0x9435。这里逐级试，取到第一帧就停，
+     * 保证默认路径不会切到机身遥控界面。
+     */
+    private suspend fun prepareLiveView(c: Connection): Int {
+        if (takeoverHostControl) {
+            enterHostControl(c)
+            val code = startLiveViewOp(c)
+            DoukLog.i("LiveView", "PREP", "plan" to 3, "code" to "0x%04X".format(code))
+            if (code != 0x2001 && code != 0x2019) throw CameraResponse(code)
+            return 3
+        }
+        if (startAndProbe(c, 0)) return 0
+        // 第一级失败：只把机身切到相机控制模式（不切应用模式），有些机型靠这一步放行取景
+        runCatching {
+            operation(0x90c2, intArrayOf(1), expected = c)
+            operation(0x1016, intArrayOf(0xd1a6), byteArrayOf(0), expected = c)
+        }
+        if (startAndProbe(c, 1)) return 1
+        // 第二级失败：再补应用模式，此时机身允许取景但 Display 可能已经让给 App
+        runCatching { operation(0x9435, intArrayOf(1), expected = c) }
+        if (startAndProbe(c, 2)) return 2
+        throw IOException("相机拒绝在保留机身屏幕的情况下取景，请点「接管相机」")
+    }
+
+    /** 发 0x9201 并返回响应码（0x2001 = OK，0x2019 = DeviceBusy 也算接受）。 */
+    private suspend fun startLiveViewOp(c: Connection): Int =
+        runCatching { operation(0x9201, expected = c).response.code }.getOrDefault(-1)
+
+    /** 起一次取景事务并抓一帧验证；失败就把事务停掉，留给下一级方案重试。 */
+    private suspend fun startAndProbe(c: Connection, plan: Int): Boolean {
+        val code = startLiveViewOp(c)
+        DoukLog.i("LiveView", "PREP", "plan" to plan, "code" to "0x%04X".format(code))
+        if (code != 0x2001 && code != 0x2019) return false
+        runCatching { ready(c) }
+        var probe = runCatching { operation(0x9428, expected = c) }.getOrNull()
+        if (probe == null || probe.response.code != 0x2001 || probe.data.size <= 512) {
+            // 老机型没有 0x9428（GetLiveViewImageEx），回落到 0x9203 再验证一次
+            val alt = runCatching { operation(0x9203, expected = c) }.getOrNull()
+            if (alt != null && alt.response.code == 0x2001 && alt.data.size > 512) probe = alt
+        }
+        val result = probe
+        val ok = result != null && result.response.code == 0x2001 && result.data.size > 512
+        DoukLog.i(
+            "LiveView", "PROBE", "plan" to plan,
+            "code" to "0x%04X".format(result?.response?.code ?: -1),
+            "bytes" to (result?.data?.size ?: 0)
+        )
+        if (!ok) runCatching { operation(0x9202, expected = c) }
+        return ok
+    }
+
+    /** 收尾：只停取景；接管过机身才把控制权/应用模式还回去。 */
+    private suspend fun endLiveViewSession(c: Connection, level: Int) {
+        runCatching { operation(0x9202, expected = c) }
+        if (level >= 3 || takeoverHostControl) {
+            leaveHostControl(c)
+            return
+        }
+        if (level >= 2) runCatching { operation(0x9435, intArrayOf(0), expected = c) }
+        if (level >= 1) {
+            runCatching { operation(0x90c2, intArrayOf(0), expected = c) }
+            runCatching { operation(0x1016, intArrayOf(0xd1a6), byteArrayOf(1), expected = c) }
+        }
+        c.trace?.note("${c.label} LIVEVIEW_END plan=$level")
     }
 
     /** 进入尼康主机控制：0x9435(1) → 0x90C2(1) → 0xD1A6=0（老机型不支持时静默跳过）。 */
@@ -838,8 +941,9 @@ class NikonPtpClient {
                 _isLiveViewActive.value = false
                 liveViewJob?.cancelAndJoin(); liveViewJob = null
                 if (connection === c) runCatching { operation(0x9202, expected = c) }
-                // 关掉监视就把控制权还给机身，否则机身上的按键/拨盘一直是「被应用接管」的状态
-                if (connection === c) leaveHostControl(c)
+                // 关掉监视就把控制权还给机身，否则机身上的按键/拨盘一直是「被应用接管」的状态。
+                // 没接管过就不去碰 0x9435/0x90C2，机身屏幕本来就还在显示。
+                if (connection === c) endLiveViewSession(c, 0)
                 if (connection === c) _connectionStage.value = "已连接，取景已暂停"
             }
         }
@@ -965,8 +1069,47 @@ class NikonPtpClient {
     }
 
     fun triggerCapture() = control(0x9207, intArrayOf(-1, 0))    fun triggerAf() = control(0x90c1)
-    fun setFocusPoint(normX: Float, normY: Float) = control(0x9206,
-        intArrayOf((normX.coerceIn(0f,1f)*1000).toInt(), (normY.coerceIn(0f,1f)*1000).toInt()))
+
+    /**
+     * 点哪对哪：0x9205 ChangeAfArea 的两个参数是**传感器像素坐标**（不是取景 JPEG 的
+     * 640×480，也不是 0..1000），所以按机身型号的传感器分辨率换算，再发 0x90C1 驱动一次对焦。
+     * 参考实测（PiCamControl / libgphoto2）：changeafarea 只写不回读，坐标必须是 sensor 像素。
+     */
+    fun setFocusPoint(normX: Float, normY: Float) {
+        val c = connection ?: return
+        val nx = normX.coerceIn(0f, 1f)
+        val ny = normY.coerceIn(0f, 1f)
+        val x = (nx * sensorWidthPx).toInt()
+        val y = (ny * sensorHeightPx).toInt()
+        scope.launch {
+            try {
+                var code = -1
+                repeat(6) { attempt ->
+                    val r = runCatching { operation(0x9205, intArrayOf(x, y), expected = c) }.getOrNull()
+                    code = r?.response?.code ?: -1
+                    // 取景事务抢着命令通道时相机回 DeviceBusy，等一拍再发，不算失败
+                    if (code == 0x2019 || code == 0xa004) { delay(60); return@repeat }
+                    return@repeat
+                }
+                DoukLog.i("Focus", "CHANGE_AF_AREA", "x" to x, "y" to y,
+                    "sensor" to "${sensorWidthPx}x${sensorHeightPx}", "code" to "0x%04X".format(code))
+                if (code == 0x2001) {
+                    // 区域挪好后再驱动一次 AF，否则只挪框不对焦
+                    val af = runCatching { operation(0x90c1, expected = c) }.getOrNull()
+                    DoukLog.i("Focus", "AF_DRIVE", "code" to "0x%04X".format(af?.response?.code ?: -1))
+                    if (af != null && af.response.code != 0x2001) {
+                        activeListener?.onLog("对焦驱动失败：0x${"%04X".format(af.response.code)}")
+                    }
+                } else {
+                    activeListener?.onLog("对焦点下发失败：0x${"%04X".format(code)}")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                activeListener?.onLog("对焦点下发失败：${e.message}")
+            }
+        }
+    }
     fun toggleMovieRecord(startRecord: Boolean) = control(if (startRecord) 0x920a else 0x920b)
 
     fun rememberOriginalCompression(value: Long, version: Long) = synchronized(lifecycle) {
@@ -1343,7 +1486,7 @@ class NikonPtpClient {
     @Volatile private var storageCacheAt: Long = 0L
     fun invalidateStorageCache() { storageCache = null }
     suspend fun fetchCameraPhotos(startIdx: Int = 0, count: Int = 50, prepareTransfer: Boolean = false,
-        force: Boolean = false): List<com.lutcamera.lutcamerapro.model.CameraStorageFile> = withContext(Dispatchers.IO) {
+        force: Boolean = false, quiet: Boolean = false): List<com.lutcamera.lutcamerapro.model.CameraStorageFile> = withContext(Dispatchers.IO) {
         storageStatus = "正在读取相机文件列表"
         val resultList = mutableListOf<com.lutcamera.lutcamerapro.model.CameraStorageFile>()
         val storageConnection = connection ?: return@withContext resultList
@@ -1537,10 +1680,13 @@ class NikonPtpClient {
                 val ordered = photoHandles
                 val validStart = minOf(startIdx, ordered.size)
                 val endIdx = minOf(validStart + count, ordered.size)
-                activeListener?.onLog(
-                    "📂 已读到机身最新 ${ordered.size} 张，返回区间 [$validStart - $endIdx]" +
-                        if (hasMore) "，更早的照片下拉再读" else ""
-                )
+                // 保护文件巡检每几秒跑一次，日志里不必每次都写这一行
+                if (!quiet) {
+                    activeListener?.onLog(
+                        "📂 已读到机身最新 ${ordered.size} 张，返回区间 [$validStart - $endIdx]" +
+                            if (hasMore) "，更早的照片下拉再读" else ""
+                    )
+                }
                 ordered.subList(validStart, endIdx).forEach { handle ->
                     entryCache[handle]?.let { resultList.add(it) }
                 }

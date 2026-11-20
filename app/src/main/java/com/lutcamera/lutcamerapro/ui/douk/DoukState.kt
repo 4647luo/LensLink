@@ -6,6 +6,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -17,6 +18,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import com.lutcamera.lutcamerapro.log.DoukLog
 import com.lutcamera.lutcamerapro.model.CameraStorageFile
 import com.lutcamera.lutcamerapro.network.CameraLanProbe
+import com.lutcamera.lutcamerapro.network.LiveViewQuality
 import com.lutcamera.lutcamerapro.network.NikonPtpClient
 import com.lutcamera.lutcamerapro.network.UsbPtpClient
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient
@@ -199,6 +201,11 @@ class DoukState(
     var previewFullscreen by mutableStateOf(false)
     var photoCounter by mutableStateOf(0)
     var lastHint by mutableStateOf("")
+    /** 参数被锁/未下发时给监看页的一句话反馈（与连接提示分开，避免串台） */
+    var lastParamHint by mutableStateOf("")
+    /** 手机端取景画质：流畅 / 标准 / 高清，写进 PTP 解码器 */
+    var previewQuality by mutableStateOf(runCatching { DoukPrefs.monitorPreviewQuality }.getOrDefault("标准"))
+        private set
     /** 设备页相机实物照片的版本号：设置页换了图就 +1，让设备页重新读文件 */
     var photoVersion by mutableStateOf(0)
     /** 设备页是否显示「添加设备」按钮，由设置页控制 */
@@ -227,16 +234,15 @@ class DoukState(
     val isPairing: Boolean get() = vm.scanning
 
     /**
-     * 根据设置里的「Wi‑Fi 连接时保持相机唤醒」调整 PTP 空闲心跳。
+     * 连接时刷新 PTP 空闲心跳与「是否接管相机」。
      *
-     * 尼康 PTP 没有公开可写的「自动关机 / 节能」属性，直接猜属性号写坏相机风险太大；
-     * 这里改成更短周期的轻量 GetDeviceInfo 心跳，让相机在 Wi‑Fi 会话期间不进入待机，
-     * 效果等同关掉节能，且对全机型通用。开关关闭时恢复默认 15 秒，不增加额外耗电。
+     * 0.0.143 起不再用 6 秒 GetDeviceInfo 强行阻止相机待机：实测那会让相机屏幕
+     * 被反复点亮。心跳固定 15 秒（只要够维持 TCP 会话），相机能不能睡、屏幕亮不亮
+     * 完全交随机身自己的节能设置。
      */
     fun applyWifiPowerSave() {
-        val wifiSession = vm.isConnected && connectMode != ConnectMode.USB_PTP
-        val interval = if (wifiSession && DoukPrefs.wifiKeepAwake) 6_000L else 15_000L
-        vm.ptpClient.keepAliveIntervalMs = interval
+        vm.ptpClient.keepAliveIntervalMs = 15_000L
+        vm.ptpClient.takeoverHostControl = DoukPrefs.takeoverCamera
     }
 
     /** mDNS 广播 + 局域网端口探测合并后的真实设备；两者都没有也能手填 IP 直连。 */
@@ -256,7 +262,7 @@ class DoukState(
                 .map { hit ->
                     DiscoveredCamera(
                         name = "相机 ${hit.ip}",
-                        model = "${hit.iface} 网段 · 端口 15740 可达",
+                        model = "${hit.ip.substringBeforeLast('.')}.x 网段 · 端口 15740 可达",
                         mode = connectMode,
                         address = "${hit.ip}:${CameraLanProbe.PTP_PORT}"
                     )
@@ -800,9 +806,11 @@ class DoukState(
 
     fun setParam(key: String, value: String) {
         paramLockReason(key)?.let { reason ->
-            lastHint = "$value 未下发：$reason"
+            lastParamHint = "$value 未下发：$reason"
+            lastHint = lastParamHint
             return
         }
+        lastParamHint = ""
         when (key) {
             "iso" -> vm.setIso(value)
             "shutter" -> vm.setShutterSpeed(value)
@@ -837,6 +845,29 @@ class DoukState(
                 vm.extraProps[key]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra(key, it) }
             else -> lastHint = "$key 由机身菜单控制，PTP 未公开写入通道"
         }
+    }
+
+    /** 启动时把监看偏好送进解码器；换画质立刻生效，下一帧起按新档位解码 */
+    fun reloadMonitorPrefs() {
+        previewQuality = DoukPrefs.monitorPreviewQuality
+        LiveViewQuality.level = when (previewQuality) {
+            "流畅" -> LiveViewQuality.FLUENT
+            "高清" -> LiveViewQuality.HD
+            else -> LiveViewQuality.STANDARD
+        }
+    }
+
+    /** 在「监看工具」里循环切换取景画质：流畅 → 标准 → 高清 */
+    fun cyclePreviewQuality() {
+        val next = when (previewQuality) {
+            "流畅" -> "标准"
+            "标准" -> "高清"
+            else -> "流畅"
+        }
+        previewQuality = next
+        DoukPrefs.monitorPreviewQuality = next
+        reloadMonitorPrefs()
+        lastHint = "预览画质已切到 $next"
     }
 
     /**
@@ -940,6 +971,26 @@ class DoukState(
     }
 
     /**
+     * 监看里的「接管相机」开关：开=进控制模式（相机屏幕会让给 App），
+     * 关=只取景、相机屏幕照常显示。取景中切换会重启一次取景让新方案生效。
+     */
+    fun setTakeoverCamera(on: Boolean) {
+        DoukPrefs.takeoverCamera = on
+        vm.setTakeoverCamera(on)
+        hostControlTaken = on
+        DoukLog.i("Ptp", "TAKEOVER_SWITCH", "on" to on)
+    }
+
+    /**
+     * 启动时把「接管相机」按钮的亮起状态对齐到持久化值：
+     * 取景方案本身一直读 pref，但 Compose 里的 hostControlTaken 初始是 false，
+     * 不对齐的话会出现「实际已接管、按钮却没亮」的错觉，点一下反而又打开一次。
+     */
+    fun syncTakeoverFromPref() {
+        hostControlTaken = DoukPrefs.takeoverCamera
+    }
+
+    /**
      * 后台自动连接：未连接时静默探测「连接过的设备」，设置里打开
      * 「自动连接已连接过的设备」就自动连上。
      *
@@ -955,20 +1006,24 @@ class DoukState(
     private var galleryPreloadObserver: Job? = null
     private var bluetoothReadyObserver: Job? = null
     private var lockedWatchObserver: Job? = null
+    /** 自动回传落盘后刷新图库，照片不用退出页面才出现 */
+    private var autoSaveGalleryObserver: Job? = null
     private val autoConnectSignal = Channel<Unit>(Channel.CONFLATED)
     private var autoNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var autoNetworkManager: ConnectivityManager? = null
     private var lastNetworkSignalAt = 0L
-    /** 上一次自动连接尝试时间：握手失败后 30 秒内不再自动重试，避免界面反复横跳。 */
+    /** 上一次自动连接尝试时间：失败后按设置间隔再试，避免界面反复横跳。 */
     private var lastAutoConnectAttemptAt = 0L
+    /** 用户主动断开后暂停自动探测，重新点连接时恢复，避免「刚断开又被自动连上」 */
+    private var autoConnectPaused = false
 
     fun startAutoConnectLoop(context: Context) {
         if (autoConnectJob != null) return
         registerAutoConnectNetwork(context)
         autoConnectJob = ioScope.launch {
             while (isActive) {
-                // 有 Wi-Fi 事件立即醒；没有就每 30 秒兜底一次。
-                withTimeoutOrNull(30_000L) { autoConnectSignal.receive() }
+                // 有 Wi-Fi 事件立即醒；没有就按设置间隔兜底一次（默认 20 秒）。
+                withTimeoutOrNull(DoukPrefs.autoReconnectSeconds * 1000L) { autoConnectSignal.receive() }
                 try {
                     autoConnectOnce(context)
                 } catch (e: Exception) {
@@ -981,13 +1036,23 @@ class DoukState(
         autoReconnectObserver = ioScope.launch(Dispatchers.Main) {
             var wasConnected = isConnected
             snapshotFlow { isConnected }.collect { connected ->
-                if (wasConnected && !connected && DoukPrefs.autoConnectKnown &&
+                if (wasConnected && !connected && DoukPrefs.autoConnectKnown && !autoConnectPaused &&
                     !vm.ptpClient.hasConnection
                 ) {
                     delay(1_500)
                     autoConnectSignal.trySend(Unit)
                 }
                 wasConnected = connected
+            }
+        }
+        // 自动回传/保护文件导入落盘后让图库立刻重扫，不用退出再进来才看到新照片
+        autoSaveGalleryObserver = ioScope.launch(Dispatchers.Main) {
+            var last = vm.photosSaved
+            snapshotFlow { vm.photosSaved }.collect { count ->
+                if (count != last) {
+                    last = count
+                    galleryRefreshTick++
+                }
             }
         }
         // 连接成功上升沿：后台预读一批机身照片，打开图库时直接有最新那几张
@@ -1017,21 +1082,34 @@ class DoukState(
             }
         }
         // 「仅连接后新增」只在连接瞬间扫一次会漏掉“拍完再在机身加锁”的情况：
-        // 连着相机时低频巡检最新 120 个对象，发现新的锁定句柄就导入（带去重，避免重复下载）。
+        // 连着相机时低频巡检，发现新的锁定句柄就导入（带去重，避免重复下载）。
+        // 取样间隔压到几秒：用户在机身上给照片加锁后，不打开设置页也能很快自动下载。
+        // 取景期间不抢 PTP 通道（进存储枚举会打断实时取景），退出取景后下一轮立刻补扫。
         lockedWatchObserver = ioScope.launch(Dispatchers.Main) {
             snapshotFlow { isConnected }.collect { connected ->
                 if (!connected) return@collect
-                while (isActive && isConnected && DoukPrefs.lockedOnly && DoukPrefs.lockedAutoImport && DoukPrefs.lockedNewOnly) {
-                    // 20 秒才看最新 20 个对象：够覆盖“刚拍完再锁定”，又不会和实时取景抢 PTP 通道。
-                    delay(20_000)
+                var lastScanAt = 0L
+                var round = 0
+                while (isActive && isConnected && DoukPrefs.lockedOnly && DoukPrefs.lockedAutoImport) {
+                    delay(2_000)
                     if (!isConnected) break
-                    if (!vm.isImportingLocked) {
-                        vm.importLockedPhotos(
-                            onlyAfterConnect = true,
-                            scanCount = 20,
-                            dedupeHandled = true
-                        )
-                    }
+                    if (vm.isImportingLocked) continue
+                    // 实时取景时让路，避免每次巡检都把取景打断
+                    if (vm.ptpClient.isLiveViewActive.value) continue
+                    val interval = if (DoukPrefs.lockedNewOnly) 6_000L else 8_000L
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (lastScanAt != 0L && now - lastScanAt < interval) continue
+                    lastScanAt = now
+                    round++
+                    // 平时只看最新 40 个（覆盖“刚拍完才在机身上加锁”）；
+                    // 每 6 轮补一次全量，捞得到在回放里给老照片补锁的情况。
+                    val fullSweep = round % 6 == 0
+                    vm.importLockedPhotos(
+                        onlyAfterConnect = DoukPrefs.lockedNewOnly,
+                        scanCount = if (fullSweep) 4000 else 40,
+                        dedupeHandled = true,
+                        quiet = !fullSweep
+                    )
                 }
             }
         }
@@ -1084,6 +1162,8 @@ class DoukState(
 
     private suspend fun autoConnectOnce(context: Context) {
         if (!DoukPrefs.autoConnectKnown) return
+        // 用户主动断开后不要偷偷连回来；重新点连接会解除暂停。
+        if (autoConnectPaused) return
         // USB/蓝牙模式不要偷偷走 Wi-Fi 自动连接
         if (connectMode == ConnectMode.USB_PTP || connectMode == ConnectMode.BLUETOOTH) return
         if (ble.phase.value == com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient.Phase.READY) return
@@ -1093,7 +1173,7 @@ class DoukState(
         if (vm.ptpClient.hasConnection) return
         // 刚失败过就别马上再顶一次：Nikon 一次只允许一条会话，连续握手会让两边都断。
         val now = System.currentTimeMillis()
-        if (now - lastAutoConnectAttemptAt < 30_000L) return
+        if (now - lastAutoConnectAttemptAt < DoukPrefs.autoReconnectSeconds * 1000L) return
         lastAutoConnectAttemptAt = now
         val known = DoukPrefs.knownDevices()
         if (known.isEmpty()) return
@@ -1225,6 +1305,9 @@ class DoukState(
             DoukLog.w("Connect", "IP_INVALID", "input" to ip)
             return
         }
+        // 用户主动点连接/搜索时恢复自动探测：之前手动断开留下的暂停标记清掉。
+        autoConnectPaused = false
+        lastAutoConnectAttemptAt = 0L
         applyNetworkMode(target)
         // 自动连接/搜索结果已经用 TCP 15740 探通过，没必要再做一次 1.5 秒预检；
         // 这一步在旧实现里会把每次自动连接都白白拖慢 1.5~4 秒。
@@ -1362,6 +1445,9 @@ class DoukState(
     }
 
     fun disconnect() {
+        // 用户主动断开：先暂停自动探测，别刚断开 20 秒又被自动连回去。
+        autoConnectPaused = true
+        lastAutoConnectAttemptAt = System.currentTimeMillis()
         vm.disconnect()
         usb.disconnect()
         ble.disconnect()
@@ -1371,65 +1457,65 @@ class DoukState(
         pairingMessage = ""
     }
 
-    /** 向相机请求配对验证码：相机只给最小能力集时，靠这一步才拿得到完整权限 */
-    fun startPairing() {
+    /**
+     * 一键完成尼康配对：先发 0x952B 取验证码，再自动发 0x935A 确认。
+     * 用户不需要看机身验证码，也不需要手动点第二次；相机没准备好时自动重试，
+     * 最多 3 轮（每轮之间重发一次 0x952B），仍失败就只弹一条 Toast。
+     */
+    fun confirmPairing(context: Context) {
         if (pairingBusy) return
         pairingBusy = true
-        pairingMessage = "正在向相机请求验证码…"
-        DoukLog.i("Pair", "REQUEST_BEGIN", "stage" to vm.connectionStage.value)
+        pairingCode = null
+        DoukLog.i("Pair", "AUTO_BEGIN", "stage" to vm.connectionStage.value)
         ioScope.launch {
             try {
-                val code = vm.ptpClient.requestPairingNow()
-                withContext(Dispatchers.Main) {
-                    pairingCode = code
-                    pairingMessage = "相机屏幕应显示 $code。两边一致再点「确认配对」。"
-                    DoukLog.i("Pair", "CODE_OK", "code" to code)
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    pairingMessage = "请求配对失败：${e.message}"
-                    DoukLog.e("Pair", "REQUEST_FAIL", "error" to (e.message ?: ""))
-                }
-            } finally {
-                withContext(Dispatchers.Main) { pairingBusy = false }
-            }
-        }
-    }
-
-    fun submitPairing(context: Context) {
-        if (pairingBusy) return
-        pairingBusy = true
-        pairingMessage = "正在提交配对确认…"
-        ioScope.launch {
-            try {
-                val code = vm.ptpClient.submitPairingNow()
-                withContext(Dispatchers.Main) {
-                    pairingBusy = false
-                    pairingCode = null
-                    pairingMessage = if (code == 0x2001) {
-                        "相机已接受配对，正在重新连接…"
-                    } else {
-                        "相机拒绝了配对（0x%04X）。可取消后重试。".format(code)
+                // 第一次 0x952B：有的机身要它先把配对会话打开
+                runCatching { vm.ptpClient.requestPairingNow() }
+                var accepted = false
+                var lastCode = -1
+                for (attempt in 0 until 3) {
+                    delay(if (attempt == 0) 900L else 1500L)
+                    val code = runCatching { vm.ptpClient.submitPairingNow() }.getOrElse { e ->
+                        DoukLog.e("Pair", "AUTO_SUBMIT_FAIL", "attempt" to attempt + 1, "error" to (e.message ?: ""))
+                        -1
                     }
-                    DoukLog.i("Pair", "SUBMIT", "code" to "0x%04X".format(code))
+                    lastCode = code
+                    DoukLog.i("Pair", "AUTO_SUBMIT", "attempt" to attempt + 1, "code" to "0x%04X".format(code))
+                    if (code == 0x2001) {
+                        accepted = true
+                        break
+                    }
+                    // 第一轮被拒时重发一次 0x952B，再继续确认（不少机型要两次往返才切到正常服务）
+                    if (attempt == 0) runCatching { vm.ptpClient.requestPairingNow() }
                 }
-                if (code == 0x2001) {
-                    // 配对完成后相机会把内部服务从「配对服务」切到「正常服务」，并重启 Wi-Fi：
-                    // 表现为机身屏幕显示已连接、而本机连 15740 一律超时。必须等它重新监听再握手，
-                    // 且要允许换 IP（热点可能重新分配地址）。不能只探测一次就判失败。
-                    vm.ptpClient.clearPairingRequired()
+                if (!accepted) {
                     withContext(Dispatchers.Main) {
-                        pairingRequired = false
-                        pairingMessage = "相机已接受配对，正在等它重启网络服务…"
+                        pairingBusy = false
+                        Toast.makeText(
+                            context,
+                            "配对未完成（0x%04X），请让相机停在「连接至智能设备」界面再点一次".format(lastCode),
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
-                    vm.disconnect()
-                    reconnectAfterPairing(context)
+                    return@launch
                 }
+                // 配对完成后相机会把内部服务从「配对服务」切到「正常服务」，并重启 Wi-Fi：
+                // 表现为机身屏幕显示已连接、而本机连 15740 一律超时。必须等它重新监听再握手，
+                // 且要允许换 IP（热点可能重新分配地址）。不能只探测一次就判失败。
+                vm.ptpClient.clearPairingRequired()
+                withContext(Dispatchers.Main) {
+                    pairingRequired = false
+                    pairingBusy = false
+                    pairingMessage = ""
+                    DoukLog.i("Pair", "AUTO_ACCEPTED")
+                }
+                vm.disconnect()
+                reconnectAfterPairing(context)
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     pairingBusy = false
-                    pairingMessage = "提交失败：${e.message}"
-                    DoukLog.e("Pair", "SUBMIT_FAIL", "error" to (e.message ?: ""))
+                    Toast.makeText(context, "配对失败：${e.message}", Toast.LENGTH_LONG).show()
+                    DoukLog.e("Pair", "AUTO_FAIL", "error" to (e.message ?: ""))
                 }
             }
         }

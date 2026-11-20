@@ -154,7 +154,7 @@ fun AddDeviceScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(DoukShapes.cardSmall)
-                        .background(DoukColors.successSoft)
+                        .doukCardSurface(DoukShapes.cardSmall, tint = DoukColors.successSoft)
                         .padding(DoukSpace.md),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -320,7 +320,19 @@ fun AddDeviceScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(camera.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = DoukColors.textPrimary)
                             Spacer(modifier = Modifier.height(2.dp))
-                            Text("${camera.mode.label} · ${camera.address}", fontSize = 11.sp, color = DoukColors.textSecondary)
+                            Text(
+                                buildString {
+                                    append(camera.mode.label)
+                                    append(" · ")
+                                    append(camera.address)
+                                    if (camera.model.isNotBlank() && camera.model != camera.name) {
+                                        append(" · ")
+                                        append(camera.model)
+                                    }
+                                },
+                                fontSize = 11.sp,
+                                color = DoukColors.textSecondary
+                            )
                         }
                         Icon(
                             Icons.Rounded.CheckCircle,
@@ -548,7 +560,8 @@ fun AddDeviceScreen(
                 )
             }
 
-            // 相机只给最小能力集 = 尼康的「待配对」状态，不是连不上：这里引导核对验证码
+            // 相机只给最小能力集 = 尼康的「待配对」状态。只保留标题和一个确认按钮，
+            // 点一下自动完成 0x952B + 0x935A，不再要求用户核对机身验证码。
             if (state.pairingRequired) {
                 Spacer(modifier = Modifier.height(14.dp))
                 Column(
@@ -560,44 +573,25 @@ fun AddDeviceScreen(
                         .padding(14.dp)
                 ) {
                     Text(
-                        "相机需要配对（还没完成机身认证）",
+                        "相机需要匹配",
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = DoukColors.textPrimary
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        "相机只给了 9 个命令，这是尼康「等待配对」的最小权限集，不是连不上。" +
-                            "点下面按钮让相机显示验证码，与机身屏幕核对一致后确认，再重新连接一次就能拿到完整权限。",
-                        fontSize = 12.sp,
-                        color = DoukColors.textSecondary,
-                        lineHeight = 18.sp
-                    )
-                    if (state.pairingMessage.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            state.pairingMessage,
-                            fontSize = 12.sp,
-                            color = DoukColors.warning,
-                            lineHeight = 18.sp
-                        )
-                    }
                     Spacer(modifier = Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Button(
-                            onClick = { if (state.pairingCode == null) state.startPairing() else state.submitPairing(context) },
-                            enabled = !state.pairingBusy,
-                            colors = ButtonDefaults.buttonColors(containerColor = DoukColors.accent)
-                        ) {
-                            Text(
-                                when {
-                                    state.pairingBusy -> "请稍候…"
-                                    state.pairingCode == null -> "开始配对"
-                                    else -> "确认配对"
-                                },
-                                fontSize = 13.sp
-                            )
-                        }
+                    Button(
+                        onClick = { state.confirmPairing(context) },
+                        enabled = !state.pairingBusy,
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                        shape = DoukShapes.cardSmall,
+                        colors = ButtonDefaults.buttonColors(containerColor = DoukColors.accent)
+                    ) {
+                        Text(
+                            if (state.pairingBusy) "匹配中…" else "确认匹配",
+                            fontSize = 13.sp,
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                 }
             }
@@ -623,7 +617,10 @@ private fun ModeCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(DoukShapes.cardSmall)
-            .background(if (selected) DoukColors.accentSoft else DoukColors.surface)
+            .doukCardSurface(
+                DoukShapes.cardSmall,
+                tint = if (selected) DoukColors.accentSoft else Color.Transparent
+            )
             .border(
                 width = 1.5.dp,
                 color = if (selected) DoukColors.accent else DoukColors.divider,
@@ -678,7 +675,7 @@ private fun ConnectionHint(mode: ConnectMode, spec: NikonModelSpec.Spec?) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(DoukShapes.cardSmall)
-            .background(DoukColors.surfaceMuted)
+            .doukCardSurface(DoukShapes.cardSmall, baseColor = DoukColors.surfaceMuted)
             .padding(14.dp)
     ) {
         Text("提示", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = DoukColors.textPrimary)

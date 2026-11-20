@@ -88,15 +88,61 @@ object NikonModelSpec {
     val wirelessStaNames: String = third.joinToString("、") { it.label }
     val computerNames: String = second.joinToString("、") { it.label }
 
+    /**
+     * 尼康部分机型/固件会把型号写成 `Z50II`、`Z 6III` 这类罗马数字，
+     * 而能力表 id 用的是 `z502`、`z63` 这种 PTP 写法，先做一层别名归一。
+     * 只收真实存在、容易和短 id 混淆的型号，避免把未知机型硬塞进错误档位。
+     */
+    private val aliases = mapOf(
+        "z50ii" to "z502",
+        "z5ii" to "z52",
+        "z6ii" to "z62",
+        "z6iii" to "z63",
+        "z7ii" to "z72"
+    )
+
     /** `Z 50_2` / `Z50_2` / `Z 6_3` 统一成 `z502` / `z63` 这种纯字母数字串。 */
     private fun norm(model: String): String =
-        model.lowercase().filter { it.isLetterOrDigit() }
+        model.lowercase()
+            .removePrefix("nikon")
+            .filter { it.isLetterOrDigit() }
+
+    /**
+     * 判断 id 是否作为独立型号片段出现。
+     * `z50iimock` 里的 `z5` 后面紧跟 `0`，`z50` 后面紧跟 `i`，都不能算命中；
+     * 否则短 id 会把更长的新机型抢走（Z50II 被识别成 Z5 就是这么来的）。
+     */
+    private fun containsModelId(key: String, id: String): Boolean {
+        var start = key.indexOf(id)
+        while (start >= 0) {
+            val before = if (start > 0) key[start - 1] else null
+            val after = if (start + id.length < key.length) key[start + id.length] else null
+            val beforeOk = before == null || !before.isDigit()
+            val afterOk = after == null || !after.isDigit()
+            if (beforeOk && afterOk) return true
+            start = key.indexOf(id, start + 1)
+        }
+        return false
+    }
 
     fun of(model: String?): Spec? {
         if (model.isNullOrBlank()) return null
         val key = norm(model)
-        return catalog.firstOrNull { it.id == key }
-            ?: catalog.firstOrNull { key.contains(it.id) }
+
+        // 1. 精确命中 PTP 写法：Z 50_2 → z502、Z 6_3 → z63
+        catalog.firstOrNull { it.id == key }?.let { return it }
+
+        // 2. 罗马数字别名：Z50II → z50ii → z502；Z6III → z6iii → z63
+        aliases.entries
+            .filter { key == it.key || key.contains(it.key) }
+            .maxByOrNull { it.key.length }
+            ?.let { alias -> catalog.firstOrNull { it.id == alias.value } }
+            ?.let { return it }
+
+        // 3. 兜底：按最长 id 匹配，且必须是独立片段，避免 z5 抢走 z50ii
+        return catalog
+            .filter { containsModelId(key, it.id) }
+            .maxByOrNull { it.id.length }
     }
 
     /** 三种无线/有线方式的机型专属步骤。 */

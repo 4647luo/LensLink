@@ -263,7 +263,7 @@ fun ControlScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(DoukShapes.cardSmall)
-                        .background(DoukColors.warningSoft)
+                        .doukCardSurface(DoukShapes.cardSmall, tint = DoukColors.warningSoft)
                         .padding(horizontal = DoukSpace.sm, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -294,7 +294,7 @@ fun ControlScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(DoukShapes.cardSmall)
-                        .background(DoukColors.warningSoft)
+                        .doukCardSurface(DoukShapes.cardSmall, tint = DoukColors.warningSoft)
                         .padding(horizontal = DoukSpace.sm, vertical = DoukSpace.xs),
                     verticalAlignment = Alignment.Top
                 ) {
@@ -391,8 +391,8 @@ fun ControlScreen(
         FloatingShutter(
             state = state,
             onOpenGallery = onOpenCameraGallery,
-            // 底栏是悬浮在页面之上的，快门条要整体让到胶囊上方，不能被底栏压住
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 108.dp)
+            // 内容已经铺到屏幕最底部，快门要整体抬到透明胶囊上方，别和 Douk 栏叠在一起
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 104.dp)
         )
         }
     }
@@ -663,7 +663,7 @@ private fun MonitorButton(state: DoukState) {
                 text = when {
                     !state.isConnected -> "未连接相机"
                     hasFrame -> "点开全屏取景 · ${state.profile.model}"
-                    else -> "等待相机画面 · ${state.profile.model}"
+                    else -> "已连接 · 点开全屏取景 · ${state.profile.model}"
                 },
                 style = DoukType.label,
                 color = DoukColors.textTertiary
@@ -725,9 +725,6 @@ private fun FloatingShutter(
         modifier = modifier
             .doukShadow(DoukElevation.raised, DoukShapes.pill)
             .clip(DoukShapes.pill)
-            // 快门条压在参数列表上，玻璃下面再垫一层高不透明度底色，
-            // 避免滑过的参数文字透出来影响读数
-            .background(DoukColors.surface.copy(alpha = if (DoukColors.glass) 0.94f else 1f))
             .doukCardSurface(DoukShapes.pill)
             .padding(horizontal = DoukSpace.md, vertical = DoukSpace.xs),
         horizontalArrangement = Arrangement.spacedBy(DoukSpace.lg),
@@ -999,18 +996,18 @@ private fun ParamGroup(
         keys.forEachIndexed { index, key ->
             val param = state.cameraParams.firstOrNull { it.key == key } ?: return@forEachIndexed
             val locked = state.paramLockReason(key) != null
-            var rowAnchor by remember(key) { mutableStateOf(IntOffset.Zero) }
+            // 坐标只给点击时用，不写进 Compose State：滚动时不会因为每帧
+            // onGloballyPositioned 回写 IntOffset 而触发整行/整组重组。
+            val rowAnchor = remember(key) { IntArray(2) }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .onGloballyPositioned { coords ->
                         val pos = coords.localToWindow(Offset.Zero)
-                        rowAnchor = IntOffset(
-                            pos.x.roundToInt() + coords.size.width,
-                            pos.y.roundToInt()
-                        )
+                        rowAnchor[0] = pos.x.roundToInt() + coords.size.width
+                        rowAnchor[1] = pos.y.roundToInt()
                     }
-                    .clickable { onEdit(param, rowAnchor) }
+                    .clickable { onEdit(param, IntOffset(rowAnchor[0], rowAnchor[1])) }
                     .padding(start = DoukSpace.md, end = DoukSpace.sm, top = 14.dp, bottom = 14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {

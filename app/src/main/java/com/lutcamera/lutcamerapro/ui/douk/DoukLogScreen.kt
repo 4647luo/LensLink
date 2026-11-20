@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -29,6 +30,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -116,6 +118,9 @@ fun DoukLogScreen(onBack: () -> Unit) {
                 .weight(1f)
                 .padding(horizontal = 12.dp)
                 .padding(bottom = 12.dp)
+                .clip(DoukShapes.card)
+                .doukCardSurface(DoukShapes.card)
+                .padding(8.dp)
         ) {
             if (lines.isEmpty()) {
                 Column(
@@ -129,7 +134,11 @@ fun DoukLogScreen(onBack: () -> Unit) {
                 }
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(lines) { line ->
+                    itemsIndexed(
+                        lines,
+                        key = { index, _ -> index },
+                        contentType = { _, _ -> "log-line" }
+                    ) { _, line ->
                         LogLine(line)
                     }
                 }

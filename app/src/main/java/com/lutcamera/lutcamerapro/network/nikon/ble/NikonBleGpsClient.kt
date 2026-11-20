@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.UUID
+import kotlin.math.roundToInt
 
 /**
  * 向尼康相机推送手机 GPS（蓝牙「智能设备」模式）。
@@ -248,6 +249,10 @@ class NikonBleGpsClient(private val context: Context) {
     private var handshakeTimeoutJob: Job? = null
     private var pendingPush = false
     private var autoConnectOnHit = false
+    private var autoReconnectJob: Job? = null
+    private var autoReconnectAttempts = 0
+    private var manualDisconnect = false
+    private var lastGoodAltitude: Double? = null
     private var placeLat = 0.0
     private var placeLon = 0.0
     private var placeAt = 0L
@@ -402,15 +407,43 @@ class NikonBleGpsClient(private val context: Context) {
     private fun buildGeoPayload(location: Location): ByteArray {
         val measured = location.extras?.getInt("satellites", 0) ?: 0
         val satellites = if (measured in 1..99) measured else 4
-        val altitude = if (location.hasAltitude()) location.altitude.toInt() else 0
+        val resolved = resolveAltitude(location)
+        val altitude = resolved?.first?.roundToInt() ?: 0
         _lastPayloadSatellites.value = satellites
         _lastPayloadAltitude.value = altitude
         val payload = NikonGeoPayload.build(location.latitude, location.longitude, altitude, satellites)
         log(
-            "GEO 载荷 sat=$satellites alt=$altitude ref=${if (altitude >= 0) "P" else "M"} " +
+            "GEO 载荷 sat=$satellites alt=$altitude src=${resolved?.second ?: "无"} " +
+                "ref=${if (altitude >= 0) "P" else "M"} " +
                 "bytes=${payload.joinToString("") { "%02x".format(it) }}"
         )
         return payload
+    }
+
+    /**
+     * 取海拔。Android 的网络定位（NETWORK_PROVIDER）通常不带海拔，
+     * 低精度模式下只开网络定位时相机会一直收到 0，机身上就看不到海拔。
+     * 这里按「当前 fix → 最近一次有效海拔 → 最近一次 GPS fix」兜底，
+     * 保证只要这台手机曾经拿到过 GPS 海拔，后续网络 fix 也能继续推送。
+     */
+    private fun resolveAltitude(location: Location): Pair<Double, String>? {
+        if (location.hasAltitude()) {
+            lastGoodAltitude = location.altitude
+            return location.altitude to "本次"
+        }
+        lastGoodAltitude?.let { return it to "缓存" }
+        val manager = gpsManager
+            ?: (context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager)
+        val gps = runCatching { manager?.getLastKnownLocation(LocationManager.GPS_PROVIDER) }.getOrNull()
+        if (gps != null && gps.hasAltitude()) {
+            val age = (System.currentTimeMillis() - gps.time).coerceAtLeast(0L)
+            // 30 分钟内的 GPS 海拔仍有参考价值；再久就当作失效，避免把旧位置的高度带进来
+            if (age <= 30 * 60 * 1000L) {
+                lastGoodAltitude = gps.altitude
+                return gps.altitude to "GPS 最近"
+            }
+        }
+        return null
     }
 
     /**
@@ -423,7 +456,7 @@ class NikonBleGpsClient(private val context: Context) {
         _lastFixLat.value = location.latitude
         _lastFixLon.value = location.longitude
         _lastFixAccuracy.value = if (location.hasAccuracy()) location.accuracy else 0f
-        _lastFixAltitude.value = if (location.hasAltitude()) location.altitude else null
+        _lastFixAltitude.value = resolveAltitude(location)?.first
         val measured = location.extras?.getInt("satellites", 0) ?: 0
         _lastFixSatellites.value = if (measured in 1..99) measured else 0
         _lastFixProvider.value = location.provider ?: ""
@@ -600,6 +633,8 @@ class NikonBleGpsClient(private val context: Context) {
             log("已在连接流程中（${_phase.value.label}），忽略重复连接")
             return
         }
+        manualDisconnect = false
+        cancelAutoReconnect()
         if (!hasPermissions()) {
             fail("缺少蓝牙权限")
             return
@@ -626,13 +661,16 @@ class NikonBleGpsClient(private val context: Context) {
         openGatt(device)
     }
 
-    fun reconnectSaved(): Boolean {        val address = prefs.getString("address", null) ?: return false
+    fun reconnectSaved(): Boolean {
+        val address = prefs.getString("address", null) ?: return false
         val name = prefs.getString("name", null) ?: "尼康相机"
         val device = try {
             adapter?.getRemoteDevice(address)
         } catch (e: Exception) {
             null
         } ?: return false
+        manualDisconnect = false
+        cancelAutoReconnect()
         targetDevice = device
         lastDeviceAddress = address
         lastDeviceName = name
@@ -855,11 +893,14 @@ class NikonBleGpsClient(private val context: Context) {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 log("GATT 已断开（status=$status）")
                 cancelConnectTimers()
-                if (_phase.value == Phase.READY) {
+                val wasReady = _phase.value == Phase.READY
+                if (wasReady) {
                     _phase.value = Phase.ERROR
-                    _statusDetail.value = "连接断开，请重新连接"
+                    _statusDetail.value = "连接断开，正在准备自动重连"
                 }
                 stopGpsLoop()
+                // 相机关屏 / 休眠会主动断开 BLE；只要不是用户手动断开，就按间隔扫描找回。
+                if (wasReady && !manualDisconnect) scheduleAutoReconnect()
             }
         }
 
@@ -1428,6 +1469,7 @@ class NikonBleGpsClient(private val context: Context) {
 
     private fun finishReady() {
         cancelConnectTimers()
+        cancelAutoReconnect()
         _phase.value = Phase.READY
         _statusDetail.value = "相机已接收蓝牙身份，开始推送定位"
         geoRecovering = false
@@ -1658,9 +1700,62 @@ class NikonBleGpsClient(private val context: Context) {
         }
     }
 
+    /**
+     * 相机息屏 / 休眠后 BLE 会被机身主动断开。这里按「6 秒 → 20 秒 → 每分钟」
+     * 扫描一轮，命中已连接过的那台就自动重连；用户手动断开则立即停止。
+     * 最多重试 20 次（约 20 分钟），避免相机一直关机时无休止扫描和耗电。
+     */
+    private fun scheduleAutoReconnect() {
+        if (manualDisconnect) return
+        if (autoReconnectJob?.isActive == true) return
+        autoReconnectAttempts = 0
+        autoReconnectJob = scope.launch {
+            while (!manualDisconnect) {
+                val attempt = autoReconnectAttempts
+                val waitMs = when (attempt) {
+                    0 -> 6_000L
+                    1 -> 20_000L
+                    else -> 60_000L
+                }
+                if (attempt >= 20) {
+                    _statusDetail.value = "已停止自动重连：$lastDeviceName 长时间没有重新广播，请唤醒相机后再点「连接上次」"
+                    log("自动重连达到上限，停止")
+                    break
+                }
+                autoReconnectAttempts = attempt + 1
+                _statusDetail.value =
+                    "蓝牙已断开（相机可能息屏了），${waitMs / 1000} 秒后自动扫描重连（第 ${attempt + 1} 次）"
+                log("自动重连：${waitMs}ms 后开始第 ${attempt + 1} 次扫描")
+                delay(waitMs)
+                if (manualDisconnect) break
+                val phase = _phase.value
+                if (phase == Phase.READY || phase == Phase.CONNECTING ||
+                    phase == Phase.HANDSHAKING || phase == Phase.BONDING
+                ) break
+                if (wifiSessionActive) allowScanDuringWifi = true
+                startScan(autoConnect = true)
+                _statusDetail.value = "正在自动找回 ${lastDeviceName ?: "相机"}…"
+                // 一轮扫描 12 秒；命中后 handleScanResult 会自动 connect，循环下一轮检测到 CONNECTING 就退出
+                delay(12_000)
+                if (_phase.value == Phase.SCANNING) stopScan()
+            }
+            autoReconnectJob = null
+        }
+    }
+
+    private fun cancelAutoReconnect() {
+        autoReconnectJob?.cancel()
+        autoReconnectJob = null
+        autoReconnectAttempts = 0
+    }
+
+    fun isAutoReconnecting(): Boolean = autoReconnectJob?.isActive == true
+
     // ---------------------------------------------------------------- 生命周期
 
     fun disconnect() {
+        manualDisconnect = true
+        cancelAutoReconnect()
         stopGpsLoop()
         stopScan()
         stopClassicDiscovery()

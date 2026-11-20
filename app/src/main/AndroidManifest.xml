@@ -17,6 +17,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 熄屏后 CPU 仍要跑 BLE 回调与定位推送；前台服务本身不保证 CPU 不休眠 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 用户主动点「后台保活」时申请系统电池优化白名单 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- 应用内下载更新后调起系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- 4. 相册存储权限（Android 14 起支持「仅选中照片」的部分访问） -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />

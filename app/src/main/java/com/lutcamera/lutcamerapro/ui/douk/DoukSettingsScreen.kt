@@ -13,12 +13,14 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import com.lutcamera.lutcamerapro.network.nikon.ble.DoukBleKeepAliveService
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -214,7 +216,7 @@ fun DoukSettingsScreen(state: DoukState) {
     var glass by remember { mutableStateOf(DoukPrefs.glassEffect) }
     var materialAlpha by remember { mutableFloatStateOf(DoukPrefs.materialAlpha) }
     var materialBlur by remember { mutableFloatStateOf(DoukPrefs.materialBlur) }
-    var wifiKeepAwake by remember { mutableStateOf(DoukPrefs.wifiKeepAwake) }
+    var uiContrast by remember { mutableFloatStateOf(DoukPrefs.uiContrast) }
     var previewOnCapture by remember { mutableStateOf(DoukPrefs.capturePreview) }
     var photoPath by remember { mutableStateOf(DoukPrefs.cameraPhotoPath) }
     var lutCount by remember { mutableStateOf(0) }
@@ -353,20 +355,73 @@ fun DoukSettingsScreen(state: DoukState) {
         when (aboutInfo) {
             "update" -> SettingsSubPage(title = "检查更新", onBack = back) {
                 val context = LocalContext.current
-                var result by remember { mutableStateOf<GitHubUpdateChecker.Result?>(null) }
-                LaunchedEffect(Unit) {
-                    result = GitHubUpdateChecker.check(APP_VERSION)
+                var result by remember { mutableStateOf<UpdateCenter.Result?>(null) }
+                var checking by remember { mutableStateOf(false) }
+                var downloading by remember { mutableStateOf(false) }
+                var progress by remember { mutableIntStateOf(0) }
+                var autoCheck by remember { mutableStateOf(DoukPrefs.checkUpdateOnLaunch) }
+
+                val runCheck: () -> Unit = {
+                    if (!checking) {
+                        scope.launch {
+                            checking = true
+                            result = UpdateCenter.check(APP_VERSION)
+                            checking = false
+                        }
+                    }
                 }
+                LaunchedEffect(Unit) {
+                    checking = true
+                    result = UpdateCenter.check(APP_VERSION)
+                    checking = false
+                }
+
+                SettingCard {
+                    SettingSwitchRow(
+                        "打开应用时检查更新",
+                        "启动 App 后自动检查一次；24 小时内不重复请求，失败不打扰",
+                        autoCheck
+                    ) { enabled ->
+                        autoCheck = enabled
+                        DoukPrefs.checkUpdateOnLaunch = enabled
+                    }
+                    SettingDivider()
+                    SettingRow(
+                        if (checking) "正在检查…" else "立即检查",
+                        "从 GitHub 读取最新 Release",
+                        enabled = !checking
+                    ) { runCheck() }
+                    SettingDivider()
+                    SettingRow(
+                        "百度网盘分享链接",
+                        "GitHub 连不上时从这里下载，提取码 lk01；新版本会放进同一文件夹",
+                        value = "打开"
+                    ) {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(UpdateCenter.BAIDU_MIRROR_URL))
+                            )
+                        }.onFailure {
+                            Toast.makeText(context, "没有可打开浏览器的应用", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
                 val lines = when (val r = result) {
-                    null -> listOf("当前版本：$APP_VERSION", "正在从 GitHub 检查最新版本…")
-                    is GitHubUpdateChecker.Result.Success -> {
+                    null -> listOf("当前版本：$APP_VERSION", "正在检查最新版本…")
+                    is UpdateCenter.Result.Success -> {
                         val info = r.info
                         buildList {
+                            add("当前版本：$APP_VERSION")
+                            add("更新源：${info.source}")
                             if (info.isNewer) {
-                                add("发现新版本：${info.tag}")
-                                add("当前版本：$APP_VERSION")
+                                add("发现新版本：${info.version}")
                                 if (info.apkSize > 0) add("安装包：${"%.1f".format(info.apkSize / 1048576.0)} MB")
-                                add("发布日期：${info.publishedAt}")
+                                if (info.publishedAt.isNotBlank()) add("发布日期：${info.publishedAt}")
+                                if (info.apkUrl.isNullOrBlank()) {
+                                    add("该更新源没有提供 APK 直链，无法应用内下载。")
+                                }
                                 add("")
                                 if (info.notes.isNotBlank()) {
                                     add("更新说明：")
@@ -374,65 +429,79 @@ fun DoukSettingsScreen(state: DoukState) {
                                 }
                             } else {
                                 add("已是最新版本：$APP_VERSION")
-                                add("GitHub 最新版本：${info.tag}")
-                                add("发布日期：${info.publishedAt}")
+                                add("远端版本：${info.version}")
+                                if (info.publishedAt.isNotBlank()) add("发布日期：${info.publishedAt}")
                                 add("")
-                                add("当前版本与 GitHub Release 一致，无需更新。")
+                                add("当前版本与更新源一致，无需更新。")
                             }
                         }
                     }
-                    is GitHubUpdateChecker.Result.NoRelease ->
-                        listOf(
-                            "当前版本：$APP_VERSION",
-                            "GitHub 仓库还没有发布 Release。",
-                            "发布第一个 v0.0.1 后，这里会自动显示最新版本和安装包。"
-                        )
-                    is GitHubUpdateChecker.Result.Failure ->
-                        listOf(
-                            "当前版本：$APP_VERSION",
-                            "检查失败：${r.message}",
-                            "可以点下面的按钮直接打开 GitHub 查看。"
-                        )
+                    is UpdateCenter.Result.NoRelease -> listOf(
+                        "当前版本：$APP_VERSION",
+                        "更新源还没有发布版本。",
+                        r.message
+                    )
+                    is UpdateCenter.Result.Failure -> listOf(
+                        "当前版本：$APP_VERSION",
+                        "检查失败：${r.message}",
+                        "检查网络后，点「立即检查」重试。"
+                    )
                 }
                 InfoLines(lines)
-                val openUrl = when (val r = result) {
-                    is GitHubUpdateChecker.Result.Success ->
-                        if (r.info.isNewer) (r.info.apkUrl ?: r.info.pageUrl) else r.info.pageUrl
-                    is GitHubUpdateChecker.Result.NoRelease -> r.repoUrl
-                    else -> "https://github.com/${GitHubUpdateChecker.OWNER}/${GitHubUpdateChecker.REPO}/releases"
-                }
-                Spacer(modifier = Modifier.height(14.dp))
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .doukCardSurface(RoundedCornerShape(18.dp))
-                        .clickable {
-                            runCatching {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(openUrl)))
-                            }.onFailure {
-                                Toast.makeText(context, "没有可打开浏览器的应用", Toast.LENGTH_SHORT).show()
+
+                val info = (result as? UpdateCenter.Result.Success)?.info
+                if (info != null && info.isNewer && !info.apkUrl.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .doukCardSurface(RoundedCornerShape(18.dp))
+                            .clickable(enabled = !downloading) {
+                                scope.launch {
+                                    downloading = true
+                                    progress = 0
+                                    val downloadResult = runCatching {
+                                        UpdateCenter.download(context, info) { percent ->
+                                            progress = percent
+                                        }
+                                    }
+                                    downloading = false
+                                    downloadResult.onSuccess { file ->
+                                        if (!UpdateCenter.install(context, file)) {
+                                            Toast.makeText(
+                                                context,
+                                                "下载完成，请允许安装未知来源应用后重试",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }.onFailure {
+                                        Toast.makeText(
+                                            context,
+                                            "下载失败：${it.message}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                }
                             }
-                        }
-                        .padding(horizontal = 18.dp, vertical = 15.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (result is GitHubUpdateChecker.Result.Success &&
-                            (result as GitHubUpdateChecker.Result.Success).info.isNewer
-                        ) "在 GitHub 下载最新安装包" else "打开 GitHub 更新页面",
-                        style = DoukType.body,
-                        color = DoukColors.textPrimary,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Icon(
-                        imageVector = Icons.Rounded.ChevronRight,
-                        contentDescription = null,
-                        tint = DoukColors.textTertiary
-                    )
+                            .padding(horizontal = 18.dp, vertical = 15.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (downloading) "正在下载 ${progress}%" else "下载并安装最新版本",
+                            style = DoukType.body,
+                            color = DoukColors.textPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(
+                            imageVector = Icons.Rounded.ChevronRight,
+                            contentDescription = null,
+                            tint = DoukColors.textTertiary
+                        )
+                    }
                 }
             }
             "changelog" -> SettingsSubPage(title = "更新日志", onBack = back) {
-                InfoLines(CHANGELOG_LINES)
+                InfoLines(changelogFor(APP_VERSION))
             }
             "terms" -> SettingsSubPage(title = "使用条款", onBack = back) {
                 InfoLines(TERMS_LINES)
@@ -577,7 +646,7 @@ fun DoukSettingsScreen(state: DoukState) {
             options = listOf(
                 DownloadOption(
                     "图片大小",
-                    "原图占空间大，仅缩略图更快",
+                    "原图更清晰，缩略图更快",
                     dlSize,
                     listOf("原图", "仅缩略图")
                 ) { v -> dlSize = v; DoukPrefs.downloadSize = v },
@@ -593,7 +662,7 @@ fun DoukSettingsScreen(state: DoukState) {
                 },
                 DownloadOption(
                     "视频大小",
-                    "原视频画质最好，仅缩略图只用于快速浏览",
+                    "原视频画质最好，缩略图更快",
                     dlVideoSize,
                     listOf("原视频", "仅缩略图")
                 ) { v -> dlVideoSize = v; DoukPrefs.downloadVideoSize = v },
@@ -605,18 +674,37 @@ fun DoukSettingsScreen(state: DoukState) {
                 ) { v -> dlVideoFormat = v; DoukPrefs.downloadVideoFormat = v },
                 DownloadOption(
                     "保存位置",
-                    "应用相册留在 App 内，系统相册会出现在手机相册",
+                    "App 相册或手机相册",
                     dlDir,
                     listOf("应用相册", "系统相册", "Download")
                 ) { v -> dlDir = v; DoukPrefs.downloadDir = v }
             ),
+            optionsEnabled = autoDl,
             onBack = { downloadPage = null }
         )
     } else if (downloadPage == "locked") {
+        // 进这一页时按当前设置静默核一遍：状态行显示的是这次的真实结果，
+        // 而不是上一轮留下的旧文案（旧文案会把「已导入过」误报成「格式不对」）。
+        LaunchedEffect(Unit) {
+            if (!(state.isConnected && DoukPrefs.lockedOnly && DoukPrefs.lockedAutoImport)) {
+                return@LaunchedEffect
+            }
+            // 后台巡检可能刚好在跑，等它这一轮结束再扫，否则会直接 return 掉、状态行还是旧的
+            repeat(4) {
+                if (!state.vm.isImportingLocked) {
+                    state.vm.importLockedPhotos(
+                        onlyAfterConnect = DoukPrefs.lockedNewOnly,
+                        quiet = true
+                    )
+                    return@LaunchedEffect
+                }
+                kotlinx.coroutines.delay(1_500)
+            }
+        }
         DownloadPanel(
             title = "下载保护文件",
             enabledTitle = "只下载相机里锁定的文件",
-            enabledSubtitle = "按相机上的锁定标记挑选，适合现场先挑片再回传",
+            enabledSubtitle = "按相机的锁定标记挑选",
             enabled = lockedOnly,
             onEnabled = {
                 lockedOnly = it
@@ -625,46 +713,52 @@ fun DoukSettingsScreen(state: DoukState) {
                 // 不再在下面重复放一个「连接相机后导入锁定照片」开关。
                 lkAuto = it
                 DoukPrefs.lockedAutoImport = it
+                // 用户刚打开这个开关时，相机里已有的锁定文件就是他要的文件。
+                // 「仅连接后新增」的分界只用于之后的自动巡检，这里先无条件导入全部，
+                // 否则已连接状态下打开开关什么都不会发生。
+                if (it) {
+                    state.vm.importLockedPhotos(onlyAfterConnect = false)
+                }
             },
             options = listOf(
                 DownloadOption(
                     "图片大小",
-                    "原图占空间大，仅缩略图更快",
+                    "原图更清晰，缩略图更快",
                     lkSize,
                     listOf("原图", "仅缩略图")
                 ) { v -> lkSize = v; DoukPrefs.lockedSize = v },
                 DownloadOption(
                     "图片格式",
-                    "选「不下载」就只导入锁定视频",
+                    "不下载图片时只导入视频",
                     lkFormat,
                     listOf("JPG", "RAW", "JPG + RAW", "全部格式", "不下载")
                 ) { v -> lkFormat = v; DoukPrefs.lockedFormat = v },
                 DownloadOption(
                     "视频大小",
-                    "原视频画质最好，仅缩略图只用于快速浏览",
+                    "原视频画质最好，缩略图更快",
                     lkVideoSize,
                     listOf("原视频", "仅缩略图")
                 ) { v -> lkVideoSize = v; DoukPrefs.lockedVideoSize = v },
                 DownloadOption(
                     "视频格式",
-                    "选「不下载」就只导入锁定图片",
+                    "不下载视频时只导入图片",
                     lkVideoFormat,
                     listOf("MOV", "MP4", "全部格式", "不下载")
                 ) { v -> lkVideoFormat = v; DoukPrefs.lockedVideoFormat = v },
                 DownloadOption(
                     "保存位置",
-                    "应用相册留在 App 内，系统相册会出现在手机相册",
+                    "App 相册或手机相册",
                     lkDir,
                     listOf("应用相册", "系统相册", "Download")
                 ) { v -> lkDir = v; DoukPrefs.lockedDir = v }
             ),
             optionsEnabled = lockedOnly,
             footnote = if (lockedOnly) {
-                "连接相机后自动导入已开启：" +
-                    (if (lkNewOnly) "仅本次连接后新增" else "相机内全部") +
-                    "锁定文件" + (if (lkAsk) "，导入前会先询问。" else "，静默导入。")
+                "自动导入已开启：" +
+                    (if (lkNewOnly) "只导入连接后新增的锁定文件" else "导入相机内全部锁定文件") +
+                    (if (lkAsk) "，导入前先确认。" else "。")
             } else {
-                "总开关关闭：不会自动导入，下面的规则和立即导入都不能点。"
+                "总开关关闭：不会自动导入。"
             },
             extraContent = {
                 SettingCard {
@@ -682,7 +776,7 @@ fun DoukSettingsScreen(state: DoukState) {
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            if (lkNewOnly) "只导入本次连接相机之后新锁定/新拍摄的文件"
+                            if (lkNewOnly) "只导入连接后新增的文件"
                             else "导入相机内所有已锁定文件",
                             style = DoukType.caption,
                             color = DoukColors.textSecondary
@@ -722,7 +816,7 @@ fun DoukSettingsScreen(state: DoukState) {
                     SettingDivider()
                     SettingSwitchRow(
                         "导入前先询问",
-                        "两种导入范围都先确认数量，再开始导入；关闭后静默导入",
+                        "导入前先确认数量",
                         lkAsk,
                         enabled = lockedOnly
                     ) {
@@ -993,7 +1087,7 @@ fun DoukSettingsScreen(state: DoukState) {
             // ===== 外观设置（悬浮 Douk 栏已按要求去掉） =====
             "appearance" -> SettingsSubPage(title = "外观设置", onBack = back) {
                 SettingCard {
-                    SettingSwitchRow("高级材质", "卡片 95% 不透明度 + 背后一层轻度模糊（可调）", glass) {
+                    SettingSwitchRow("高级材质", "卡片磨砂玻璃 + 底栏真实模糊（可调）", glass) {
                         glass = it
                         DoukPrefs.glassEffect = it
                         DoukColors.applyGlass(it)
@@ -1030,7 +1124,7 @@ fun DoukSettingsScreen(state: DoukState) {
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text("背景模糊度", fontSize = 14.sp, color = DoukColors.textPrimary)
+                                Text("底栏模糊度", fontSize = 14.sp, color = DoukColors.textPrimary)
                                 Text(
                                     "${materialBlur.roundToInt()} dp",
                                     fontSize = 13.sp,
@@ -1051,13 +1145,77 @@ fun DoukSettingsScreen(state: DoukState) {
                                 )
                             )
                             Text(
-                                "不透明度越高越接近实心卡片；模糊度只作用在卡片背后的页面内容，"
-                                    + "不会模糊卡片里的文字和图标。",
+                                "卡片改用静态磨砂渐变，滚动时不会逐张重算模糊；"
+                                    + "真实模糊只保留在底栏，观感一致但更省性能。",
                                 fontSize = 12.sp,
                                 lineHeight = 18.sp,
                                 color = DoukColors.textSecondary
                             )
                         }
+                    }
+                    SettingDivider()
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("界面对比度", fontSize = 14.sp, color = DoukColors.textPrimary)
+                            Text(
+                                "${(uiContrast * 100).roundToInt()}%",
+                                fontSize = 13.sp,
+                                color = DoukColors.textSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("柔和" to 0f, "标准" to 0.35f, "高对比" to 0.8f).forEach { (label, value) ->
+                                val active = kotlin.math.abs(uiContrast - value) < 0.05f
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(DoukShapes.pill)
+                                        .background(if (active) DoukColors.accentSoft else DoukColors.surfaceMuted)
+                                        .border(
+                                            1.dp,
+                                            if (active) DoukColors.accent.copy(alpha = 0.45f) else Color.Transparent,
+                                            DoukShapes.pill
+                                        )
+                                        .clickable {
+                                            uiContrast = value
+                                            DoukPrefs.uiContrast = value
+                                            DoukColors.applyContrast(value)
+                                        }
+                                        .padding(vertical = 9.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        label,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (active) DoukColors.accent else DoukColors.textSecondary
+                                    )
+                                }
+                            }
+                        }
+                        Slider(
+                            value = uiContrast,
+                            onValueChange = {
+                                uiContrast = it
+                                DoukPrefs.uiContrast = it
+                                DoukColors.applyContrast(it)
+                            },
+                            valueRange = 0f..1f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = DoukColors.accent,
+                                activeTrackColor = DoukColors.accent
+                            )
+                        )
+                        Text(
+                            "提高后文字、分割线和选中态更清晰；降低后更柔和。只影响界面，不改变照片颜色。",
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            color = DoukColors.textSecondary
+                        )
                     }
                     SettingDivider()
                     SettingRow(
@@ -1191,7 +1349,7 @@ fun DoukSettingsScreen(state: DoukState) {
             }
 
             // ===== 语言 =====
-            "language" -> SettingsSubPage(title = "语言", onBack = back) {
+            "language" -> SettingsSubPage(title = "语言 / Language", onBack = back) {
                 SettingCard {
                     listOf("跟随系统", "中文", "English").forEachIndexed { index, name ->
                         if (index > 0) SettingDivider()
@@ -1235,6 +1393,12 @@ fun DoukSettingsScreen(state: DoukState) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
                     "语言改动在下次启动应用时生效，界面里的相机参数名保持原厂写法。",
+                    fontSize = 12.sp,
+                    color = DoukColors.textTertiary
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "Language changes take effect the next time you open the app.",
                     fontSize = 12.sp,
                     color = DoukColors.textTertiary
                 )
@@ -1299,7 +1463,11 @@ fun DoukSettingsScreen(state: DoukState) {
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(top = 4.dp, bottom = 130.dp)
                     ) {
-                        itemsIndexed(order, key = { _, key -> key }) { index, key ->
+                        itemsIndexed(
+                            order,
+                            key = { _, key -> key },
+                            contentType = { _, _ -> "param-row" }
+                        ) { index, key ->
                             val param = state.cameraParams.firstOrNull { it.key == key }
                             val label = param?.label ?: key
                             val hidden = state.isParamHidden(key)
@@ -1661,7 +1829,7 @@ fun DoukSettingsScreen(state: DoukState) {
             SettingCard {
                 SettingSwitchRow(
                     title = "自动连接已连接过的设备",
-                    subtitle = "打开应用时识别到上次的相机就自动连上",
+                    subtitle = "没有连接时，自动重连上次的相机",
                     checked = autoConnect,
                     onCheckedChange = {
                         autoConnect = it
@@ -1680,23 +1848,12 @@ fun DoukSettingsScreen(state: DoukState) {
                 SettingDivider()
                 SettingSwitchRow(
                     title = "设备页显示「添加设备」按钮",
-                    subtitle = "关掉后设备页只保留顶部的 + 号和搜索入口",
+                    subtitle = "关闭后只留顶部 + 与搜索",
                     checked = showAddButton,
                     onCheckedChange = {
                         showAddButton = it
                         DoukPrefs.showAddDeviceButton = it
                         state.showAddDeviceButton = it
-                    }
-                )
-                SettingDivider()
-                SettingSwitchRow(
-                    title = "Wi‑Fi 连接时关闭相机节能",
-                    subtitle = "连接后每 6 秒发一次轻量 PTP 心跳，阻止相机待机；不修改相机菜单，断开即恢复",
-                    checked = wifiKeepAwake,
-                    onCheckedChange = {
-                        wifiKeepAwake = it
-                        DoukPrefs.wifiKeepAwake = it
-                        state.applyWifiPowerSave()
                     }
                 )
                 SettingDivider()
@@ -1719,19 +1876,19 @@ fun DoukSettingsScreen(state: DoukState) {
             SettingCard {
                 SettingRow(
                     title = "自动下载",
-                    subtitle = "相机里有新照片、新视频时自动回传到手机",
+                    subtitle = "新拍的照片和视频自动回传手机",
                     value = if (autoDl) "已开启" else "已关闭"
                 ) { downloadPage = "auto" }
                 SettingDivider()
                 SettingRow(
                     title = "下载保护文件",
-                    subtitle = "连接后可选导入全部锁定文件，或仅导入连接后新增的锁定文件",
+                    subtitle = "导入相机里锁定的照片和视频",
                     value = if (lockedOnly) "已开启" else "已关闭"
                 ) { downloadPage = "locked" }
                 SettingDivider()
                 SettingRow(
                     title = "从相机下载的格式",
-                    subtitle = "图库里「保存到」按这里挑，只落选中的格式",
+                    subtitle = "图库保存时只下载选中格式",
                     value = saveFormat
                 ) {
                     pick = ValuePick(
@@ -1750,13 +1907,13 @@ fun DoukSettingsScreen(state: DoukState) {
                 // 顺序：资源 → 相机预加载 → 图像编辑 → 默认打开 → 打开图库加载全部
                 SettingRow(
                     "资源",
-                    if (lutCount == 0) "支持 .cube / .3dl / .look / 图片预设" else "已导入 $lutCount 个（${DoukPrefs.readableSize(lutBytes)}）",
+                    if (lutCount == 0) "LUT、滤镜与图片预设" else "已导入 $lutCount 个（${DoukPrefs.readableSize(lutBytes)}）",
                     null
                 ) { subPage = "resources" }
                 SettingDivider()
                 SettingSwitchRow(
                     title = "相机内图片预加载",
-                    subtitle = "连上相机后在后台先读最新一批，打开图库直接有内容",
+                    subtitle = "后台预读最新照片，图库打开即看",
                     checked = galleryPreload,
                     onCheckedChange = {
                         galleryPreload = it
@@ -1764,13 +1921,13 @@ fun DoukSettingsScreen(state: DoukState) {
                     }
                 )
                 SettingDivider()
-                SettingRow("图像编辑", "导出格式 / 质量 / 预览分辨率 / 网格与对比", null) {
+                SettingRow("图像编辑", "导出格式、质量与预览", null) {
                     subPage = "editor"
                 }
                 SettingDivider()
                 SettingRow(
                     "默认打开",
-                    "进图库时先显示哪一类内容",
+                    "进图库先显示哪一类",
                     galleryDefault
                 ) {
                     pick = ValuePick(
@@ -1785,7 +1942,7 @@ fun DoukSettingsScreen(state: DoukState) {
                 SettingDivider()
                 SettingSwitchRow(
                     title = "打开图库加载全部图片",
-                    subtitle = "关闭时先显示最新一批，向下滚动再分批加载更早的照片",
+                    subtitle = "关闭时先显示最新一批，下滑再加载",
                     checked = galleryLoadAll,
                     onCheckedChange = {
                         galleryLoadAll = it
@@ -1815,18 +1972,25 @@ fun DoukSettingsScreen(state: DoukState) {
                 SettingDivider()
                 SettingRow(
                     title = "设备页更换图片",
-                    subtitle = if (photoPath.isBlank()) "未设置，点这里从相册选一张" else "已设置，点这里更换（设备页只负责展示）",
+                    subtitle = if (photoPath.isBlank()) "从相册选一张做设备页图片" else "已设置，点这里更换",
                     onClick = { photoPicker.launch("image/*") }
                 )
                 SettingDivider()
                 SettingRow("外观设置", "$themeColor · $darkMode", null) { subPage = "appearance" }
                 SettingDivider()
-                SettingRow("储存", "查看图片、LUT 占用，可导出或导入预设", null) {
+                SettingRow(
+                    title = "后台保活",
+                    subtitle = "连接时保持后台运行",
+                    value = if (DoukBleKeepAliveService.isBatteryOptimizationIgnored(context)) "无限制" else "去设置"
+                ) {
+                    DoukBleKeepAliveService.requestIgnoreBatteryOptimizations(context)
+                }
+                SettingDivider()
+                SettingRow("储存", "查看占用，导入导出预设", null) {
                     subPage = "storage"
                 }
                 SettingDivider()
-                SettingRow("语言", "中文 / English，可跟随系统", language) { subPage = "language" }
-            }
+                SettingRow("语言 / Language", "中文 / English", language) { subPage = "language" }            }
 
             // ========== 控制面板 ==========
             Spacer(modifier = Modifier.height(18.dp))
@@ -1834,7 +1998,7 @@ fun DoukSettingsScreen(state: DoukState) {
             SettingCard {
                 SettingRow(
                     title = "参数排列顺序",
-                    subtitle = "拍摄 / 视频分开，长按拖动排序，可隐藏功能",
+                    subtitle = "长按拖动排序，可隐藏功能",
                     onClick = { subPage = "sort" }
                 )
             }
@@ -1879,36 +2043,131 @@ fun DoukSettingsScreen(state: DoukState) {
                 }
             }
 
-            // 悬浮 Douk 栏约 96dp，再加系统手势区；留 132dp 避免最后一张卡被压住
-            Spacer(modifier = Modifier.height(168.dp))
+            // 内容铺到屏幕最底部，滚动时会从透明胶囊下面穿过去；
+            // 末尾留一块比胶囊更高的空白，滚到底时「关于」这张卡完整露在胶囊上方。
+            Spacer(modifier = Modifier.height(124.dp))
         }
     }
 }
 }
 
-private val CHANGELOG_LINES = listOf(
-    APP_VERSION,
-    "· 视频控制补齐：文件类型、画面尺寸/帧率、画质、对焦与 AF 区域、ISO 自动、麦克风灵敏度、录音电平、风噪消减、闪烁消减、高频闪烁消减、畸变校正、裁切、时码与丢帧。",
-    "· 视频页不再重复「视频」前缀；所有档位直接来自相机 descriptor，只显示真机上报的项。",
-    "· 设置右上角新增「关于」图标；「支持作者」页展示铜锣烧赞赏码。",
-    "· 日志统一为 Timber 门面 + xLog 落文件 + 网络拦截器 + ACRA 崩溃收集，诊断包一键生成。",
-    "· 「反馈与建议」整合：可只保存诊断日志，或写邮件并附上 ZIP（lianjingup@outlook.com），正文自带问题模板。",
-    "· 预设改为 .zip 跨设备包，勾选「LUT 与滤镜」时连同 .cube / .xmp 原文件一起导出，另一台手机导入即还原。",
-    "· 储存页移除运行日志与连接诊断占用，保留导出/导入预设，可逐组勾选或全选。",
-    "· 设备页移除「支持的连接方式」卡片与添加设备页的「只允许一台设备」提示。",
-    "· 设置里所有弹窗改为独立整屏页：已连接过的设备、蓝牙、关于内的更新/日志/条款/捐赠。",
-    "· 设备页新增蓝牙 GPS 卡片：状态、推送间隔（1/2/3/5/10/20/30 分钟、1 小时）、最近推送时间与中文地名。",
-    "· 设置 → 设备新增「蓝牙」入口：连接过的设备、自动连接开关、默认设备。",
-    "· 未连接时每 30 秒静默探测「连接过的设备」，打开自动连接就直接连上。",
-    "· 蓝牙推送被相机拒收（status=128）时断开重连并重新握手，再补推一次。",
-    "· 读取机身图库时，结束取景/就绪检查被相机回 0x201F 不再中断整段流程。",
-    "",
-    "更早",
-    "· 品牌改为「连镜 / LensLink」，新应用图标。",
-    "· 四页 UI（设备 / 添加设备 / 控制 / 图库 / 设置）。",
-    "· USB PTP、Wi-Fi STA、Wi-Fi AP、蓝牙 GPS 四种连接方式。",
-    "· 运行日志落盘到应用私有目录，可手动导出。"
+private data class ChangelogEntry(val version: String, val lines: List<String>)
+
+private val CHANGELOG_ENTRIES = listOf(
+    ChangelogEntry(
+        "0.1.0",
+        listOf(
+            "· 修复已知 bug。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.145",
+        listOf(
+            "· Douk 栏加一圈玻璃反光白边：左上角与右下角最亮（0.95 白），沿两条边往中间淡下去，不再是均匀卡片框。",
+            "· 底栏顶部加一层极淡的白色吃光，浅色页面里也能看出玻璃的厚度。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.144",
+        listOf(
+            "· Douk 栏改回全透明：去掉 95% 白底和折光描边，不再看成压在页面上的一张卡片。",
+            "· 外观设置里的「底栏模糊度」恢复真实模糊，0–20dp 拖动即时生效，滚到栏下面的照片会被高斯模糊。",
+            "· 所有页面内容铺到屏幕最底部，底部收尾间距比胶囊更高，滚到最底时最后一块内容完整越过 Douk 栏。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.143",
+        listOf(
+            "· 进监视默认不接管相机：机身屏幕继续显示画面，不再弹「已连接至智能设备」；相机参数里新增「接管相机」按钮，需要时再切。",
+            "· 取消 6 秒保活心跳，不再把相机屏幕反复点亮；相机按自己的节能设置休眠。",
+            "· 点画面改为真正的「点哪对哪」：下发 ChangeAfArea 到对应传感器坐标并驱动一次对焦。",
+            "· 工具箱划出后双击画面即可收起，点画面对焦不再有双击等待。",
+            "· 内置 5 个尼康 N-Log 转 Rec709 LUT（含 RED 系列），首启写入资源页，监看/图库滤镜直接用。",
+            "· 图片详情新增 EXIF 参数段：快门、光圈、ISO、焦距、曝光补偿、测光、白平衡、闪光灯、色彩空间等。",
+            "· 滤镜缩略图改为每个滤镜单独渲染，条上直接显示套完滤镜的效果。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.142",
+        listOf(
+            "· 图库底部不再留出一大片空白，照片网格直接铺到悬浮底栏上方。",
+            "· 相机上给照片加锁后，不打开设置页也会在几秒内自动下载（取景时不打断取景）。",
+            "· 「相机内全部」导入前先比对手机上已有的文件，以前下过的锁定照片不会再重复下载。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.141",
+        listOf(
+            "· 保护文件自动导入默认改为「相机内全部」，相机里已经锁好的照片连接后就会补齐。",
+            "· 已导入过的锁定照片跨会话自动跳过，不会每次连接重复下载。",
+            "· 自动下载与保护文件都保存到应用图库目录，拍完即在图库可见。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.140",
+        listOf(
+            "· 修复自动下载：保存位置「应用相册」现在真正写进应用图库目录，拍完的照片立刻出现在图库。",
+            "· 修复下载保护文件：连接后自动导入锁定照片，任何页面都会弹导入确认。",
+            "· 自动导入改为持续巡检，机身里新加锁的照片会自动补导入。",
+            "· 旧版下载到 LutCameraPro 目录的照片也会在图库显示。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.139",
+        listOf(
+            "· 应用内图库同一张 JPG/RAW 合并为一格，角标同时显示两种格式。",
+            "· 修复多选照片删除失败的问题，配对文件会一起删除。",
+            "· 导入 JPG 时写入手机当前定位；无缓存定位时会短时请求一次新鲜定位。",
+            "· 控制页拍摄卡片下移，贴近底部导航栏上方。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.138",
+        listOf(
+            "· 监看右栏新增「相机控制」按钮，取景中也能调参数；画质胶囊直接显示当前屏幕画质。",
+            "· 底部 Douk 栏不再压住图库、设置和二级页内容，最后一行都能完整看到。",
+            "· 相机拨盘或机身菜单改参数后，App 每 2.5 秒同步一次快门、光圈、ISO、曝光补偿、测光、白平衡和对焦。",
+            "· 更新日志只显示当前版本及之后的版本，不再堆历史旧版。",
+            "· 精简设置页功能说明，保留一句能看懂的重点。"
+        )
+    ),
+    ChangelogEntry(
+        "0.0.128",
+        listOf(
+            "· 监看画面缩到左右栏之间，右栏功能一行一个，快门不被遮挡。",
+            "· 自动下载重启后恢复回传；保护文件支持全部导入；图库支持双指缩放。",
+            "· 设置精简，语言页补英文，移除自启动权限入口。"
+        )
+    )
 )
+
+private fun versionParts(version: String): List<Int> =
+    version.split('.').map { it.toIntOrNull() ?: 0 }
+
+private fun compareVersion(a: String, b: String): Int {
+    val max = maxOf(versionParts(a).size, versionParts(b).size)
+    val pa = versionParts(a) + List(max) { 0 }
+    val pb = versionParts(b) + List(max) { 0 }
+    for (i in 0 until max) {
+        if (pa[i] != pb[i]) return pa[i].compareTo(pb[i])
+    }
+    return 0
+}
+
+/** 只显示当前安装版本及之后版本的更新日志，旧版本不再往前堆。 */
+private fun changelogFor(current: String): List<String> {
+    val visible = CHANGELOG_ENTRIES.filter { compareVersion(it.version, current) >= 0 }
+    if (visible.isEmpty()) return listOf("当前版本 $current", "", "暂无更新日志。")
+    return buildList {
+        add("当前版本 $current")
+        add("")
+        visible.forEach { entry ->
+            add("版本 ${entry.version}")
+            addAll(entry.lines)
+            add("")
+        }
+    }
+}
 
 private val TERMS_LINES = listOf(
     "一、关于本应用",
@@ -1953,15 +2212,20 @@ private val TERMS_LINES = listOf(
     "条款可能随功能调整而更新，更新后的内容会在应用内展示。如对本条款有疑问，可通过「反馈与建议」或发送邮件至 $FEEDBACK_MAIL 与作者联系。"
 )
 
-/** 关于类二级页共用的正文列表 */
+/** 关于类二级页共用的正文列表：统一放进一张高级材质卡，不再让文字直接铺在背景上 */
 @Composable
 private fun InfoLines(lines: List<String>) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        lines.forEach { line ->
-            if (line.isBlank()) {
-                Spacer(modifier = Modifier.height(4.dp))
-            } else {
-                Text(line, fontSize = 13.sp, color = DoukColors.textSecondary, lineHeight = 20.sp)
+    SettingCard {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            lines.forEach { line ->
+                if (line.isBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                } else {
+                    Text(line, fontSize = 13.sp, color = DoukColors.textSecondary, lineHeight = 20.sp)
+                }
             }
         }
     }
@@ -2725,17 +2989,17 @@ private fun AboutPanel(
 
             Spacer(modifier = Modifier.height(18.dp))
             SettingCard {
-                SettingRow("检查更新", "从 GitHub Releases 检查最新版本和安装包") { onCheckUpdate() }
+                SettingRow("检查更新", "从 GitHub 检查最新版本") { onCheckUpdate() }
                 SettingDivider()
-                SettingRow("更新日志", "查看每个版本改了什么") { onChangelog() }
+                SettingRow("更新日志", "只看当前版本及以后") { onChangelog() }
                 SettingDivider()
-                SettingRow("反馈与建议", "写问题、保存诊断日志，或带上日志发邮件给作者") { onFeedback() }
+                SettingRow("反馈与建议", "保存日志或发邮件给作者") { onFeedback() }
                 SettingDivider()
-                SettingRow("使用条款", "免责声明、数据使用与隐私说明") { onTerms() }
+                SettingRow("使用条款", "数据使用与免责说明") { onTerms() }
                 SettingDivider()
-                SettingRow("权限说明", "查看各功能需要的系统权限") { showPermission = true }
+                SettingRow("权限说明", "各功能需要的系统权限") { showPermission = true }
                 SettingDivider()
-                SettingRow("支持作者", "扫码赞赏，请作者喝杯咖啡") { onDonate() }
+                SettingRow("支持作者", "扫码赞赏") { onDonate() }
             }
             Spacer(modifier = Modifier.height(30.dp))
         }

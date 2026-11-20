@@ -226,15 +226,12 @@ class UsbPtpClient {
                     listener?.onLog("🚀 USB LiveView 实时图传启动 (0x9428 优先)")
                 }
 
-                val options = BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                    inMutable = true
-                }
-
                 while (isActive && _isLiveViewActive.value && _isConnected.value) {
                     val frameBytes = fetchUsbLiveViewFrame()
                     if (frameBytes != null && frameBytes.isNotEmpty()) {
-                        val bmp = BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.size, options)
+                        val bmp = BitmapFactory.decodeByteArray(
+                            frameBytes, 0, frameBytes.size, LiveViewQuality.decodeOptions()
+                        )
                         if (bmp != null) {
                             _liveViewBitmap.value = bmp
                             withContext(Dispatchers.Main) {
@@ -316,16 +313,26 @@ class UsbPtpClient {
     }
 
     /**
-     * USB 屏幕触控点对焦     */
+     * USB 屏幕触控点对焦：0x9205 ChangeAfArea 收的是传感器像素坐标（不是 0..1000），
+     * 挪完 AF 区域再发 0x90C1 驱动一次对焦。0x9206 是「取消对焦」，不能用。
+     */
     fun setFocusPoint(normX: Float, normY: Float) {
         if (!_isConnected.value) return
         scope.launch(Dispatchers.IO) {
             try {
-                val x = (normX.coerceIn(0f, 1f) * 1000).toInt()
-                val y = (normY.coerceIn(0f, 1f) * 1000).toInt()
+                val x = (normX.coerceIn(0f, 1f) * 6000).toInt()
+                val y = (normY.coerceIn(0f, 1f) * 4000).toInt()
                 withContext(Dispatchers.Main) { listener?.onLog("🎯 USB 屏幕触控对焦 X=${(normX * 100).toInt()}% Y=${(normY * 100).toInt()}%") }
-                sendPtpCommand(0x9206.toShort(), intArrayOf(x, y))
-                readPtpResponse()
+                sendPtpCommand(0x9205.toShort(), intArrayOf(x, y))
+                val afArea = readPtpResponse()
+                val code = if (afArea.size >= 8) {
+                    (afArea[6].toInt() and 0xFF) or ((afArea[7].toInt() and 0xFF) shl 8)
+                } else -1
+                Log.i(TAG, "USB CHANGE_AF_AREA x=$x y=$y resp=0x${"%04X".format(code)}")
+                if (code == 0x2001) {
+                    sendPtpCommand(0x90c1.toShort())
+                    readPtpResponse()
+                }
                 sendPtpCommand(OP_NIKON_DEVICE_READY)
                 readPtpResponse()
             } catch (e: Exception) {

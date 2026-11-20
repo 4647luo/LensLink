@@ -415,6 +415,16 @@ class NikonViewModel : ViewModel() {
     // 尼康式 PTP 客户端实例
                 val ptpClient = NikonPtpClient()
 
+    init {
+        // App 重启后设置页里的开关仍然是开的，但 PTP 客户端的自动回传标记会回到 false；
+        // 这里按已保存的设置同步一次，否则事件通道收到新照片也会被直接丢掉。
+        val wanted = com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.autoDownload &&
+            com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.downloadFormat != "不下载"
+        autoTransferOnShutter = wanted
+        ptpClient.autoTransferJpeg = wanted
+        autoTransferStatus = if (wanted) "等待新照片；相机请设置 JPG 或 RAW+JPG，并开启自动上传" else "自动回传已关闭"
+    }
+
     // 实时图传流
                 val isLiveViewActive = ptpClient.isLiveViewActive
     val liveViewBitmap = ptpClient.liveViewBitmap
@@ -819,11 +829,14 @@ class NikonViewModel : ViewModel() {
                             withContext(Dispatchers.Main) {
                                 addLogInner("⚠️ 参数同步异常: ${e.message}")
                             }
+                        } finally {
+                            startParamPolling()
                         }
                     }
                 }
 
                 override fun onDisconnected(reason: String) {
+                    stopParamPolling()
                     viewModelScope.launch(Dispatchers.Main) {
                         runCatching { FtpPushReceiver.stopReceiver() }
                         pairingCode = null; pairingVersion = null
@@ -872,6 +885,7 @@ class NikonViewModel : ViewModel() {
     }
 
     fun disconnect() {
+        stopParamPolling()
         pairingCode = null; pairingVersion = null
         val wasConnecting = isConnecting
         isConnecting = false
@@ -919,9 +933,75 @@ class NikonViewModel : ViewModel() {
         }
     }
 
+    // 相机拨盘/机身菜单改动后，App 里显示的参数也要跟着变。
+    // 这里只轮询「当前值」，不再每轮拉一遍完整 descriptor，避免把 PTP 和取景拖慢。
+    private var paramPollJob: Job? = null
+
+    private fun startParamPolling() {
+        if (paramPollJob?.isActive == true) return
+        paramPollJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(2000)
+            while (isActive && isConnected) {
+                runCatching { pollCameraParamSnapshot() }
+                delay(2500)
+            }
+        }
+    }
+
+    private fun stopParamPolling() {
+        paramPollJob?.cancel()
+        paramPollJob = null
+    }
+
+    private suspend fun pollCameraParamSnapshot() {
+        if (!isConnected || !ptpClient.canControlCamera) return
+        val shutter = readPropBytes(0x500D)?.let(::leU32)
+        val aperture = readPropBytes(0x5007)?.let(::leU16)
+        val iso = readPropBytes(0x500F)?.let(::leU16)
+        val ev = readPropBytes(0x5010)?.let(::leS16)
+        val metering = readPropBytes(0x500B)?.let(::leU16)
+        val mode = readPropBytes(0x500E)?.let { if (it.isNotEmpty()) (it[0].toInt() and 0xFF).toLong() else null }
+        val wb = readPropBytes(0x5005)?.let(::leU16)
+        val focus = readPropBytes(0xD061)?.let { if (it.isNotEmpty()) (it[0].toInt() and 0xFF).toLong() else null }
+
+        withContext(Dispatchers.Main) {
+            if (shutter != null && shutter > 0) shutterSpeed = formatShutterRaw(shutter)
+            if (aperture != null && aperture > 0) this@NikonViewModel.aperture = formatApertureRaw(aperture)
+            if (iso != null && iso > 0) this@NikonViewModel.iso = formatIsoRaw(iso)
+            ev?.let { exposureComp = decodeExposureComp(it) }
+            if (metering != null && metering > 0) meteringMode = meteringLabel(metering)
+            if (mode != null && mode in 1L..5L) {
+                exposureProgram = mode.toInt()
+                exposureModeLabel = exposureModeLabelOf(mode)
+            }
+            if (wb != null && wb > 0) whiteBalance = whiteBalanceLabel(wb)
+            if (focus != null && focus in 0L..5L) focusModeLabel = nikonFocusModeLabelOf(focus)
+        }
+    }
+
+    private suspend fun readPropBytes(prop: Int): ByteArray? =
+        runCatching { ptpClient.getDevicePropValue(prop.toShort()) }.getOrNull()
+
+    private fun leU16(bytes: ByteArray): Long? {
+        if (bytes.size < 2) return null
+        return ((bytes[0].toLong() and 0xFF) or ((bytes[1].toLong() and 0xFF) shl 8))
+    }
+
+    private fun leU32(bytes: ByteArray): Long? {
+        if (bytes.size < 4) return leU16(bytes)
+        return (bytes[0].toLong() and 0xFF) or
+            ((bytes[1].toLong() and 0xFF) shl 8) or
+            ((bytes[2].toLong() and 0xFF) shl 16) or
+            ((bytes[3].toLong() and 0xFF) shl 24)
+    }
+
+    private fun leS16(bytes: ByteArray): Long? {
+        val u = leU16(bytes) ?: return null
+        return if (u >= 0x8000) u - 0x10000 else u
+    }
+
     /** 拉取快门/光圈/ISO 的枚举可选值与当前值，刷新界面选项 */
-    private suspend fun syncCameraPropOptions() {
-        // 快门码 0x500D ExposureTime（UINT32，单位 1/10000 秒）
+    private suspend fun syncCameraPropOptions() {        // 快门码 0x500D ExposureTime（UINT32，单位 1/10000 秒）
                 ptpClient.fetchPropDesc(0x500D.toShort())?.let { desc ->
             if (desc.isEnum) {
                 val options = desc.enumValues.map { CameraOption(formatShutterRaw(it), it, desc.dataType) }
@@ -1224,7 +1304,7 @@ class NikonViewModel : ViewModel() {
         return if (total == 0) 1 else total
     }
 
-    /** 手机最近一次定位，用来给导入的照片补 GPS（相机不收蓝牙 GPS 时的兜底） */
+    /** 手机最近一次定位；系统还没有缓存时同步请求一次新鲜定位，避免导入照片时拿不到坐标 */
     private fun lastKnownLatLon(): Pair<Double, Double>? {
         val ctx = appContext ?: return null
         val fine = androidx.core.content.ContextCompat.checkSelfPermission(
@@ -1238,22 +1318,63 @@ class NikonViewModel : ViewModel() {
         if (!granted) return null
         val lm = ctx.getSystemService(android.content.Context.LOCATION_SERVICE)
             as? android.location.LocationManager ?: return null
-        val loc = runCatching { lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER) }.getOrNull()
+        val cached = runCatching { lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER) }.getOrNull()
             ?: runCatching { lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER) }.getOrNull()
-            ?: return null
-        return loc.latitude to loc.longitude
+        cached?.let { return it.latitude to it.longitude }
+        return freshLocation(lm)
+    }
+
+    private fun freshLocation(lm: android.location.LocationManager): Pair<Double, Double>? {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var latest: android.location.Location? = null
+        val listener = object : android.location.LocationListener {
+            override fun onLocationChanged(location: android.location.Location) {
+                if (latest == null) {
+                    latest = location
+                    latch.countDown()
+                }
+            }
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
+            @Deprecated("Deprecated in Java")
+            override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
+        }
+        val providers = listOf(
+            android.location.LocationManager.GPS_PROVIDER,
+            android.location.LocationManager.NETWORK_PROVIDER
+        ).filter { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) }
+        providers.forEach { provider ->
+            runCatching {
+                lm.requestSingleUpdate(provider, listener, android.os.Looper.getMainLooper())
+            }
+        }
+        try {
+            latch.await(900, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        runCatching { lm.removeUpdates(listener) }
+        return latest?.let { it.latitude to it.longitude }
     }
 
     /** 导入照片落盘后补写 EXIF GPS（设置里「导入图片时附加手机 GPS」打开才写） */
-    private fun stampGpsIfEnabled(path: String) {
+    private fun stampGpsIfEnabled(pathOrUri: String) {
         if (!com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.gpsEnabled) return
         if (!com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.gpsAttachImport) return
         val (lat, lon) = lastKnownLatLon() ?: run {
             addLogInner("未取到手机定位，照片未附加 GPS")
             return
         }
-        if (com.lutcamera.lutcamerapro.util.PhotoGpsStamp.stamp(path, lat, lon)) {
-            addLogInner("已把手机 GPS 写入 ${java.io.File(path).name}")
+        val displayName = if (pathOrUri.startsWith("content://", true)) {
+            android.net.Uri.parse(pathOrUri).lastPathSegment ?: pathOrUri
+        } else java.io.File(pathOrUri).name
+        val stamped = com.lutcamera.lutcamerapro.util.PhotoGpsStamp.stamp(
+            appContext, pathOrUri, lat, lon
+        )
+        if (stamped) {
+            addLogInner("已把手机 GPS 写入 $displayName")
+        } else {
+            addLogInner("JPG 可写 GPS，RAW/视频不支持写入定位：$displayName")
         }
     }
 
@@ -1351,6 +1472,13 @@ class NikonViewModel : ViewModel() {
         }
     }
 
+    /** 锁定文件的去重键：文件名 + 大小，跨连接稳定；handle 每次连接可能变，不能拿来跨会话判重。 */
+    private fun doukLockedKey(file: com.lutcamera.lutcamerapro.model.CameraStorageFile): String =
+        "${file.fileName}|${file.sizeBytes}"
+
+    private fun doukIsLockedImported(file: com.lutcamera.lutcamerapro.model.CameraStorageFile): Boolean =
+        com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.isLockedImported(doukLockedKey(file))
+
     /**
      * 导入相机里所有标了「保护/锁定」的照片。
      * 只下原图 JPG，按顺序逐张处理，避免同时开多个 PTP 事务把相机顶掉。
@@ -1359,7 +1487,9 @@ class NikonViewModel : ViewModel() {
         onlyAfterConnect: Boolean = false,
         onDone: ((Int) -> Unit)? = null,
         scanCount: Int = 4000,
-        dedupeHandled: Boolean = false
+        dedupeHandled: Boolean = true,
+        /** 后台巡检用：没有新东西就不写日志，避免每几秒刷一行 */
+        quiet: Boolean = false
     ) {
         if (!isConnected) {
             lockedImportStatus = "相机未连接，无法导入锁定照片"
@@ -1377,7 +1507,7 @@ class NikonViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             var success = 0
             try {
-                val all = ptpClient.fetchCameraPhotos(startIdx = 0, count = scanCount, force = true)
+                val all = ptpClient.fetchCameraPhotos(startIdx = 0, count = scanCount, force = true, quiet = quiet)
                 val lockedCandidates = all.filter { it.isLocked }
                 // 设置-下载保护文件里的图片/视频格式要真正参与筛选：
                 // 只锁了 RAW 或视频时，默认「JPG」会一个都找不到，必须先按规则分类再报数量。
@@ -1385,13 +1515,35 @@ class NikonViewModel : ViewModel() {
                 val includeJpg = lkFormat != "不下载" && lkFormat != "RAW"
                 val includeRaw = lkFormat == "RAW" || lkFormat == "JPG + RAW" || lkFormat == "全部格式"
                 val includeVideo = com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.lockedVideoFormat != "不下载"
-                val lockedAll = lockedCandidates.filter { file ->
+                // 落盘前先按磁盘现状判重：老版本下到 LutCameraPro、或手工导入过的同名同尺寸文件
+                // 从来没进过去重记录，只靠 key 去重会再下一份 (1).JPG，所以这里加一层磁盘索引。
+                val diskIndex = if (dedupeHandled) {
+                    runCatching {
+                        com.lutcamera.lutcamerapro.ui.douk.GalleryFileOps.appFileNameIndex()
+                    }.getOrDefault(emptySet())
+                } else emptySet()
+                val alreadyOnDisk = lockedCandidates.filter { file ->
+                    com.lutcamera.lutcamerapro.ui.douk.GalleryFileOps
+                        .diskBaseName(file.fileName) in diskIndex
+                }
+                alreadyOnDisk.forEach {
+                    com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.markLockedImported(doukLockedKey(it))
+                    importedLockedHandles.add(it.handle)
+                }
+                val lockedByFormat = lockedCandidates.filter { file ->
                     when {
                         file.isVideo -> includeVideo
                         file.isRaw -> includeRaw
                         else -> includeJpg
                     }
-                }.filterNot { dedupeHandled && it.handle in importedLockedHandles }
+                }
+                val lockedAll = lockedByFormat
+                    .filterNot { dedupeHandled && it.handle in importedLockedHandles }
+                    // 跨会话去重：handle 每次连接可能变，用「文件名|大小」判断是否已经导入到手机
+                    .filterNot { dedupeHandled && doukIsLockedImported(it) }
+                    // 磁盘上已经有同名的文件，说明以前下过，直接跳过
+                    .filterNot { dedupeHandled && com.lutcamera.lutcamerapro.ui.douk.GalleryFileOps
+                        .diskBaseName(it.fileName) in diskIndex }
                 val locked = if (onlyAfterConnect) {
                     val base = withTimeoutOrNull(10_000L) {
                         lockedBaseline?.await()
@@ -1406,21 +1558,22 @@ class NikonViewModel : ViewModel() {
                 } else {
                     lockedAll
                 }
-                addLogInner(
+                if (!quiet) addLogInner(
                     "锁定文件：总计 ${lockedCandidates.size} 个" +
                         "（JPG/HEIF ${lockedCandidates.count { !it.isRaw && !it.isVideo }}，" +
                         "RAW ${lockedCandidates.count { it.isRaw }}，" +
                         "视频 ${lockedCandidates.count { it.isVideo }}），" +
-                        "按当前设置命中 ${lockedAll.size} 个"
+                        "按当前设置命中 ${lockedAll.size} 个" +
+                        if (alreadyOnDisk.isNotEmpty()) "，手机上已存在 ${alreadyOnDisk.size} 个" else ""
                 )
                 if (locked.isEmpty()) {
                     withContext(Dispatchers.Main) {
                         lockedImportStatus = when {
                             lockedCandidates.isEmpty() -> "相机里没有找到锁定文件；请确认已在机身上给照片加锁"
-                            lockedAll.isEmpty() -> "发现 ${lockedCandidates.size} 个锁定文件，但当前格式设置是「$lkFormat」；" +
+                            lockedByFormat.isEmpty() -> "发现 ${lockedCandidates.size} 个锁定文件，但当前格式设置是「$lkFormat」；" +
                                 "到设置-下载保护文件把图片格式改成 RAW / JPG + RAW，视频格式改成非「不下载」"
-                            onlyAfterConnect -> "本次连接后没有新增锁定文件"
-                            else -> "没有符合当前格式设置的锁定文件"
+                            lockedAll.isNotEmpty() -> "本次连接后没有新增锁定文件（已导入过的不会重复下载）"
+                            else -> "锁定文件都已导入过（手机上已有 ${alreadyOnDisk.size} 个），不会重复下载"
                         }
                     }
                     return@launch
@@ -1476,6 +1629,7 @@ class NikonViewModel : ViewModel() {
                         return@forEachIndexed
                     }
                     importedLockedHandles.add(file.handle)
+                    com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.markLockedImported(doukLockedKey(file))
                     success++
                     withContext(Dispatchers.Main) {
                         val idx = storageFiles.indexOfFirst { it.handle == file.handle }
@@ -2424,10 +2578,13 @@ class NikonViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             val ok = ptpClient.setPropRawValue(prop.toShort(), option.dataType, option.raw)
             withContext(Dispatchers.Main) {
-                if (ok) addLogInner("${key} 已下发: ${option.label}")
-                else {
+                if (ok) {
+                    lastParamMessage = "${extraLabel(key, option.raw)} 已写入 ${option.label}"
+                    addLogInner("${key} 已下发: ${option.label}")
+                } else {
                     extraProps[key] = current
-                    addLogInner(propFailMessage(key, ptpClient.lastResponseCode))
+                    lastParamMessage = propFailMessage(key, ptpClient.lastResponseCode)
+                    addLogInner(lastParamMessage)
                     refreshCameraParams(silent = true)
                 }
             }
@@ -2825,6 +2982,22 @@ class NikonViewModel : ViewModel() {
         }
     }
 
+    /**
+     * 监看里的「接管相机」开关：切换 ptpClient 的取景方案。
+     * 取景进行中就重启一次，让新的方案（是否发 0x9435/0x90C2）立刻生效。
+     */
+    fun setTakeoverCamera(on: Boolean) {
+        ptpClient.takeoverHostControl = on
+        addLogInner(if (on) "已接管相机：机身屏幕会让给 App" else "已退出接管：相机屏幕继续显示")
+        if (ptpClient.isLiveViewActive.value) {
+            viewModelScope.launch(Dispatchers.IO) {
+                ptpClient.stopLiveView()
+                kotlinx.coroutines.delay(600)
+                ptpClient.startLiveView()
+            }
+        }
+    }
+
     /** 从机身读回作者/版权文本（版权页的「导入相机数据」） */
     suspend fun readCopyrightFromCamera(): Pair<String, String> = withContext(Dispatchers.IO) {
         if (!isConnected) return@withContext "" to ""
@@ -2882,13 +3055,14 @@ class NikonViewModel : ViewModel() {
 
 /**
  * 设置里的「保存位置」映射成 MediaStore RELATIVE_PATH。
- * 应用相册 → App 自己的 Pictures 目录；系统相册 → DCIM；Download → 下载目录。
+ * 「应用相册」必须落进 App 图库扫描的 Pictures/Douk，否则拍完的照片只在系统相册可见、
+ * 应用内图库永远空着（旧版写成 LutCameraPro 就是这个症状）。
  */
 private fun downloadRelativePath(dir: String, sub: String): String {
     val root = when (dir) {
-        "系统相册" -> "DCIM/LutCameraPro"
-        "Download" -> "Download/LutCameraPro"
-        else -> "Pictures/LutCameraPro"
+        "系统相册" -> "DCIM/Douk"
+        "Download" -> "Download/Douk"
+        else -> "Pictures/Douk"
     }
     return if (sub.isBlank()) root else "$root/$sub"
 }

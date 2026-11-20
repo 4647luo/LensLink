@@ -67,6 +67,7 @@ import androidx.compose.material.icons.rounded.Wallpaper
 import androidx.compose.material.icons.rounded.WbSunny
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -353,10 +354,13 @@ internal fun PhotoEditorScreen(
         filterRuntime = library.runtime
         filterEntries = FILTERS.map { FilterEntry(it, it, "自带") } + library.entries
         filterThumbs = if (bmp == null) emptyMap() else withContext(Dispatchers.IO) {
-            val small = scaleToMax(bmp, 128)
+            val small = scaleToMax(bmp, 160)
             filterEntries.associate { entry ->
                 entry.id to runCatching {
-                    renderPreview(small, EditState(filter = entry.id, filterAmount = 100f), 128, filterRuntime)
+                    // render() 是原地改像素（putPixels 返回 this），每个滤镜必须拿独立副本，
+                    // 否则 18 个缩略图全指向同一张 bitmap，看起来就都跟原图一样。
+                    val copy = small.copy(Bitmap.Config.ARGB_8888, true) ?: return@runCatching null
+                    renderPreview(copy, EditState(filter = entry.id, filterAmount = 100f), 128, filterRuntime)
                         .asImageBitmap()
                 }.getOrNull()
             }.filterValues { it != null }.mapValues { it.value!! }
@@ -1533,9 +1537,12 @@ private fun FilterGrid(
                         )
                 )
                 Text(
-                    entry.label,
+                    // 内置 LUT 全名带「N-Log 转 Rec709」，格子只有 64dp，去掉尾巴后名称才看得全
+                    entry.label.replace(" N-Log 转 Rec709", "").replace("N-Log 转 Rec709", ""),
                     fontSize = 10.sp,
-                    maxLines = 1,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    lineHeight = 12.sp,
                     fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
                     color = Color.White,
                     modifier = Modifier

@@ -33,10 +33,31 @@ object DoukPrefs {
     private fun putFloat(key: String, value: Float) { ensure(); sp.edit().putFloat(key, value).apply() }
 
     // ===== 设备 =====
-    /** 识别到连接过的相机时自动连接 */
+    /** 识别到连接过的相机时自动连接（默认开启：断线后每 20 秒探测一次历史相机） */
     var autoConnectKnown: Boolean
-        get() = flag("auto_connect_known", false)
+        get() = flag("auto_connect_known", true)
         set(v) = putFlag("auto_connect_known", v)
+
+    /** 未连接时自动探测历史相机的间隔（秒） */
+    var autoReconnectSeconds: Int
+        get() = getInt("auto_reconnect_seconds", 20).coerceIn(10, 120)
+        set(v) = putInt("auto_reconnect_seconds", v.coerceIn(10, 120))
+
+    // ===== 监看 =====
+    /** 手机端取景画质：流畅 / 标准 / 高清 */
+    var monitorPreviewQuality: String
+        get() = str("monitor_preview_quality", "标准")
+        set(v) = putStr("monitor_preview_quality", v)
+
+    /** 监视画面左栏按钮（逗号分隔的动作 id） */
+    var monitorLeftActions: String
+        get() = str("monitor_left_actions", "iso,shutter,aperture,ev")
+        set(v) = putStr("monitor_left_actions", v)
+
+    /** 监视画面右栏按钮（快门固定居中，其余动作竖排） */
+    var monitorRightActions: String
+        get() = str("monitor_right_actions", "grid,hist,wave,audio")
+        set(v) = putStr("monitor_right_actions", v)
 
     /** 设备页是否显示「添加设备」按钮（关掉后走顶部 + 号或搜索） */
     var showAddDeviceButton: Boolean
@@ -186,11 +207,27 @@ object DoukPrefs {
     /**
      * 连接后导入的锁定文件范围：
      * false = 相机内所有锁定文件；true = 仅本次连接后新增的锁定文件。
-     * 「导入前询问」对这两种范围都生效。
+     * 换过两次 key：旧版默认 true，「相机内全部」模式下永远导不到已经锁好的照片；
+     * 0.0.142 再换 key，把所有装机都拉回「相机内全部」，
+     * 靠文件名+大小的判重保证以前下过的不会重复下载。
      */
     var lockedNewOnly: Boolean
-        get() = flag("locked_new_only", false)
-        set(v) = putFlag("locked_new_only", v)
+        get() = flag("locked_new_only_v3", false)
+        set(v) = putFlag("locked_new_only_v3", v)
+
+    /** 已经导入过的锁定文件键（文件名|大小），跨会话去重，避免每次连接重复下载 */
+    private var importedLockedKeys: MutableSet<String>
+        get() = str("locked_imported_keys", "").split('\n')
+            .filter { it.isNotBlank() }.toMutableSet()
+        set(v) = putStr("locked_imported_keys", v.toList().takeLast(400).joinToString("\n"))
+
+    fun isLockedImported(key: String): Boolean = key in importedLockedKeys
+
+    fun markLockedImported(key: String) {
+        val current = importedLockedKeys
+        current.add(key)
+        importedLockedKeys = current
+    }
 
     /** 设备页是否显示蓝牙 GPS 卡片 */
     var showBleGpsCard: Boolean
@@ -202,10 +239,19 @@ object DoukPrefs {
         get() = flag("show_ble_remote_card", true)
         set(v) = putFlag("show_ble_remote_card", v)
 
-    /** Wi‑Fi 连接时用轻量 PTP 心跳阻止相机进入节能休眠（不改相机菜单） */
+    /** 已废弃：以前用 6 秒心跳强行不让相机待机，实测会把相机屏幕反复点亮，现固定 15 秒 */
     var wifiKeepAwake: Boolean
-        get() = flag("wifi_keep_awake", true)
+        get() = flag("wifi_keep_awake", false)
         set(v) = putFlag("wifi_keep_awake", v)
+
+    /**
+     * 进入监视时是否直接接管相机（0x9435/0x90C2）。
+     * 默认 false：相机屏幕继续显示实时画面，不出「已连接至智能设备」弹窗；
+     * 用户在监看面板里点「接管相机」后才切成控制模式。
+     */
+    var takeoverCamera: Boolean
+        get() = flag("takeover_camera", false)
+        set(v) = putFlag("takeover_camera", v)
 
     // ===== 通用 =====
     /** 语言跟随系统（中文 / 英文） */
@@ -253,10 +299,15 @@ object DoukPrefs {
         get() = getFloat("material_alpha", 0.95f).coerceIn(0.55f, 1f)
         set(v) = putFloat("material_alpha", v.coerceIn(0.55f, 1f))
 
-    /** 高级材质背后模糊半径（dp），默认 8dp，只做很轻的一层 */
+    /** 高级材质背后模糊半径（dp），默认 8dp，仅用于底栏 */
     var materialBlur: Float
         get() = getFloat("material_blur", 8f).coerceIn(0f, 20f)
         set(v) = putFloat("material_blur", v.coerceIn(0f, 20f))
+
+    /** 界面对比度 0–1：0 柔和，0.35 标准，1 高对比 */
+    var uiContrast: Float
+        get() = getFloat("ui_contrast", 0.35f).coerceIn(0f, 1f)
+        set(v) = putFloat("ui_contrast", v.coerceIn(0f, 1f))
     /** 悬浮 Douk 栏 */
     var floatingBar: Boolean
         get() = flag("floating_bar", false)
@@ -292,10 +343,33 @@ object DoukPrefs {
         get() = flag("gallery_load_all", false)
         set(v) = putFlag("gallery_load_all", v)
 
+    /** 图库网格列数：双指放大缩到 3 列，缩小放到 6 列 */
+    var galleryColumns: Int
+        get() = getInt("gallery_columns", 4).coerceIn(3, 6)
+        set(v) = putInt("gallery_columns", v.coerceIn(3, 6))
+
     /** 图库分批显示的每批张数（默认 60，正好铺满平板两三屏） */
     var galleryPageSize: Int
         get() = getInt("gallery_page_size", 60)
         set(v) = putInt("gallery_page_size", v)
+
+    // ===== 更新 =====
+    /** 启动 App 时自动检查一次更新 */
+    var checkUpdateOnLaunch: Boolean
+        get() = flag("check_update_on_launch", true)
+        set(v) = putFlag("check_update_on_launch", v)
+
+    /** 上次启动自动检查时间，用于避免每次启动都请求 */
+    var lastAutoUpdateCheckAt: Long
+        get() {
+            ensure()
+            return sp.getLong("last_auto_update_check_at", 0L)
+        }
+        set(v) {
+            ensure()
+            sp.edit().putLong("last_auto_update_check_at", v).apply()
+        }
+
 
     // ===== 控制页参数排序 / 显示 =====
     /** 拍摄参数顺序，key 用英文逗号连接；空串表示用默认顺序。 */

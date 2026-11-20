@@ -20,6 +20,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -60,8 +61,10 @@ object DoukColors {
     internal val glassState = mutableStateOf(true)
     /** 卡片不透明度（0.55–1.0） */
     internal val materialAlphaState = mutableStateOf(0.95f)
-    /** 卡片背后模糊半径（dp） */
+    /** 卡片背后模糊半径（dp），只给底栏一层真实模糊，卡片本身用静态磨砂渐变 */
     internal val materialBlurState = mutableStateOf(8f)
+    /** 界面对比度 0–1：0 柔和，0.35 标准，1 高对比 */
+    internal val contrastState = mutableStateOf(0.35f)
     /** 全站共享的背景源状态：页面内容画一次，卡片/底栏从里面取真实模糊。 */
     internal val hazeState = dev.chrisbanes.haze.HazeState()
 
@@ -75,13 +78,34 @@ object DoukColors {
 
     val materialBlur: Float get() = materialBlurState.value
 
+    val contrast: Float get() = contrastState.value
+
+    /** 文字/描边随对比度向黑或白靠，背景和表面同时拉开层次 */
+    private fun boost(color: Color, amount: Float): Color {
+        val c = contrastState.value
+        if (c <= 0f) return color
+        val target = if (darkState.value) Color.White else Color.Black
+        return lerp(color, target, (c * amount).coerceIn(0f, 0.55f))
+    }
+
     /** 页面底层：带一点冷暖和主色倾向的渐变，玻璃卡片才有东西可透 */
     val backgroundBrush: Brush
-        get() = if (darkState.value) Brush.linearGradient(
-            listOf(Color(0xFF0A0C11), Color(0xFF141A23), Color(0xFF0B0E13))
-        ) else Brush.linearGradient(
-            listOf(Color(0xFFF6FAFF), Color(0xFFE8EFF9), Color(0xFFF8F1EA))
-        )
+        get() {
+            val c = contrastState.value
+            return if (darkState.value) Brush.linearGradient(
+                listOf(
+                    lerp(Color(0xFF0A0C11), Color.Black, c * 0.22f),
+                    lerp(Color(0xFF141A23), Color.Black, c * 0.18f),
+                    lerp(Color(0xFF0B0E13), Color.Black, c * 0.22f)
+                )
+            ) else Brush.linearGradient(
+                listOf(
+                    lerp(Color(0xFFF6FAFF), Color.Black, c * 0.06f),
+                    lerp(Color(0xFFE8EFF9), Color.Black, c * 0.05f),
+                    lerp(Color(0xFFF8F1EA), Color.Black, c * 0.06f)
+                )
+            )
+        }
 
     /** 主色的极浅底（选中态、标签底） */
     val accentSoft: Color get() = accentState.value.copy(alpha = 0.10f)
@@ -92,19 +116,27 @@ object DoukColors {
     val accentOutline: Color get() = accentState.value.copy(alpha = 0.34f)
 
     // ===== 表面分级（Material 3 surface container 思路）=====
-    val background: Color get() = if (darkState.value) Color(0xFF0D0E11) else Color(0xFFF5F6F8)
+    val background: Color get() = if (darkState.value) {
+        lerp(Color(0xFF0D0E11), Color.Black, contrastState.value * 0.18f)
+    } else {
+        lerp(Color(0xFFF5F6F8), Color.Black, contrastState.value * 0.035f)
+    }
     val surface: Color get() = if (darkState.value) Color(0xFF16181C) else Color(0xFFFFFFFF)
     val surfaceRaised: Color get() = if (darkState.value) Color(0xFF1D1F24) else Color(0xFFFBFBFC)
-    val surfaceMuted: Color get() = if (darkState.value) Color(0xFF212429) else Color(0xFFF0F1F4)
+    val surfaceMuted: Color get() = if (darkState.value) {
+        boost(Color(0xFF212429), 0.12f)
+    } else {
+        boost(Color(0xFFF0F1F4), 0.08f)
+    }
 
     // ===== 文本四级 =====
-    val textPrimary: Color get() = if (darkState.value) Color(0xFFF3F4F6) else Color(0xFF101114)
-    val textSecondary: Color get() = if (darkState.value) Color(0xFFA0A5AE) else Color(0xFF7C8189)
-    val textTertiary: Color get() = if (darkState.value) Color(0xFF6E737C) else Color(0xFFB0B4BC)
+    val textPrimary: Color get() = boost(if (darkState.value) Color(0xFFF3F4F6) else Color(0xFF101114), 0.10f)
+    val textSecondary: Color get() = boost(if (darkState.value) Color(0xFFA0A5AE) else Color(0xFF7C8189), 0.45f)
+    val textTertiary: Color get() = boost(if (darkState.value) Color(0xFF6E737C) else Color(0xFFB0B4BC), 0.55f)
 
     // ===== 线与描边 =====
-    val divider: Color get() = if (darkState.value) Color(0xFF2A2D33) else Color(0xFFECEDF1)
-    val outline: Color get() = if (darkState.value) Color(0xFF3A3E46) else Color(0xFFD8DBE1)
+    val divider: Color get() = boost(if (darkState.value) Color(0xFF2A2D33) else Color(0xFFECEDF1), 0.14f)
+    val outline: Color get() = boost(if (darkState.value) Color(0xFF3A3E46) else Color(0xFFD8DBE1), 0.18f)
 
     // ===== 语义色 =====
     val success = Color(0xFF00B26A)
@@ -145,7 +177,10 @@ object DoukColors {
 
     fun applyGlass(enabled: Boolean) { glassState.value = enabled }
 
-    /** 高级材质：不透明度越高越接近实心卡片，模糊半径只影响卡片背后那一层 */
+    /** 界面对比度：0 柔和，0.35 标准，1 高对比 */
+    fun applyContrast(value: Float) { contrastState.value = value.coerceIn(0f, 1f) }
+
+    /** 高级材质：不透明度越高越接近实心卡片，模糊半径只影响底栏那一层 */
     fun applyMaterial(alpha: Float, blurDp: Float) {
         materialAlphaState.value = alpha.coerceIn(0.55f, 1f)
         materialBlurState.value = blurDp.coerceIn(0f, 20f)
@@ -216,67 +251,65 @@ fun Modifier.doukShadow(
 
 /**
  * 卡片表面：关掉「玻璃质感」时是原来的实色；
- * 打开后换成磨砂玻璃：竖向柔光渐变 + 两团模糊光晕 + 高光描边。
+ * 打开后换成磨砂玻璃：柔光渐变 + 主色光晕 + 高光描边。
  *
- * 不再使用左上 → 右下的线性渐变，避免整张卡出现一条横向亮带；
- * 光晕用径向渐变模拟高斯模糊的扩散，卡片压在内容上时比单纯透明更像实体玻璃。
- * [tint] 用于选中态（例如底栏被选中的 tab），只染一层很淡的主色。
+ * 性能说明：卡片不再逐张调用 Haze 的真实模糊。页面滚动时几十张卡片同时
+ * 重新计算 RenderEffect 是「突然变卡」的主因；这里用统一的半透明底色
+ * 模拟磨砂层，不做渐变，底栏单独保留一层真实模糊。
+ * [tint] 用于选中/警告态，只染一层很淡的语义色；[baseColor] 用于嵌套的
+ * surfaceMuted 小卡，保持原来的深浅层级。
  */
 fun Modifier.doukCardSurface(
     shape: Shape = DoukShapes.card,
-    tint: Color = Color.Transparent
+    tint: Color = Color.Transparent,
+    baseColor: Color = DoukColors.surface
 ): Modifier {
-    val baseColor = if (tint == Color.Transparent) DoukColors.surface else tint
     if (!DoukColors.glass) {
         return background(if (tint == Color.Transparent) baseColor else tint, shape)
     }
-    // 高级材质：95% 不透明度的卡片 + 背后一层轻度真实模糊。
-    // 不再做强高斯：卡片本身接近实心，只留一点底层的色与光，文字不会被糊成色块。
     val dark = DoukColors.isDark
     val opacity = DoukColors.materialAlpha
-    val glassTint = when {
-        tint != Color.Transparent -> tint.copy(alpha = if (dark) 0.46f else 0.40f)
-        dark -> Color(0xFF171B22).copy(alpha = opacity)
-        else -> Color.White.copy(alpha = opacity)
-    }
-    return this
-        // clip 放在 hazeEffect 外层：RenderEffect 在圆角图层内绘制，四角不会露出方形模糊块
+    val fill = baseColor.copy(alpha = opacity)
+
+    var surface = this
         .clip(shape)
-        .hazeEffect(
-            state = DoukColors.hazeState,
-            style = HazeStyle(
-                backgroundColor = glassTint,
-                tints = emptyList(),
-                blurRadius = DoukColors.materialBlur.dp,
-                noiseFactor = 0f
-            )
-        )
-        // 高亮玻璃边：先铺一条更宽的极淡白边当内侧折光，再压一条 1.2dp 亮白边。
-        // 两条都画在卡片内侧，圆角处不会露出直角；浅色下接近参考图的白玻璃胶囊，
-        // 深色下降低白度，避免夜里出现一圈刺眼的荧光边。
+        .background(fill, shape)
+    if (tint != Color.Transparent) {
+        surface = surface.background(tint.copy(alpha = 0.10f), shape)
+    }
+    // 平直的玻璃边：只用一层冷灰细边 + 外侧柔光，不再做方向性渐变。
+    val edge = if (dark) {
+        Color.White.copy(alpha = 0.28f)
+    } else {
+        Color(0xFFD3D8E2).copy(alpha = 0.72f)
+    }
+    return surface
         .border(
-            width = 5.dp,
-            color = Color.White.copy(alpha = if (dark) 0.07f else 0.15f),
+            width = 2.4.dp,
+            color = Color.White.copy(alpha = if (dark) 0.04f else 0.08f),
             shape = shape
         )
         .border(
-            width = 2.dp,
-            color = Color.White.copy(alpha = if (dark) 0.58f else 0.98f),
+            width = 1.2.dp,
+            color = edge,
             shape = shape
         )
 }
 
 /**
- * 底部 Douk 栏：与卡片同一套「高级材质」，95% 不透明度 + 轻度模糊。
- * 不再使用 84dp 强模糊，避免和整个界面的材质观感割裂；边缘折光保留。
+ * 底部 Douk 栏：整条栏是透明的，只留一层极淡的染色 + 背后真实高斯模糊。
+ * 不再画 95% 不透明度白底和折光描边——那会看成一张压在页面上的卡片。
+ * 模糊半径直接取「外观设置 → 底栏模糊度」，0–20dp 实时生效。
  */
 fun Modifier.doukGlassDock(shape: Shape): Modifier {
     if (!DoukColors.glass) return background(DoukColors.surface, shape)
     val dark = DoukColors.isDark
+    // 不透明度滑块只轻微影响染色深浅（最高 0.2），保证始终看得见背后的模糊
+    val tintAlpha = 0.06f + (DoukColors.materialAlpha - 0.55f) * 0.18f
     val fill = if (dark) {
-        Color(0xFF14171D).copy(alpha = DoukColors.materialAlpha)
+        Color(0xFF0E1116).copy(alpha = tintAlpha)
     } else {
-        Color.White.copy(alpha = DoukColors.materialAlpha)
+        Color.White.copy(alpha = tintAlpha)
     }
     return this
         .clip(shape)
@@ -285,52 +318,59 @@ fun Modifier.doukGlassDock(shape: Shape): Modifier {
             style = HazeStyle(
                 backgroundColor = fill,
                 tints = emptyList(),
-                // Dock 比普通卡片多 4dp，压到栏下的内容只会剩柔和色块
-                blurRadius = (DoukColors.materialBlur + 4f).dp,
+                blurRadius = DoukColors.materialBlur.coerceIn(0f, 20f).dp,
                 noiseFactor = 0f
             )
         )
-        // 主题色只做一层很淡的染色，不改变白玻璃的通透感
-        .background(DoukColors.accent.copy(alpha = if (dark) 0.10f else 0.08f), shape)
+        // 主题色只染一点点，不破坏通透感
+        .background(DoukColors.accent.copy(alpha = if (dark) 0.05f else 0.04f), shape)
         .drawWithCache {
-            val stroke = 1.2.dp.toPx()
-            val inner = 1.6.dp.toPx()
-            val radius = androidx.compose.ui.geometry.CornerRadius(size.height / 2f)
+            // 玻璃反光边：左上角接近纯白（0.95），沿对角线往右下角一路淡到几乎透明。
+            // 不用均匀描边——那会变成一圈卡片边框；斜向渐变才像光从左上打过来时的折光。
+            val stroke = 1.5.dp.toPx()
+            val inset = stroke / 2f
+            val radius = androidx.compose.ui.geometry.CornerRadius(
+                ((size.height - stroke) / 2f).coerceAtLeast(0f)
+            )
             val rim = Brush.linearGradient(
-                colors = listOf(
-                    Color.White.copy(alpha = 0.98f),
-                    DoukColors.accent.copy(alpha = 0.30f),
-                    Color.White.copy(alpha = 0.52f),
-                    Color.White.copy(alpha = 0.86f)
+                colorStops = arrayOf(
+                    // 左上角最亮 → 沿边往中间淡下去 → 到右下角再亮回来，模拟一块厚玻璃斜向受光时
+                    // 两个对角端点的高光，右上/左下两条边自然变浅
+                    0.00f to Color.White.copy(alpha = 0.95f),
+                    0.16f to Color.White.copy(alpha = 0.62f),
+                    0.38f to Color.White.copy(alpha = 0.24f),
+                    0.52f to Color.White.copy(alpha = 0.14f),
+                    0.68f to Color.White.copy(alpha = 0.30f),
+                    0.86f to Color.White.copy(alpha = 0.66f),
+                    1.00f to Color.White.copy(alpha = 0.92f)
                 ),
                 start = Offset(0f, 0f),
                 end = Offset(size.width, size.height)
             )
             onDrawWithContent {
                 drawContent()
-                // 内侧柔和光晕：模拟厚玻璃边缘吃光，不是一条硬描边
-                drawRoundRect(
-                    color = Color.White.copy(alpha = 0.16f),
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 7.dp.toPx())
+                // 上缘那层很淡的白，模拟玻璃顶部吃光；只在胶囊上半段出现，往下化开。
+                // 浅色页面里光靠一圈描边几乎看不见，加这层才有「玻璃」的厚度感。
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0.00f to Color.White.copy(alpha = 0.34f),
+                            0.16f to Color.White.copy(alpha = 0.18f),
+                            0.38f to Color.White.copy(alpha = 0.06f),
+                            0.60f to Color.Transparent
+                        )
+                    ),
+                    size = androidx.compose.ui.geometry.Size(size.width, size.height)
                 )
-                // 外圈折光边
                 drawRoundRect(
                     brush = rim,
+                    topLeft = Offset(inset, inset),
+                    size = androidx.compose.ui.geometry.Size(
+                        (size.width - stroke).coerceAtLeast(0f),
+                        (size.height - stroke).coerceAtLeast(0f)
+                    ),
                     cornerRadius = radius,
                     style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke)
-                )
-                // 内圈极淡高光，模拟玻璃厚度
-                drawRoundRect(
-                    color = Color.White.copy(alpha = 0.14f),
-                    topLeft = Offset(inner, inner),
-                    size = androidx.compose.ui.geometry.Size(
-                        (size.width - inner * 2f).coerceAtLeast(0f),
-                        (size.height - inner * 2f).coerceAtLeast(0f)
-                    ),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(
-                        ((size.height - inner * 2f) / 2f).coerceAtLeast(0f)
-                    ),
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 0.6.dp.toPx())
                 )
             }
         }

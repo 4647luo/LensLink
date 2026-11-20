@@ -10,9 +10,12 @@ import androidx.activity.enableEdgeToEdge
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.lutcamera.lutcamerapro.ui.douk.DoukRoot
+import com.lutcamera.lutcamerapro.ui.douk.UpdateCenter
 import com.lutcamera.lutcamerapro.ui.theme.AppThemeManager
 import com.lutcamera.lutcamerapro.ui.theme.LutcameraproTheme
+import kotlinx.coroutines.launch
 import timber.log.Timber
 
 class MainActivity : ComponentActivity() {
@@ -44,6 +47,10 @@ class MainActivity : ComponentActivity() {
             LutcameraproTheme {
                 DoukRoot()
             }
+        }
+        // 启动自动检查：设置里可关；24 小时内不重复请求，失败静默，只有新版本才弹窗
+        lifecycleScope.launch {
+            UpdateCenter.checkOnLaunch(this@MainActivity)
         }
     }
 

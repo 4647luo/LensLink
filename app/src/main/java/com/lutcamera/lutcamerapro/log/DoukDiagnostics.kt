@@ -82,7 +82,7 @@ object DoukDiagnostics {
             putExtra(Intent.EXTRA_SUBJECT, subject)
             putExtra(Intent.EXTRA_TEXT, body)
             putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = android.content.ClipData.newRawUri("LensLink diagnostics", uri)
+            clipData = android.content.ClipData.newRawUri("连镜 diagnostics", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         val chooser = Intent.createChooser(intent, "发送连镜反馈邮件").apply {

@@ -62,7 +62,7 @@ class DoukApplication : Application() {
         DoukLog.install(this)
         DoukPrefs.init(this)
         plantTimber()
-        Timber.i("LensLink %s 启动", BuildConfig.VERSION_NAME)
+        Timber.i("连镜 %s 启动", BuildConfig.VERSION_NAME)
     }
 
     /** xLog 只落文件，不重复打 logcat；按天分文件，单文件 2MB，保留 7 天。 */

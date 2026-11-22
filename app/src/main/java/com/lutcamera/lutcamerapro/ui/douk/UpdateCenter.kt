@@ -320,7 +320,7 @@ object UpdateCenter {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
             !context.packageManager.canRequestPackageInstalls()
         ) {
-            Toast.makeText(context, "请先允许 LensLink 安装未知来源应用", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, "请先允许「连镜」安装未知来源应用", Toast.LENGTH_LONG).show()
             openUnknownSourcesSettings(context)
             return false
         }

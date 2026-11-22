@@ -586,10 +586,10 @@ wlan1 192.168.125.60  →  相机热点断开后残留的旧 IP
 | 项 | 值 | 位置 |
 | --- | --- | --- |
 | 中文名 | 连镜 | `res/values/strings.xml` 的 `app_name` |
-| 英文名 | LensLink | `res/values-en/strings.xml` 的 `app_name` |
+| 英文名 | 不设英文名，统一使用「连镜」 | — |
 | 设置页「关于」 | 连镜 / 3.26-nikon-ui-refinement | `DoukSettingsScreen` |
 
-桌面显示随系统语言切换：中文环境显示「连镜」，英文环境显示「LensLink」。
+桌面显示统一为「连镜」，不随系统语言切换。
 
 ### 图标
 

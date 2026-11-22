@@ -122,7 +122,7 @@ private fun saveSupportQrToGallery(context: Context, bitmap: Bitmap): Boolean {
         put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
         put(
             MediaStore.Images.Media.RELATIVE_PATH,
-            Environment.DIRECTORY_PICTURES + "/LensLink"
+            Environment.DIRECTORY_PICTURES + "/连镜"
         )
         put(MediaStore.Images.Media.IS_PENDING, 1)
     }

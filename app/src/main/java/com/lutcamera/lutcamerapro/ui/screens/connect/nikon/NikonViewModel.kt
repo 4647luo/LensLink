@@ -592,7 +592,13 @@ class NikonViewModel : ViewModel() {
         get() = cameraApertureOptions.takeIf { it.isNotEmpty() }?.map { it.label } ?: currentBrand.apertures
 
     val availableIsos: List<String>
-        get() = cameraIsoOptions.takeIf { it.isNotEmpty() }?.map { it.label } ?: currentBrand.isos
+        get() {
+            // 机身的 0x500F 枚举里通常只有具体 ISO 数值，没有「自动」这一项，
+            // 但相机确实支持 ISO 自动（0xFFFF / 0xD0AB ISO 自动控制）。
+            // 这里统一把「自动」放在列表最前面，选它就切自动 ISO。
+            val base = cameraIsoOptions.takeIf { it.isNotEmpty() }?.map { it.label } ?: currentBrand.isos
+            return if (base.any { it == "自动" }) base else listOf("自动") + base
+        }
 
     val availableShootModes = listOf(
         "Single", "Continuous High", "Continuous Low", "Self-timer 10s", "Self-timer 2s"
@@ -673,9 +679,20 @@ class NikonViewModel : ViewModel() {
 
     fun toggleVideoRecording() {
         if (!isConnected) return
-        isRecordingVideo = !isRecordingVideo
-        ptpClient.toggleMovieRecord(isRecordingVideo)
-        addLogInner(if (isRecordingVideo) "Video start" else "Video stop")
+        val next = !isRecordingVideo
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = ptpClient.toggleMovieRecordSync(next)
+            withContext(Dispatchers.Main) {
+                if (ok) isRecordingVideo = next
+                addLogInner(
+                    when {
+                        !ok -> "视频录制指令被机身拒绝（${ptpClient.lastResponseCode}）"
+                        next -> "Video start"
+                        else -> "Video stop"
+                    }
+                )
+            }
+        }
     }
 
     fun cycleAfMode() {
@@ -842,6 +859,8 @@ class NikonViewModel : ViewModel() {
                         pairingCode = null; pairingVersion = null
                         isConnecting = false
                         isConnected = false
+                        // 断开后录制状态一定要归零，否则控制页快门钮会一直停在「方块」录制态
+                        isRecordingVideo = false
                         connectedAtMs = 0L
                         lockedBaseline = null
                         compressionDesc = null
@@ -1066,7 +1085,9 @@ class NikonViewModel : ViewModel() {
         return if (v % 100 == 0L) "F${v / 100}" else "F${"%.1f".format(v / 100.0)}"
     }
 
-    private fun formatIsoRaw(v: Long) = "ISO $v"
+    private fun formatIsoRaw(v: Long) =
+        // 0xFFFF 是 PTP 里 ISO 的「自动」档；以前会原样显示成 ISO 65535
+        if (v <= 0 || v >= 0xFFFF) "自动" else "ISO $v"
 
     /** 相机枚举不可选时，按 PTP 标准物理编码把界面档位字符串反算为原始值 */
     private fun parseShutterRaw(label: String): Long {
@@ -1086,7 +1107,8 @@ class NikonViewModel : ViewModel() {
     }
 
     private fun parseIsoRaw(label: String): Long =
-        label.removePrefix("ISO").trim().toLongOrNull() ?: 0L
+        if (label.contains("自动")) 0xFFFFL
+        else label.removePrefix("ISO").trim().toLongOrNull() ?: 0L
 
     /** 按下发失败时的 PTP 响应码给出可操作提示 */
     private fun propFailMessage(name: String, code: Int): String {
@@ -1169,13 +1191,26 @@ class NikonViewModel : ViewModel() {
     fun triggerCapture() = triggerShutter()
 
     /**
-     * 视频录制控制开关（与屏幕状态同步）     */
+     * 视频录制控制开关（与屏幕状态同步）
+     * 机身的录像指令要等它真的回 OK 再翻状态：以前是点了就先翻，
+     * 指令被机身拒绝时快门钮会一直停在「方块」的录制态，退不回来。
+     */
     fun toggleMovieRecord(isRecording: Boolean) {
         if (isRecordingVideo == isRecording) return
-        isRecordingVideo = isRecording
-        if (isConnected) {
-            ptpClient.toggleMovieRecord(isRecording)
-            addLogInner(if (isRecording) "Video start" else "Video stop")
+        if (!isConnected) {
+            isRecordingVideo = false
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = ptpClient.toggleMovieRecordSync(isRecording)
+            withContext(Dispatchers.Main) {
+                isRecordingVideo = if (ok) isRecording else !isRecording
+                if (!ok) {
+                    addLogInner("视频录制指令被机身拒绝（${ptpClient.lastResponseCode}）")
+                } else {
+                    addLogInner(if (isRecording) "Video start" else "Video stop")
+                }
+            }
         }
     }
 
@@ -1895,15 +1930,28 @@ class NikonViewModel : ViewModel() {
     fun setIso(value: String) {
         iso = value
         if (!isConnected) return
+        val auto = value == "自动"
         val option = cameraIsoOptions.find { it.label == value }
-        val raw = option?.raw ?: parseIsoRaw(value)
+        val raw = if (auto) 0xFFFFL else (option?.raw ?: parseIsoRaw(value))
         val dataType = option?.dataType ?: 0x0004
         if (raw <= 0) { addLogInner("ISO options not ready"); return }
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x500F.toShort(), dataType, raw)
+            // 自动 ISO：先按 PTP 惯例把 0x500F 写成 0xFFFF；机身不接受时，
+            // 退回「ISO 自动控制」(0xD0AB) 打开，保证自动档真的能落到相机上。
+            var ok = ptpClient.setPropRawValue(0x500F.toShort(), dataType, raw)
+            // 描述写 UINT32、机身只收 16 位时补一次 UINT16，别让「自动」点了没生效。
+            if (!ok && auto) ok = ptpClient.setPropRawValue(0x500F.toShort(), 0x0004, 0xFFFFL)
+            if (!ok && auto) {
+                val type = extraProps["isoAuto"]?.options?.firstOrNull()?.dataType ?: 0x0007
+                ok = ptpClient.setPropRawValue(0xD0AB.toShort(), type, 1L)
+                if (ok) extraProps["isoAuto"] = (extraProps["isoAuto"] ?: ExtraPropState()).copy(value = "开启")
+            }
             withContext(Dispatchers.Main) {
-                if (ok) { addLogInner("ISO applied: $value"); lastParamMessage = "ISO 已写入 $value" }
-                else {
+                if (ok) {
+                    addLogInner("ISO applied: $value")
+                    lastParamMessage = if (auto) "ISO 已切到自动" else "ISO 已写入 $value"
+                    refreshCameraParams(silent = true)
+                } else {
                     val msg = propFailMessage("ISO", ptpClient.lastResponseCode)
                     addLogInner(msg); lastParamMessage = msg
                     refreshCameraParams(silent = true)
@@ -2342,6 +2390,9 @@ class NikonViewModel : ViewModel() {
         "movieAfAreaMode" to 0xD1F8,
         "movieIsoAuto" to 0xD0AD,
         "movieIsoAutoHigh" to 0xD0AE,
+        // 静态照片的 ISO 自动控制 / 自动上限（和视频的 0xD0AD/0xD0AE 是两套）
+        "isoAuto" to 0xD0AB,
+        "isoAutoHigh" to 0xD0AC,
         "movieCrop" to 0xD20F,
         "movieAutoDx" to 0xD210,
         "movieTimeCode" to 0xD1FB,
@@ -2410,7 +2461,9 @@ class NikonViewModel : ViewModel() {
         "movieMetering" -> meteringLabel(raw)
         "movieShutter" -> shutterLabel(raw)
         "movieAperture" -> if (raw > 0) String.format(java.util.Locale.US, "f/%.1f", raw / 100.0) else "自动"
-        "movieIso" -> if (raw > 0) "ISO $raw" else "自动"
+        "movieIso" -> if (raw > 0 && raw < 0xFFFF) "ISO $raw" else "自动"
+        "isoAuto" -> onOffLabel(raw)
+        "isoAutoHigh" -> if (raw > 0 && raw < 0xFFFF) "ISO $raw" else "自动"
         "movieEv" -> decodeExposureComp(raw)
         "movieFileType" -> movieFileTypeLabel(raw)
         "movieScreenSize" -> movieScreenSizeLabel(raw)
@@ -2524,6 +2577,13 @@ class NikonViewModel : ViewModel() {
 
     /** 尼康快门速度按 1/10000 秒上报；整数秒时显示 1s 而不是 1/1s。 */
     private fun shutterLabel(raw: Long): String {
+        // 视频快门是另一套编码：0x10000 标志位 | 分母，例如 0x10032 = 1/50s。
+        // 以前不带标志位直接按 1/10000 秒解码，1/50s 会被显示成 6.6s。
+        if (raw and 0x10000L != 0L) {
+            val denom = (raw and 0xFFFFL).toInt()
+            if (denom > 0) return "1/${denom}s"
+            return "自动"
+        }
         if (raw <= 0) return "Bulb"
         val sec = raw / 10000.0
         if (sec >= 1.0) {
@@ -2553,7 +2613,14 @@ class NikonViewModel : ViewModel() {
                         }
                     } else emptyList()
                 } else emptyList()
-                result[key] = ExtraPropState(value, options, desc.writable)
+                // 尼康的 ISO 枚举里往往没有「自动」这一项，但机身确实支持 0xFFFF 自动档；
+                // 补一个 Auto 选项，视频 ISO 也能选自动（以前只能选固定数值）。
+                val withAuto = if ((key == "movieIso" || key == "movieIsoAutoHigh") &&
+                    options.none { it.label == "自动" } && desc.isEnum
+                ) {
+                    listOf(CameraOption("自动", 0xFFFFL, desc.dataType)) + options
+                } else options
+                result[key] = ExtraPropState(value, withAuto, desc.writable)
             } else {
                 val raw = rawValueOrNull(prop)
                 result[key] = if (raw != null) {
@@ -2562,6 +2629,12 @@ class NikonViewModel : ViewModel() {
                     ExtraPropState("相机未上报", emptyList(), false)
                 }
             }
+        }
+        // 机身的「视频 ISO 自动」(0xD0AD) 开着时，0xD1AA 仍会回报上一次的固定 ISO，
+        // 只按 0xD1AA 显示就会和机身状态自相矛盾（刚点完自动又跳回 ISO 500）。
+        val movieAutoOn = result["movieIsoAuto"]?.value?.contains("开") == true
+        if (movieAutoOn) {
+            result["movieIso"] = (result["movieIso"] ?: ExtraPropState()).copy(value = "自动")
         }
         return result
     }
@@ -2576,11 +2649,27 @@ class NikonViewModel : ViewModel() {
         extraProps[key] = current.copy(value = option.label)
         if (!isConnected) return
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(prop.toShort(), option.dataType, option.raw)
+            var ok = ptpClient.setPropRawValue(prop.toShort(), option.dataType, option.raw)
+            // 视频 ISO 选「自动」：Z50II 对 0xD1AA=0xFFFF 常回 Device Busy(0x201C)。
+            // 依次退回「视频 ISO 自动控制 0xD0AD=开」和「0x500F=0xFFFF」，三级都试，
+            // 哪一级被机身接受就用哪一级，别让「自动」点了没反应。
+            if (!ok && option.raw == 0xFFFFL) {
+                if (key == "movieIso" || key == "movieIsoAutoHigh") {
+                    ok = ptpClient.setPropRawValue(0xD0AD.toShort(), 0x0002, 1L)
+                    if (!ok) ok = ptpClient.setPropRawValue(0xD0AD.toShort(), 0x0007, 1L)
+                    if (!ok) ok = ptpClient.setPropRawValue(0xD0AD.toShort(), 0x0004, 1L)
+                }
+                if (!ok) ok = ptpClient.setPropRawValue(0x500F.toShort(), option.dataType, 0xFFFFL)
+                // 少数机身 0x500F 的描述写 UINT32，实际只收 16 位；再补一次 UINT16。
+                if (!ok) ok = ptpClient.setPropRawValue(0x500F.toShort(), 0x0004, 0xFFFFL)
+                if (!ok) ok = ptpClient.setPropRawValue(prop.toShort(), 0x0004, 0xFFFFL)
+                if (ok) addLogInner("$key 自动档：机身走的是回退路径")
+            }
             withContext(Dispatchers.Main) {
                 if (ok) {
                     lastParamMessage = "${extraLabel(key, option.raw)} 已写入 ${option.label}"
                     addLogInner("${key} 已下发: ${option.label}")
+                    refreshCameraParams(silent = true)
                 } else {
                     extraProps[key] = current
                     lastParamMessage = propFailMessage(key, ptpClient.lastResponseCode)

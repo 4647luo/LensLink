@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0
+
+连镜 LensLink 0.2.0 更新日志
+
+一、连相机
+优化连接相机的能力
+
+二、拍摄与监看
+优化lut和监视界面
+
+三、图库
+增加双指缩放、长按多选和取消勾选。
+增加图片-详细-hdr检查
+
+四、图片编辑（测试）
+增加hdr图片显示
+增加普通 SDR 图导出HDR效果
+设置增加默认导出格式（JPG / PNG）、编辑默认格式（JPG / HEIC / RAW），可选「每次问我」。
+
+五、视频
+优化图库视频格式的支持
+支持套lut导出视频
+
+六、bug
+修改优化了已知bug
+
 ## 3.26 baseline
 
 - Nikon PTP/IP support for camera AP, phone-hotspot STA, and shared-router modes.

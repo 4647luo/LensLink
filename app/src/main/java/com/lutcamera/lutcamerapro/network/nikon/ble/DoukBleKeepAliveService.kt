@@ -89,7 +89,7 @@ class DoukBleKeepAliveService : Service() {
         if (wakeLock?.isHeld == true) return
         runCatching {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LensLink:KeepAlive")
+            val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LianJing:KeepAlive")
             lock.setReferenceCounted(false)
             // 没有超时：连接断开后 stop() 会立刻释放；超时反而会把长连接晾在后台
             lock.acquire()

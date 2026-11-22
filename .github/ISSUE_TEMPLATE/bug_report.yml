@@ -7,8 +7,8 @@ body:
     attributes:
       value: |
         ## 先做这一步：导出诊断日志
-        打开「连镜 LensLink」→ 设置 → 关于 → **反馈与建议**：
-        - 想自己保存：点「只保存诊断日志」，得到 `LensLink-diagnostics-*.zip`
+        打开「连镜」→ 设置 → 关于 → **反馈与建议**：
+        - 想自己保存：点「只保存诊断日志」，得到 `lianjing-diagnostics-*.zip`
         - 想直接发邮件：点「写邮件并附上日志」，收件人已填 `lianjingup@outlook.com`
 
         **把 ZIP 拖进下面的附件框**（GitHub 支持 .zip）。没有日志的问题通常无法定位，会被要求补发。
@@ -79,7 +79,7 @@ body:
     id: diagnostics
     attributes:
       label: 诊断日志
-      description: 把 LensLink-diagnostics-*.zip 拖到这里；文件较大也可以贴网盘链接
+      description: 把 lianjing-diagnostics-*.zip 拖到这里；文件较大也可以贴网盘链接
       placeholder: 拖入 ZIP 或贴链接
     validations:
       required: true

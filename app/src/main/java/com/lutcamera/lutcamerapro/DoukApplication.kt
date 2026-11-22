@@ -74,7 +74,7 @@ class DoukApplication : Application() {
             dir.listFiles()?.filter { it.isFile && it.lastModified() < cutoff }?.forEach { it.delete() }
             val config = LogConfiguration.Builder()
                 .logLevel(LogLevel.ALL)
-                .tag("LensLink")
+                .tag("LianJing")
                 .build()
             val printer = FilePrinter.Builder(dir.absolutePath)
                 .fileNameGenerator(DateFileNameGenerator())

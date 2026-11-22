@@ -15,7 +15,7 @@ import java.net.URL
  */
 object GitHubUpdateChecker {
     const val OWNER = "4647luo"
-    const val REPO = "LensLink"
+    const val REPO = "lianjing"
     private const val API = "https://api.github.com/repos/$OWNER/$REPO"
 
     data class ReleaseInfo(

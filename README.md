@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 在 [Releases](https://github.com/4647luo/LensLink/releases) 下载最新的公开版，命名形如 `lianjing-0.2.6.apk`。
+1. 在 [Releases](https://github.com/4647luo/lianjing/releases) 下载最新的公开版，命名形如 `lianjing-0.2.6.apk`。
 2. 在 Android 手机上允许「安装未知来源应用」。
 3. 安装后打开 App，按首页提示授予存储/附近设备/位置权限。
 

@@ -4,4 +4,6 @@
     <cache-path name="diagnostics" path="diagnostics/" />
     <!-- 应用内下载的更新 APK，交给系统安装器读取 -->
     <cache-path name="updates" path="updates/" />
+    <!-- 视频预览/外链播放时用的临时副本（只读分享，播放器拿不到应用其他目录） -->
+    <cache-path name="video-preview" path="video-preview/" />
 </paths>

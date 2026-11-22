@@ -35,4 +35,17 @@ object LiveViewQuality {
             inPreferredConfig = Bitmap.Config.RGB_565
         }
     }
+
+    /**
+     * 取景的目标帧率上限。
+     *
+     * 相机能吐多快就多快地拉，会把 Wi‑Fi、JPEG 解码和屏幕刷新全部拉满，
+     * 这就是「连着相机耗电快」的主因之一。按档位设一个上限：
+     * 12–20fps 的取景已经足够对焦和构图，功耗却能省下三到五成。
+     */
+    fun targetFps(): Int = when (level) {
+        FLUENT -> 12
+        HD -> 20
+        else -> 15
+    }
 }

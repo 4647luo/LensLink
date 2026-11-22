@@ -557,15 +557,23 @@ class NikonPtpClient {
      * 会长时间空闲，随后第一次点击就报「连接已断开」。
      *
      * 这里在 `pollEvents=false` 时按 [keepAliveIntervalMs] 发最轻的 GetDeviceInfo(0x1001)：
-     * 默认 15 秒；Wi‑Fi 会话开启「保持相机唤醒」时由 UI 缩短到 6 秒。
+     * 空闲时默认 60 秒，正在取景时整段跳过（画面数据本身就在保活）。
      * 它走同一把命令锁，不会和读图库/拍摄抢事务；失败就按真实掉线处理，
      * 交给自动连接逻辑重连，而不是让 UI 停在假连接状态。
      */
     private suspend fun keepAliveLoop(c: Connection) {
         var softFailures = 0
         while (connection === c && !c.command.isClosed) {
-            delay(keepAliveIntervalMs.coerceIn(3_000L, 30_000L))
+            // 取景流本身每帧都在传，不需要再发心跳；空闲时把间隔放到 60 秒以上，
+            // 否则每 15 秒一次 GetDeviceInfo 会让相机 Wi‑Fi 灯一直闪、白耗电。
+            val interval = if (_isLiveViewActive.value) {
+                4_000L
+            } else {
+                keepAliveIntervalMs.coerceIn(20_000L, 180_000L)
+            }
+            delay(interval)
             if (connection !== c) return
+            if (_isLiveViewActive.value) continue
             // 0x90C7 轮询本身就在保活；受限会话只允许白名单命令，别添乱；
             // 读图库/传图期间不要插命令，避免 0x201F。
             if (c.pollEvents || c.restricted || storageBusy) continue
@@ -784,7 +792,13 @@ class NikonPtpClient {
                         received.incrementAndGet(); bytes.addAndGet(jpeg.size.toLong())
                         frames.trySend(jpeg)
                         _connectionStage.value = "实时取景中"
-                        yield() // No additional fixed per-frame sleep.
+                        // 按画质档位限帧：以前是「相机吐多快就拉多快」，Wi‑Fi 射频、
+                        // JPEG 解码和屏幕三边一起满负荷跑，机身和手机都热、电量掉得飞快。
+                        // 现在补足到目标帧率的时间就睡，多余的帧不再请求。
+                        val budgetNs = 1_000_000_000L / LiveViewQuality.targetFps().coerceAtLeast(1)
+                        val spent = System.nanoTime() - start
+                        if (spent < budgetNs) delay((budgetNs - spent) / 1_000_000L)
+                        yield()
                     }
                     0x2019, 0xa004 -> {
                         if (++retries > 100) throw IOException("相机持续忙碌，取景已暂停")
@@ -1111,6 +1125,47 @@ class NikonPtpClient {
         }
     }
     fun toggleMovieRecord(startRecord: Boolean) = control(if (startRecord) 0x920a else 0x920b)
+
+    /**
+     * 录像开/停，同步等机身真实响应再返回成功与否。
+     * 以前是即发即忘，指令被机身拒绝时 UI 状态照样翻转，快门钮会卡在录制态的方块。
+     */
+    suspend fun toggleMovieRecordSync(startRecord: Boolean): Boolean = withContext(Dispatchers.IO) {
+        val c = connection ?: return@withContext false
+        val code = if (startRecord) 0x920a else 0x920b
+        try {
+            // 尼康的录像开关要在取景开着时发；无参和带参两种写法都试，机身回「忙」再停取景重试。
+            val attempts = if (startRecord) listOf(intArrayOf(), intArrayOf(1))
+                           else listOf(intArrayOf(), intArrayOf(0))
+            for ((i, p) in attempts.withIndex()) {
+                val r = runCatching { operation(code, p, expected = c) }.getOrNull()
+                val rc = r?.response?.code
+                DoukLog.d("Rec", if (i == 0) "MOVIE_REC_TRY" else "MOVIE_REC_TRY2",
+                    "start" to startRecord.toString(), "params" to p.size.toString(), "code" to "0x%04X".format(rc ?: 0))
+                if (rc == 0x2001) { lastResponseCode = 0x2001; return@withContext true }
+                lastResponseCode = rc ?: 0
+            }
+            val firstCode = lastResponseCode
+            val paused = _isLiveViewActive.value
+            if (paused) {
+                pauseFrames()
+                runCatching { operation(0x9202, expected = c) }
+                runCatching { ready(c) }
+                val r = runCatching { operation(code, expected = c) }.getOrNull()
+                val rc = r?.response?.code
+                DoukLog.d("Rec", "MOVIE_REC_NOLV", "start" to startRecord.toString(), "code" to "0x%04X".format(rc ?: 0))
+                lastResponseCode = rc ?: 0
+                if (_isConnected.value && connection === c) runCatching { startLiveView() }
+                if (rc == 0x2001) return@withContext true
+            }
+            DoukLog.w("Rec", "MOVIE_REC_REJECT", "start" to startRecord.toString(), "code" to "0x%04X".format(firstCode))
+            false
+        } catch (e: Exception) {
+            DoukLog.w("Rec", "MOVIE_REC_FAIL", "start" to startRecord.toString(), "error" to (e.message ?: "?"))
+            if (_isConnected.value && connection === c) runCatching { startLiveView() }
+            false
+        }
+    }
 
     fun rememberOriginalCompression(value: Long, version: Long) = synchronized(lifecycle) {
         sessionFor(version)
@@ -1559,20 +1614,14 @@ class NikonPtpClient {
             // 尼康无线会话里的 0x1007 一般只回「存储上的一个关联句柄」，
             // 真正的照片在它下面的文件夹（DCIM/100NCZ…）里，必须按关联句柄逐层展开。
             val storageList = storageIds.ifEmpty { listOf(-1) }
-            // 三元组多带一个「当前文件夹名」，图库的相册按机身真实目录分
-            val queue = ArrayDeque<Triple<Int, Int, String?>>()
-            val visited = HashSet<Int>()
-            val photoHandles = ArrayList<Int>()
-            val entryCache = HashMap<Int, com.lutcamera.lutcamerapro.model.CameraStorageFile>()
             var denied = 0
+            var hasMore = false
 
             suspend fun listHandles(sid: Int, association: Int): List<Int> = try {
                 val packet = sendOperation(0x1007.toShort(), intArrayOf(sid, 0, association))
-                // 个数已由 parseU32Array 剥掉，剩下的就是全部句柄，不能再 drop(1)
                 val handles = parseU32Array(packet)
                 DoukLog.i("Storage", "OBJECT_HANDLES", "sid" to sid, "allHandle" to association,
-                    "count" to handles.size, "bytes" to (packet?.size ?: 0),
-                    "head" to (packet?.take(16)?.joinToString(" ") { "%02x".format(it) } ?: "-"))
+                    "count" to handles.size, "bytes" to (packet?.size ?: 0))
                 handles
             } catch (e: Exception) {
                 val code = (e as? CameraResponse)?.code
@@ -1585,57 +1634,86 @@ class NikonPtpClient {
                 emptyList()
             }
 
+            // 先把机身里所有目录都走一遍（DCIM 下面常有 100NZ502 / 101NZ502 / … 好几个），
+            // 以前只按「最新一屏」停，永远只读到最新的那个文件夹。
+            val rootHandles = ArrayList<Int>()
             for (sid in storageList) {
-                var top: List<Int> = emptyList()
-                // 0xFFFFFFFF=全部对象，0=根关联；两种都试，谁先给句柄用谁
                 for (parent in intArrayOf(-1, 0)) {
-                    top = listHandles(sid, parent)
-                    if (top.isNotEmpty()) break
+                    val top = listHandles(sid, parent)
+                    if (top.isNotEmpty()) {
+                        top.forEach { rootHandles.add(it) }
+                        break
+                    }
                 }
-                top.forEach { if (visited.add(it)) queue.addLast(Triple(it, 0, null)) }
             }
 
-            // 从最新的一头往里读：机身句柄旧→新，所以根目录和每个文件夹都倒序入栈，
-            // 取栈顶就是最新的。够 startIdx+count 张就立即停，不再把 4000 个 0x1008 全扫一遍。
-            val windowLimit = minOf(startIdx + count, 4000).coerceAtLeast(1)
-            var hasMore = false
-            var inspected = 0
-            while (queue.isNotEmpty() && inspected < 4000) {
-                if (photoHandles.size >= windowLimit) break
-                val (handle, depth, folderName) = queue.removeLast()
-                inspected++
-                val infoPacket = try { sendOperation(0x1008.toShort(), intArrayOf(handle)) }
-                catch (e: CameraResponse) {
-                    if (e.code == 0x200f) denied++
-                    DoukLog.w("Storage", "OBJECT_INFO_FAIL", "handle" to handle,
-                        "code" to "0x%04X".format(e.code))
-                    continue
+            val dirs = ArrayList<Pair<Int, String>>()
+            val rootFiles = ArrayList<Int>()
+            val visited = HashSet<Int>()
+
+            suspend fun infoOf(handle: Int): ByteArray? = try {
+                sendOperation(0x1008.toShort(), intArrayOf(handle))
+            } catch (e: CameraResponse) {
+                if (e.code == 0x200f) denied++
+                DoukLog.w("Storage", "OBJECT_INFO_FAIL", "handle" to handle,
+                    "code" to "0x%04X".format(e.code))
+                null
+            }
+
+            suspend fun walk(handles: List<Int>, fallbackName: String?, depth: Int) {
+                for (h in handles) {
+                    if (!visited.add(h)) continue
+                    val packet = infoOf(h) ?: continue
+                    if (packet.size < 53) continue
+                    val fmt = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).getShort(4)
+                    if (fmt == 0x3001.toShort()) {
+                        val dirName = runCatching {
+                            val strLen = packet[52].toInt() and 0xFF
+                            if (strLen > 0 && 53 + strLen * 2 <= packet.size)
+                                String(packet, 53, (strLen - 1) * 2, Charsets.UTF_16LE).trim()
+                            else ""
+                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: fallbackName ?: "机身存储"
+                        DoukLog.i("Storage", "FOLDER_OPEN", "handle" to h, "depth" to depth, "dir" to dirName)
+                        dirs.add(h to dirName)
+                        if (depth < 6) {
+                            val children = ArrayList<Int>()
+                            for (sid in storageList) children.addAll(listHandles(sid, h))
+                            walk(children, dirName, depth + 1)
+                        }
+                    } else {
+                        rootFiles.add(h)
+                    }
                 }
-                if (infoPacket == null || infoPacket.size < 53) continue
+            }
+            walk(rootHandles, null, 0)
+
+            // 每个目录再单独取一次子句柄（这一步很便宜，0x1007 只回句柄列表），
+            // 这样不同文件夹里的照片都会进同一个候选池。
+            val candidates = ArrayList<Pair<Int, String>>()
+            dirs.forEach { (handle, name) ->
+                for (sid in storageList) {
+                    listHandles(sid, handle).forEach { child -> candidates.add(child to name) }
+                }
+            }
+            rootFiles.forEach { candidates.add(it to "机身存储") }
+
+            val folderOf = HashMap<Int, String>()
+            candidates.forEach { (h, name) -> if (folderOf[h] == null) folderOf[h] = name }
+            // 机身的 ObjectHandle 是递增分配的，倒序就是最新在前；跨文件夹统一按句柄排序
+            val ordered = candidates.map { it.first }.distinct().sortedDescending()
+            val total = ordered.size
+            val validStart = minOf(startIdx, total)
+            val endIdx = minOf(validStart + count, total)
+            hasMore = endIdx < total
+
+            ordered.subList(validStart, endIdx).forEach { handle ->
+                val infoPacket = infoOf(handle) ?: return@forEach
+                if (infoPacket.size < 53) return@forEach
                 val infoBuf = ByteBuffer.wrap(infoPacket).order(ByteOrder.LITTLE_ENDIAN)
                 val compressedSize = infoBuf.getInt(8)
                 val format = infoBuf.getShort(4)
-                // PTP ObjectInfo：ProtectionStatus 在偏移 6；1 表示相机里已保护/锁定
+                if (format == 0x3001.toShort()) return@forEach
                 val protection = infoBuf.getShort(6).toInt() and 0xFFFF
-                if (format == 0x3001.toShort()) {
-                    // 文件夹自己的 0x1008 里就带目录名（100NCZ / 101NCZ…），拿它给子项标相册
-                    val dirName = runCatching {
-                        val strLen = infoPacket[52].toInt() and 0xFF
-                        if (strLen > 0 && 53 + strLen * 2 <= infoPacket.size)
-                            String(infoPacket, 53, (strLen - 1) * 2, Charsets.UTF_16LE).trim()
-                        else ""
-                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: folderName ?: "机身存储"
-                    DoukLog.i("Storage", "FOLDER_OPEN", "handle" to handle, "depth" to depth, "dir" to dirName)
-                    if (depth < 6) {
-                        for (sid in storageList) {
-                            // 正序入栈，栈顶就是该文件夹里最新的子项
-                            listHandles(sid, handle).forEach { child ->
-                                if (visited.add(child)) queue.addLast(Triple(child, depth + 1, dirName))
-                            }
-                        }
-                    }
-                    continue
-                }
                 val isRaw = format == 0xB101.toShort() || format == 0xB103.toShort()
                 var fileName = "DSC_${handle}.JPG"
                 var captureMillis: Long? = null
@@ -1643,8 +1721,6 @@ class NikonPtpClient {
                     val strLen = infoPacket[52].toInt() and 0xFF
                     if (strLen > 0 && 53 + strLen * 2 <= infoPacket.size) {
                         fileName = String(infoPacket, 53, (strLen - 1) * 2, Charsets.UTF_16LE)
-                        // 文件名之后紧跟着 PTP 的 CaptureDate（"20251115T120102"），
-                        // 用它给图库做真实日期分组，不再拿当前时间糊过去
                         captureMillis = parsePtpStringTime(infoPacket, 53 + strLen * 2)
                     }
                 }.onFailure { if (isRaw) fileName = "DSC_${handle}.RAW" }
@@ -1652,49 +1728,28 @@ class NikonPtpClient {
                     DoukLog.w("Storage", "CAPTURE_DATE_MISS", "handle" to handle, "file" to fileName,
                         "len" to infoPacket.size)
                 }
-                photoHandles.add(handle)
-                entryCache[handle] = com.lutcamera.lutcamerapro.model.CameraStorageFile(
-                    handle = handle,
-                    fileName = fileName,
-                    sizeBytes = compressedSize.toLong().coerceAtLeast(1024L),
-                    dateModified = captureMillis ?: System.currentTimeMillis(),
-                    isRaw = isRaw,
-                    folder = folderName,
-                    isLocked = protection != 0
+                resultList.add(
+                    com.lutcamera.lutcamerapro.model.CameraStorageFile(
+                        handle = handle,
+                        fileName = fileName,
+                        sizeBytes = compressedSize.toLong().coerceAtLeast(1024L),
+                        dateModified = captureMillis ?: System.currentTimeMillis(),
+                        isRaw = isRaw,
+                        folder = folderOf[handle],
+                        isLocked = protection != 0
+                    )
                 )
-                if (photoHandles.size >= windowLimit) {
-                    // 还有没展开的文件夹或更早的句柄，说明只是先给第一屏
-                    hasMore = queue.isNotEmpty()
-                    break
-                }
             }
-            // while 正常结束（队列空）但已达到窗口上限，也要看是否刚好全部读完
-            if (!hasMore && queue.isNotEmpty() && photoHandles.size >= windowLimit) hasMore = true
             storageHasMore = hasMore
 
-            DoukLog.i("Storage", "ENUM_DONE", "folders" to visited.size,
-                "photos" to photoHandles.size, "denied" to denied, "hasMore" to hasMore)
-
-            if (photoHandles.isNotEmpty()) {
-                // 上面的遍历已经从最新读到较旧，这里不再倒序
-                val ordered = photoHandles
-                val validStart = minOf(startIdx, ordered.size)
-                val endIdx = minOf(validStart + count, ordered.size)
-                // 保护文件巡检每几秒跑一次，日志里不必每次都写这一行
-                if (!quiet) {
-                    activeListener?.onLog(
-                        "📂 已读到机身最新 ${ordered.size} 张，返回区间 [$validStart - $endIdx]" +
-                            if (hasMore) "，更早的照片下拉再读" else ""
-                    )
-                }
-                ordered.subList(validStart, endIdx).forEach { handle ->
-                    entryCache[handle]?.let { resultList.add(it) }
-                }
-                if (startIdx == 0 && endIdx >= ordered.size && !hasMore) {
-                    storageCache = ordered.mapNotNull { entryCache[it] }
-                    storageCacheVersion = sessionVersion
-                    storageCacheAt = SystemClock.elapsedRealtime()
-                }
+            DoukLog.i("Storage", "ENUM_DONE", "folders" to dirs.size,
+                "candidates" to total, "photos" to resultList.size,
+                "denied" to denied, "hasMore" to hasMore)
+            if (resultList.isNotEmpty()) {
+                activeListener?.onLog(
+                    "📂 已读到机身 ${dirs.size} 个目录 / 最新 ${total} 个文件，返回区间 [$validStart - $endIdx]" +
+                        if (hasMore) "，更早的照片下拉再读" else ""
+                )
             }
 
         } catch (e: CancellationException) { throw e

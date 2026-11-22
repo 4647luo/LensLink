@@ -24,8 +24,8 @@ android {
         minSdk = 29
         // 回退到 34
         targetSdk = 34
-        versionCode = 28
-        versionName = "0.1.0"
+        versionCode = 46
+        versionName = "0.1.18"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -136,9 +136,3 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
-
-
-
-
-
-

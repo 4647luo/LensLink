@@ -239,7 +239,7 @@ internal fun VideoLutScreen(
                         android.os.Environment.getExternalStoragePublicDirectory(
                             android.os.Environment.DIRECTORY_PICTURES
                         ),
-                        "Douk"
+                        "连镜"
                     )
                     if (!dir.exists()) dir.mkdirs()
                     val base = f.nameWithoutExtension
@@ -312,7 +312,7 @@ internal fun VideoLutScreen(
                     val f = file ?: return@IconButton
                     runCatching {
                         // FileProvider 只暴露了 cache/video-preview，直接把原路径（
-                        // Pictures/Douk 或机身缓存）丢给系统播放器会抛 IllegalArgumentException。
+                        // Pictures/连镜 或机身缓存）丢给系统播放器会抛 IllegalArgumentException。
                         // 统一先复制一份只读副本到 cache/video-preview 再分享。
                         val shareFile = prepareShareCopy(context, f)
                         context.startActivity(

@@ -240,7 +240,7 @@ class NikonPtpClient {
                         "hint" to if (reason == 1) "相机不认这个配对身份" else "相机主动断开")
                     throw IOException(if (reason == 1)
                         "相机拒绝此应用的配对身份 (InitFail 1)。若曾重装或清除应用数据，请从旧日志恢复身份，或在相机上新建配置并重新配对。"
-                    else "相机拒绝握手 (InitFail $reason)。相机一次只允许一台设备连接：请在相机「已配对设备」里删掉除本机以外的记录（包括 SnapBridge 和旧的 Douk 记录），再重连。")
+                    else "相机拒绝握手 (InitFail $reason)。相机一次只允许一台设备连接：请在相机「已配对设备」里删掉除本机以外的记录（包括 SnapBridge 和旧版连镜记录），再重连。")
                 }
                 if (PtpIpWire.type(ack) != 2 || ack.size < 28) throw IOException("相机握手回复无效")
                 val id = PtpIpWire.le(ack).getInt(8)

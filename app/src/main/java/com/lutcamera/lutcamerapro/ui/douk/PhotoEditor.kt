@@ -2422,7 +2422,7 @@ private fun addGrain(px: IntArray, strength: Float) {
     }
 }
 
-/** 保存：算出全尺寸结果，写进 Pictures/Douk，文件名 = 原名 + _edit + 序号 */
+/** 保存：算出全尺寸结果，写进 Pictures/连镜，文件名 = 原名 + _edit + 序号 */
 private fun saveEdited(
     context: Context,
     item: GalleryItem,
@@ -2452,7 +2452,7 @@ private fun saveEdited(
         val base = file.nameWithoutExtension
         val dir = File(
             android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES),
-            "Douk"
+            "连镜"
         )
         if (!dir.exists()) dir.mkdirs()
 

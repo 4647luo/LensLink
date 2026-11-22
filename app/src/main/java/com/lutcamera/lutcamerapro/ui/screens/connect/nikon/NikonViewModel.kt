@@ -3157,14 +3157,14 @@ class NikonViewModel : ViewModel() {
 
 /**
  * 设置里的「保存位置」映射成 MediaStore RELATIVE_PATH。
- * 「应用相册」必须落进 App 图库扫描的 Pictures/Douk，否则拍完的照片只在系统相册可见、
+ * 「应用相册」必须落进 App 图库扫描的 Pictures/连镜，否则拍完的照片只在系统相册可见、
  * 应用内图库永远空着（旧版写成 LutCameraPro 就是这个症状）。
  */
 private fun downloadRelativePath(dir: String, sub: String): String {
     val root = when (dir) {
-        "系统相册" -> "DCIM/Douk"
-        "Download" -> "Download/Douk"
-        else -> "Pictures/Douk"
+        "系统相册" -> "DCIM/连镜"
+        "Download" -> "Download/连镜"
+        else -> "Pictures/连镜"
     }
     return if (sub.isBlank()) root else "$root/$sub"
 }

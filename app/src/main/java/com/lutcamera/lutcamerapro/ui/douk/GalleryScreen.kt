@@ -651,7 +651,7 @@ fun GalleryScreen(
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("删除 $count 张照片？") },
-            text = { Text("这些照片来自应用下载目录（Pictures/Douk、DCIM/Douk），删除后无法恢复；相机与手机相册里的原图不受影响。") },
+            text = { Text("这些照片来自应用下载目录（Pictures/连镜、DCIM/连镜），删除后无法恢复；相机与手机相册里的原图不受影响。") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDelete = false
@@ -1000,7 +1000,7 @@ private fun CameraGallery(
     )
 }
 
-/** 应用内：App 自己下载到 Pictures/Douk、DCIM/Douk 的照片。 */
+/** 应用内：App 自己下载到 Pictures/连镜、DCIM/连镜 的照片。 */
 @Composable
 private fun AppGallery(
     thumbs: MutableMap<String, ImageBitmap>,
@@ -1081,7 +1081,7 @@ private fun AppGallery(
         EmptyGallery(
             icon = Icons.Rounded.PhotoLibrary,
             title = if (scanned) "应用内暂无照片" else "正在扫描…",
-            desc = "控制页从相机下载的照片会出现在这里（Pictures/Douk）"
+            desc = "控制页从相机下载的照片会出现在这里（Pictures/连镜）"
         )
         return
     }
@@ -1099,7 +1099,7 @@ private fun AppGallery(
             desc = if (items.isNotEmpty()) {
                 "换一个类型或格式，或者点筛选里的重置"
             } else {
-                "控制页从相机下载的照片会出现在这里（Pictures/Douk）"
+                "控制页从相机下载的照片会出现在这里（Pictures/连镜）"
             }
         )
         return
@@ -1753,13 +1753,16 @@ private fun groupAppFiles(files: List<File>): List<AppGroup> {
 
 private fun scanAppImages(): List<File> {
     val roots = listOf(
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "连镜"),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "连镜"),
+        // 旧版本写过的目录继续扫，保证升级后老照片仍在应用图库里
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Douk"),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Douk"),
-        // 0.0.139 之前自动下载/保护文件都写进 LutCameraPro，旧照片也要能在图库里看到
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LensLink"),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "LutCameraPro"),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCameraPro")
     )
-    // 递归扫：保存到应用相册的会落进 Pictures/Douk/<目录名>/，只扫根目录会漏掉
+    // 递归扫：保存到应用相册的会落进 Pictures/连镜/<目录名>/，只扫根目录会漏掉
     return roots.filter { it.exists() }.flatMap { root ->
         root.walkTopDown().filter { file ->
             file.isFile && file.name.substringAfterLast('.', "").lowercase()
@@ -2231,7 +2234,7 @@ private fun AlbumGridPanel(
             title = "还没有相册",
             desc = when (source) {
                 GallerySource.CAMERA -> "连上相机后，机身存储会作为一个相册出现"
-                GallerySource.APP -> "下载下来的照片会先进 Pictures/Douk"
+                GallerySource.APP -> "下载下来的照片会先进 Pictures/连镜"
                 GallerySource.PHONE -> "授予相册权限后，系统里的相册会出现在这里"
             }
         )

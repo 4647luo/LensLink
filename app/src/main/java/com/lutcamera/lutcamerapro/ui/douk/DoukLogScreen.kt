@@ -50,7 +50,7 @@ import kotlinx.coroutines.withContext
 
 /**
  * 运行日志页：把 [DoukLog] 的行按「时间 级别/标签: 事件 key=value」展示，
- * 可导出到 Download/Douk 或清空。相机连不上时，把导出的文件发出来即可定位。
+ * 可导出到 Download/连镜 或清空。相机连不上时，把导出的文件发出来即可定位。
  */
 @Composable
 fun DoukLogScreen(onBack: () -> Unit) {
@@ -159,7 +159,7 @@ fun DoukLogScreen(onBack: () -> Unit) {
             ) {
                 Icon(Icons.Rounded.Save, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("导出日志到 Download/Douk", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Text("导出日志到 Download/连镜", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }

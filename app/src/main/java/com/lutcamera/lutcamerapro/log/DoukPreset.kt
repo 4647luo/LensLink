@@ -29,7 +29,10 @@ import java.util.zip.ZipOutputStream
  */
 object DoukPreset {
 
-    const val SCHEMA = "lenslink-preset-v1"
+    const val SCHEMA = "lianjing-preset-v1"
+
+    /** 1.0.0 之前的旧预设；只读兼容，导入后照常应用，导出统一写新 schema。 */
+    private const val LEGACY_SCHEMA = "lenslink-preset-v1"
 
     data class Group(
         val key: String,
@@ -41,7 +44,7 @@ object DoukPreset {
         Group("device", "设备连接", "自动连接、已连接相机、蓝牙默认设备、设备页按钮"),
         Group("download", "下载与回传", "自动下载、图片/视频大小与格式、保存位置、锁定文件"),
         Group("general", "通用", "语言、GPS 附加方式、拍摄后快速预览"),
-        Group("appearance", "外观", "深色模式、主题色、玻璃质感、悬浮 Douk 栏"),
+        Group("appearance", "外观", "深色模式、主题色、玻璃质感、悬浮连镜栏"),
         Group("gallery", "图库", "默认打开来源、是否始终显示原图"),
         Group("editor", "图像编辑", "导出格式/质量、预览长边、九宫格、按住对比"),
         Group("filters", "LUT 与滤镜", "已导入的 .cube / .xmp 原文件和分类归属，一起打包带走")
@@ -161,7 +164,9 @@ object DoukPreset {
         root: JSONObject,
         importedLutCount: Int = 0
     ): Pair<Int, List<String>> {
-        require(root.optString("schema") == SCHEMA) { "不是连镜预设文件（schema=${root.optString("schema")}）" }
+        require(root.optString("schema").let { it == SCHEMA || it == LEGACY_SCHEMA }) {
+            "不是连镜预设文件（schema=${root.optString("schema")}）"
+        }
         val g = root.optJSONObject("groups") ?: JSONObject()
         val applied = mutableListOf<String>()
         g.optJSONObject("device")?.let { applyDevice(it); applied += "设备连接" }

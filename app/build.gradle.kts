@@ -24,8 +24,8 @@ android {
         minSdk = 29
         // 回退到 34
         targetSdk = 34
-        versionCode = 53
-        versionName = "0.2.6"
+        versionCode = 100
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -36,7 +36,7 @@ android {
     signingConfigs {
         create("release") {
             require(keystorePropsFile.exists()) {
-                "缺少 keystore.properties：release 包必须使用固定的 LensLink 签名密钥。"
+                "缺少 keystore.properties：release 包必须使用固定的连镜签名密钥。"
             }
             storeFile = file(keystoreProps.getProperty("storeFile"))
             storePassword = keystoreProps.getProperty("storePassword")

@@ -196,8 +196,18 @@ object ImageDecode {
         gain || csHdr || hasHdrMarker(file)
     }.getOrDefault(false)
 
-    /** Ultra HDR 的「底图 + 增益图」组合 */
-    class HdrPair(val base: android.graphics.Bitmap, val gain: android.graphics.Bitmap, val ratioMax: Float)
+    /** Ultra HDR 的「底图 + 增益图」组合，以及 ISO 21496-1 的完整元数据。 */
+    class HdrPair(
+        val base: android.graphics.Bitmap,
+        val gain: android.graphics.Bitmap,
+        val ratioMax: Float,
+        val ratioMin: Float,
+        val gamma: Float,
+        val epsSdr: Float,
+        val epsHdr: Float,
+        val displayRatioFull: Float,
+        val minDisplayRatio: Float
+    )
 
     /**
      * 解 Ultra HDR JPEG：底图走 BitmapFactory（只有它会把 gainmap 挂到 Bitmap 上），
@@ -235,14 +245,33 @@ object ImageDecode {
         }
         val gain = android.graphics.Bitmap.createBitmap(gw, gh, android.graphics.Bitmap.Config.ARGB_8888)
         gain.setPixels(gray, 0, gw, 0, 0, gw, gh)
-        val ratio = runCatching { gm.ratioMax?.get(0) ?: 1f }.getOrDefault(1f)
+        // ISO 21496-1：增益图不是简单映射，必须按 min/max boost、gamma、offset 和
+        // 显示器实际 HDR/SDR 比一起算；否则高光会被整体抬到 1000+ nits，看着就是过曝。
+        fun first(v: FloatArray?, fallback: Float) =
+            runCatching { v?.get(0) ?: fallback }.getOrDefault(fallback)
+        val ratio = (runCatching { gm.ratioMax.maxOrNull() }.getOrNull() ?: 1f)
+            .coerceIn(1f, 16f)
+        val ratioMin = (runCatching { gm.ratioMin.minOrNull() }.getOrNull() ?: 1f)
+            .coerceIn(0.01f, ratio)
+        val gamma = first(runCatching { gm.gamma }.getOrNull(), 1f).coerceIn(0.05f, 8f)
+        val epsSdr = first(runCatching { gm.epsilonSdr }.getOrNull(), 1f / 64f).coerceIn(0f, 1f)
+        val epsHdr = first(runCatching { gm.epsilonHdr }.getOrNull(), 1f / 64f).coerceIn(0f, 1f)
+        val fullRatio = runCatching { gm.displayRatioForFullHdr }.getOrDefault(ratio)
+            .coerceAtLeast(ratioMin)
+        val minDisplayRatio = runCatching { gm.minDisplayRatioForHdrTransition }
+            .getOrDefault(1f).coerceAtLeast(0.01f)
         com.lutcamera.lutcamerapro.log.DoukLog.i(
             "HdrDecode", "PAIR",
             "base" to "${base.width}x${base.height}",
             "gain" to "${gw}x${gh}",
-            "ratio" to ratio.toString()
+            "max" to ratio.toString(),
+            "min" to ratioMin.toString(),
+            "gamma" to gamma.toString(),
+            "eps" to "$epsSdr/$epsHdr",
+            "full" to fullRatio.toString(),
+            "minD" to minDisplayRatio.toString()
         )
-        HdrPair(base, gain, ratio)
+        HdrPair(base, gain, ratio, ratioMin, gamma, epsSdr, epsHdr, fullRatio, minDisplayRatio)
     }.getOrNull()
 
     /** 探针：这张图是不是 Ultra HDR（带 gainmap）。 */
@@ -269,8 +298,7 @@ object ImageDecode {
         "hdrgainmap",
         "iso:std:iso:ts:21496",
         "21496-1",
-        "urn:com:apple:photo:2020:hdrgainmap",
-        "mpf:"
+        "urn:com:apple:photo:2020:hdrgainmap"
     )
 
     fun hasHdrMarker(file: File): Boolean = runCatching {
@@ -425,7 +453,7 @@ object ImageDecode {
                 decoder.isMutableRequired = false
             }
             decoded = ImageDecoder.decodeBitmap(source, listener)
-            decoded?.let { applyGainmap(it) }
+            decoded?.asImageBitmap()
         }.getOrNull()
     }
 

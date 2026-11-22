@@ -9,6 +9,7 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.AttributeSet
@@ -26,6 +27,8 @@ import java.nio.FloatBuffer
  * 直接把 PQ 值写到 PQ 色彩空间的 Surface，合成器给屏幕下发 HDR metadata，
  * 亮部才会真的超过 SDR 白（本机峰值 420 nits）。
  *
+ * 增益图重建按 ISO 21496-1；高光肩部参考 Apache-2.0 的 JonaNorman/HDRSample
+ * 与 bjzhou/PhotonCamera 的公开实现，但没有复制 GPL 项目（LocalViewer）的代码。
  * 设备/驱动不支持 BT2020_PQ 的 EGL 窗口时退回 SDR 交换链并做一次简单
  * tone map，画面照常显示，只是没有 HDR 高光。
  */
@@ -49,7 +52,14 @@ internal class HdrImageView @JvmOverloads constructor(
     private var gainTex = 0
     private var gainBmp: Bitmap? = null
     private var ratioMax = 1f
+    private var ratioMin = 1f
+    private var mapGamma = 1f
+    private var epsSdr = 1f / 64f
+    private var epsHdr = 1f / 64f
+    private var fullRatio = 1f
+    private var minDisplayRatio = 1f
     private var gainOn = false
+    private var pqInput = false
     // 已经在 GL 里的那张底图 / 增益图：换了图必须重新上传，
     // 以前只在 texId==0 时上传，翻到下一张会继续显示上一张的纹理。
     private var texBitmap: Bitmap? = null
@@ -60,7 +70,14 @@ internal class HdrImageView @JvmOverloads constructor(
     private var uGain = 0
     private var uGainOn = 0
     private var uRatioMax = 0
+    private var uRatioMin = 0
+    private var uGamma = 0
+    private var uEpsSdr = 0
+    private var uEpsHdr = 0
+    private var uWeight = 0
     private var uTonemap = 0
+    private var uPqInput = 0
+    private var uPeakNits = 0
     private var uZoom = 0
     private var uPan = 0
     private var uQuarter = 0
@@ -69,6 +86,22 @@ internal class HdrImageView @JvmOverloads constructor(
     /** 这一层是否真的用上了 PQ 交换链（false = SDR 回退） */
     var hdrActive: Boolean = false
         private set
+
+    /**
+     * 当前纹理属于哪一张图。翻页时上层用缩略图盖住旧帧，等这里真正画完新纹理
+     * 再撤掉遮罩，避免 SurfaceView 先黑一帧再出图。
+     */
+    var sourceTag: String? = null
+        set(value) {
+            if (field != value) {
+                field = value
+                if (value == null) lastFrameTag = null
+            }
+        }
+
+    /** 新纹理已经完成一次 eglSwapBuffers 后回调（主线程） */
+    var onFrameReady: ((String?) -> Unit)? = null
+    private var lastFrameTag: String? = null
 
     /** EGL 窗口是否按 BT2020_PQ 建成功；只有它为 true 才允许输出 PQ 数值 */
     private var pqSurface = false
@@ -83,6 +116,7 @@ internal class HdrImageView @JvmOverloads constructor(
     private var quarter = false
 
     fun setTransform(z: Float, px: Float, py: Float, q: Boolean) {
+        if (zoom == z && panX == px && panY == py && quarter == q) return
         zoom = z; panX = px; panY = py; quarter = q
         handler.post { renderOnce() }
     }
@@ -94,9 +128,15 @@ internal class HdrImageView @JvmOverloads constructor(
         setZOrderOnTop(false)
     }
     fun setBitmap(bmp: Bitmap?) {
+        if (bmp == null) {
+            // 保留上一帧：翻页时新图还没解出来，清空 Surface 会先黑一下。
+            // 上层会用缩略图遮住，真正的新纹理上传完成后再撤遮罩。
+            return
+        }
         if (bitmap === bmp && !gainOn) return
         bitmap = bmp
         gainBmp = null; gainOn = false
+        pqInput = true
         handler.post { renderOnce() }
     }
 
@@ -104,12 +144,34 @@ internal class HdrImageView @JvmOverloads constructor(
      * Ultra HDR：底图是普通 8bit SDR，gain 是逐像素增益图（灰度）。
      * 着色器里按 ratioMax^gain 还原线性亮度再编码成 PQ，这才是真 HDR 数据。
      */
-    fun setGainPair(base: Bitmap?, gain: Bitmap?, ratio: Float) {
+    fun setGainPair(
+        base: Bitmap?,
+        gain: Bitmap?,
+        ratioMaxValue: Float,
+        ratioMinValue: Float,
+        gammaValue: Float,
+        epsilonSdr: Float,
+        epsilonHdr: Float,
+        displayRatioFull: Float,
+        minDisplayRatioValue: Float
+    ) {
         if (bitmap === base && gainBmp === gain) return
         bitmap = base
         gainBmp = gain
-        ratioMax = ratio.coerceIn(1f, 8f)
+        val contentRatio = displayRatioFull.takeIf { it.isFinite() && it >= 1.05f }
+        // libultrahdr 的 ratioMax 经常是 10000/203≈49（编码器能力上限），
+        // 并不等于这张图真实的高光能力。直接用 49 倍会把高光整片推爆。
+        // HDRCapacityMax（displayRatioForFullHdr）才是内容峰值，超过它的部分不能再用。
+        ratioMax = (contentRatio?.let { minOf(ratioMaxValue, it) } ?: ratioMaxValue)
+            .coerceIn(1f, 16f)
+        ratioMin = ratioMinValue.coerceIn(0.01f, ratioMax)
+        mapGamma = gammaValue.coerceIn(0.05f, 8f)
+        epsSdr = epsilonSdr.coerceIn(0f, 1f)
+        epsHdr = epsilonHdr.coerceIn(0f, 1f)
+        fullRatio = ratioMax
+        minDisplayRatio = minDisplayRatioValue.coerceAtLeast(0.01f)
         gainOn = gain != null
+        pqInput = false
         handler.post { renderOnce() }
     }
 
@@ -154,6 +216,7 @@ internal class HdrImageView @JvmOverloads constructor(
 
     private fun initGl() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) releaseGl()
+        lastFrameTag = null
         val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         if (display == EGL14.EGL_NO_DISPLAY) {
             DoukLog.w("HdrImage", "NO_EGL_DISPLAY")
@@ -230,7 +293,14 @@ internal class HdrImageView @JvmOverloads constructor(
         uGain = GLES20.glGetUniformLocation(program, "uGain")
         uGainOn = GLES20.glGetUniformLocation(program, "uGainOn")
         uRatioMax = GLES20.glGetUniformLocation(program, "uRatioMax")
+        uRatioMin = GLES20.glGetUniformLocation(program, "uRatioMin")
+        uGamma = GLES20.glGetUniformLocation(program, "uGamma")
+        uEpsSdr = GLES20.glGetUniformLocation(program, "uEpsSdr")
+        uEpsHdr = GLES20.glGetUniformLocation(program, "uEpsHdr")
+        uWeight = GLES20.glGetUniformLocation(program, "uWeight")
         uTonemap = GLES20.glGetUniformLocation(program, "uTonemap")
+        uPqInput = GLES20.glGetUniformLocation(program, "uPqInput")
+        uPeakNits = GLES20.glGetUniformLocation(program, "uPeakNits")
         uZoom = GLES20.glGetUniformLocation(program, "uZoom")
         uPan = GLES20.glGetUniformLocation(program, "uPan")
         uQuarter = GLES20.glGetUniformLocation(program, "uQuarter")
@@ -291,7 +361,14 @@ internal class HdrImageView @JvmOverloads constructor(
             uniform sampler2D uGain;
             uniform float uGainOn;
             uniform float uRatioMax;
+            uniform float uRatioMin;
+            uniform float uGamma;
+            uniform float uEpsSdr;
+            uniform float uEpsHdr;
+            uniform float uWeight;
             uniform float uTonemap;
+            uniform float uPqInput;
+            uniform float uPeakNits;
             out vec4 fragColor;
 
             const float m1 = 0.1593017578125;
@@ -299,6 +376,7 @@ internal class HdrImageView @JvmOverloads constructor(
             const float c1 = 0.8359375;
             const float c2 = 18.8515625;
             const float c3 = 18.6875;
+            const float SDR_NITS = 203.0;
 
             vec3 pq(vec3 nits) {
                 vec3 Y = clamp(nits / 10000.0, 0.0001, 1.0);
@@ -306,35 +384,92 @@ internal class HdrImageView @JvmOverloads constructor(
                 return pow((c1 + c2 * Yp) / (1.0 + c3 * Yp), vec3(m2));
             }
 
+            // PQ 码值反解成绝对亮度（nits），用于直接解码出来的 PQ 位图。
+            vec3 pqToNits(vec3 code) {
+                vec3 e = pow(clamp(code, 0.0, 1.0), vec3(1.0 / m2));
+                vec3 num = max(e - c1, 0.0);
+                vec3 den = max(c2 - c3 * e, 1e-6);
+                return 10000.0 * pow(num / den, vec3(1.0 / m1));
+            }
+
+            vec3 srgbToLinear(vec3 c) {
+                vec3 lo = c / 12.92;
+                vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+                return mix(lo, hi, step(vec3(0.04045), c));
+            }
+
+            vec3 linearToSrgb(vec3 c) {
+                vec3 lo = c * 12.92;
+                vec3 hi = 1.055 * pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.4)) - 0.055;
+                return mix(lo, hi, step(vec3(0.0031308), c));
+            }
+
+            // 线性 sRGB -> 线性 BT.2020，PQ 交换链必须以 BT.2020 原色输出
+            vec3 srgbToBt2020(vec3 c) {
+                return vec3(
+                    dot(c, vec3(0.6274, 0.3293, 0.0433)),
+                    dot(c, vec3(0.0691, 0.9195, 0.0114)),
+                    dot(c, vec3(0.0164, 0.0880, 0.8956))
+                );
+            }
+
+            vec3 bt2020ToSrgb(vec3 c) {
+                return vec3(
+                    dot(c, vec3(1.0280, -0.0268, -0.0012)),
+                    dot(c, vec3(-0.0562, 1.0702, -0.0140)),
+                    dot(c, vec3(-0.0023, -0.0070, 1.0093))
+                );
+            }
+
+            /**
+             * 高光肩部：75% 峰值以下不动，之上平滑趋近峰值。
+             * 直接输出 800~1000 nits 的 PQ，在 400~600 nits 的面板上会被整片裁白；
+             * 这里先把细节压进面板真实峰值，再编码，亮部层次才留得住。
+             */
+            vec3 softClip(vec3 nits, float peak) {
+                vec3 safe = max(nits, 0.0);
+                float y = dot(safe, vec3(0.2627, 0.6780, 0.0593));
+                if (y <= 1e-5) return safe;
+                float knee = peak * 0.72;
+                float mapped = y;
+                if (y > knee) {
+                    float room = max(peak - knee, 1.0);
+                    mapped = knee + room * (1.0 - exp(-(y - knee) / room));
+                }
+                float scale = mapped / y;
+                return min(safe * scale, vec3(peak));
+            }
+
             void main() {
                 vec4 c = texture(uTex, vTexCoord);
-                if (uGainOn > 0.5) {
-                    float g = texture(uGain, vTexCoord).r;
-                    // sRGB 8bit → 线性，再按增益乘到 SDR 白（203 nits）之上。
-                    // 增益只作用到中高光：暗部仍按 SDR 亮度走，整张图不会因为
-                    // 平均增益而发灰；高光再冲一段后软压顶，避免整片死白。
-                    vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3(2.2));
-                    float lum = dot(lin, vec3(0.2126, 0.7152, 0.0722));
-                    float w = smoothstep(0.16, 0.85, lum);
-                    float ratio = pow(uRatioMax, g);
-                    float boost = 1.0 + (ratio - 1.0) * (0.25 + 0.75 * w);
+                float peak = max(uPeakNits, 1.0);
+                if (uPqInput > 0.5) {
+                    vec3 nits = softClip(pqToNits(c.rgb), peak);
                     if (uTonemap > 0.5) {
-                        // SDR 交换链：不能直接把底图丢出去。Ultra HDR 的底图本身就是
-                        // 一张低对比的 SDR 层，直接显示就是用户看到的「一停就发灰」。
-                        // 这里照 HDR 的增益算完再压回 0..1，画面和拖动时看到的一致。
-                        vec3 lit = lin * boost;
-                        lit = lit / (1.0 + max(lit - 0.92, 0.0) * 0.42);
-                        fragColor = vec4(pow(clamp(lit, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+                        vec3 srgb = clamp(bt2020ToSrgb(nits / SDR_NITS), 0.0, 1.0);
+                        fragColor = vec4(linearToSrgb(srgb), 1.0);
                     } else {
-                        vec3 nits = lin * boost * 203.0;
-                        // 1600 nits 以上柔化，保留高光层次而不是一刀切
-                        nits = nits - max(nits - 1600.0, 0.0) * 0.6;
+                        fragColor = vec4(pq(nits), 1.0);
+                    }
+                } else if (uGainOn > 0.5) {
+                    float g = texture(uGain, vTexCoord).r;
+                    // ISO 21496-1：L = mix(log(minBoost), log(maxBoost), G^1/gamma)
+                    // D = (SDR + epsSdr) * exp(L * W) - epsHdr
+                    // W 由显示器当前 HDR/SDR 比决定，不能无脑放满 maxBoost。
+                    float recovery = pow(clamp(g, 0.0, 1.0), 1.0 / max(uGamma, 0.05));
+                    float logBoost = mix(log(max(uRatioMin, 0.01)), log(max(uRatioMax, 0.01)), recovery);
+                    vec3 lin = srgbToLinear(clamp(c.rgb, 0.0, 1.0));
+                    vec3 hdr = (lin + uEpsSdr) * exp(logBoost * uWeight) - uEpsHdr;
+                    hdr = max(hdr, 0.0);
+                    vec3 nits = softClip(srgbToBt2020(hdr * SDR_NITS), peak);
+                    if (uTonemap > 0.5) {
+                        vec3 srgb = clamp(bt2020ToSrgb(nits / SDR_NITS), 0.0, 1.0);
+                        fragColor = vec4(linearToSrgb(srgb), 1.0);
+                    } else {
                         fragColor = vec4(pq(nits), 1.0);
                     }
                 } else if (uTonemap > 0.5) {
-                    // SDR 回退：把 PQ 值粗略拉回线性再压一下高光
-                    vec3 l = pow(max(c.rgb, vec3(0.0001)), vec3(2.2));
-                    fragColor = vec4(pow(l, vec3(1.0 / 2.2)) * 0.9, 1.0);
+                    fragColor = c;
                 } else {
                     fragColor = c;
                 }
@@ -369,6 +504,34 @@ internal class HdrImageView @JvmOverloads constructor(
             return 0
         }
         return p
+    }
+
+    /**
+     * 当前屏幕能真实显示到的 HDR/SDR 比。比如 420nits 面板 / 203nits SDR 白 ≈ 2.07，
+     * 那么 maxBoost=4 的照片只放 2.07 倍，剩下的高光交给系统 tone map，
+     * 这样高光不会一律冲成死白。
+     */
+    private fun displayWeight(): Float {
+        val displayRatio = (displayPeakNits() / 203f).coerceIn(1f, 20f)
+        val lo = minDisplayRatio.coerceAtLeast(0.01f)
+        val hi = fullRatio.coerceAtLeast(lo + 0.01f)
+        val den = kotlin.math.ln(hi) - kotlin.math.ln(lo)
+        val w = if (den > 0.001f) {
+            (kotlin.math.ln(displayRatio) - kotlin.math.ln(lo)) / den
+        } else 1f
+        return w.coerceIn(0f, 1f)
+    }
+
+    /**
+     * 面板真实 HDR 峰值。desiredMaxLuminance 在部分 ROM 上返回 0 或 1000+，
+     * 直接拿来算 boost 会把高光推过头；这里只接受合理区间，否则按这块平板
+     * 常见的 420 nits 保守处理。
+     */
+    private fun displayPeakNits(): Float {
+        val desired = runCatching { context.display?.hdrCapabilities?.desiredMaxLuminance }
+            .getOrNull() ?: 0f
+        if (desired in 100f..2000f) return desired
+        return if (hdrActive) 420f else 203f
     }
 
     private fun renderOnce() {
@@ -437,7 +600,14 @@ internal class HdrImageView @JvmOverloads constructor(
             GLES20.glUniform1i(uGain, 1)
             GLES20.glUniform1f(uGainOn, if (gainOn && gainTex != 0) 1f else 0f)
             GLES20.glUniform1f(uRatioMax, ratioMax)
+            GLES20.glUniform1f(uRatioMin, ratioMin)
+            GLES20.glUniform1f(uGamma, mapGamma)
+            GLES20.glUniform1f(uEpsSdr, epsSdr)
+            GLES20.glUniform1f(uEpsHdr, epsHdr)
+            GLES20.glUniform1f(uWeight, if (hdrActive) displayWeight() else 0f)
             GLES20.glUniform1f(uTonemap, if (hdrActive) 0f else 1f)
+            GLES20.glUniform1f(uPqInput, if (pqInput) 1f else 0f)
+            GLES20.glUniform1f(uPeakNits, if (hdrActive) displayPeakNits() else 203f)
             if (gainTex != 0) {
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gainTex)
@@ -457,6 +627,11 @@ internal class HdrImageView @JvmOverloads constructor(
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         }
         runCatching { EGL14.eglSwapBuffers(eglDisplay, eglSurface) }
+        val tag = sourceTag
+        if (tag != null && tag != lastFrameTag) {
+            lastFrameTag = tag
+            post { onFrameReady?.invoke(tag) }
+        }
     }
 
     private fun releaseGl() {
@@ -470,6 +645,7 @@ internal class HdrImageView @JvmOverloads constructor(
         }
         texBitmap = null
         texGain = null
+        lastFrameTag = null
         if (program != 0) {
             runCatching { GLES20.glDeleteProgram(program) }
             program = 0

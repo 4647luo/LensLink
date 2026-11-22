@@ -393,13 +393,13 @@ class DoukState(
     }
 
     /**
-     * USB 通道保存一张机身照片到手机相册（Pictures/Douk）。
+     * USB 通道保存一张机身照片到手机相册（Pictures/连镜）。
      * 走 GetPartialObject 分块，先落临时文件再走 MediaStore，Android 10+ 不需要存储权限。
      */
     fun saveUsbPhoto(context: Context, handle: Int, fileName: String, onDone: (String) -> Unit) {
         ioScope.launch {
             val target = usbPhotos.firstOrNull { it.handle == handle }
-            val displayName = fileName.ifBlank { "DOUK_$handle.JPG" }
+            val displayName = fileName.ifBlank { "LJ_$handle.JPG" }
             val result = runCatching {
                 val temp = java.io.File(context.cacheDir, "usb_$handle.dat")
                 if (!usb.ptp.copyObjectToFile(handle, temp, target?.sizeBytes ?: 0L)) {
@@ -410,7 +410,7 @@ class DoukState(
                 val values = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, displayName)
                     put(android.provider.MediaStore.Images.Media.MIME_TYPE, mime)
-                    put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Douk")
+                    put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, GalleryFileOps.PHONE_FOLDER)
                     put(android.provider.MediaStore.Images.Media.IS_PENDING, 1)
                 }
                 val uri = context.contentResolver.insert(
@@ -423,7 +423,7 @@ class DoukState(
                 values.put(android.provider.MediaStore.Images.Media.IS_PENDING, 0)
                 context.contentResolver.update(uri, values, null, null)
                 temp.delete()
-                "已保存到 Pictures/Douk：$displayName"
+                "已保存到 ${GalleryFileOps.PHONE_FOLDER}：$displayName"
             }.getOrElse { "保存失败：${it.message}" }
             withContext(Dispatchers.Main) {
                 if (result.startsWith("已保存")) galleryRefreshTick++

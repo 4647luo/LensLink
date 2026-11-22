@@ -24,7 +24,7 @@ import java.util.concurrent.LinkedBlockingQueue
  *
  * 三条落盘路径：
  * 1. 每次启动新建一份会话日志 `filesDir/douk-logs/session-<yyyyMMdd-HHmmss>.log`，逐行写；
- * 2. 连接失败时**自动**把完整日志导出到公共目录 `Download/Douk/`，用户用文件管理器就能取；
+ * 2. 连接失败时**自动**把完整日志导出到公共目录 `Download/连镜/`，用户用文件管理器就能取；
  * 3. 设置页仍可手动导出一份。
  *
  * 行格式对齐 GitHub 常见日志库（KLog / Timber）：
@@ -82,7 +82,7 @@ object DoukLog {
             fileQueue.clear()
             fileQueue.offer(
                 buildString {
-                    appendLine("Douk 会话日志")
+                    appendLine("连镜会话日志")
                     appendLine("开始时间: ${stampFormat.get().format(Date())}")
                     appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL}")
                     appendLine("系统: Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
@@ -184,7 +184,7 @@ object DoukLog {
     fun currentFile(): File? = sessionFile
 
     /**
-     * 连接失败时自动把日志导出到 `Download/Douk/`。
+     * 连接失败时自动把日志导出到 `Download/连镜/`。
      * 60 秒内只导一次，避免连续失败刷出一堆文件。返回 null 表示刚导过、本次跳过。
      */
     fun autoExport(context: Context, reason: String): String? {
@@ -198,7 +198,7 @@ object DoukLog {
     }
 
     /**
-     * 导出完整日志（当前会话 + 历史会话）到 `Download/Douk`，返回可读的结果文案。
+     * 导出完整日志（当前会话 + 历史会话）到 `Download/连镜`，返回可读的结果文案。
      * 首部带设备与运行时信息，方便直接贴到 issue。
      *
      * 注意：这个方法会读文件、写 MediaStore，属于阻塞 IO，必须在 IO 线程调用。
@@ -214,7 +214,7 @@ object DoukLog {
         }.getOrDefault("")
 
         val header = buildString {
-            appendLine("Douk 运行日志")
+            appendLine("连镜运行日志")
             appendLine("导出时间: ${stampFormat.get().format(Date())}")
             appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL}")
             appendLine("系统: Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
@@ -225,11 +225,11 @@ object DoukLog {
         val content = header + body.joinToString("\n") + "\n===== 历史会话文件 =====\n" + history
 
         return runCatching {
-            val name = "douk-log-${sessionFormat.get().format(Date())}.log"
+            val name = "lianjing-log-${sessionFormat.get().format(Date())}.log"
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, name)
                 put(MediaStore.Downloads.MIME_TYPE, "text/plain")
-                put(MediaStore.Downloads.RELATIVE_PATH, "Download/Douk")
+                put(MediaStore.Downloads.RELATIVE_PATH, "Download/连镜")
                 put(MediaStore.Downloads.IS_PENDING, 1)
             }
             val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
@@ -239,8 +239,8 @@ object DoukLog {
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             context.contentResolver.update(uri, values, null, null)
-            lastExportPath = "Download/Douk/$name"
-            "已导出到 Download/Douk/$name（${body.size} 条）"
+            lastExportPath = "Download/连镜/$name"
+            "已导出到 Download/连镜/$name（${body.size} 条）"
         }.getOrElse { "日志导出失败：${it.message}" }
     }
 

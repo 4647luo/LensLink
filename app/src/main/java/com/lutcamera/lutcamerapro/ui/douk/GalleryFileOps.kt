@@ -46,13 +46,22 @@ object GalleryFileOps {
         val exifRows: List<Pair<String, String>> = emptyList()
     )
 
-    private const val APP_ROOT = "Douk"
-    private const val PHONE_ALBUM_ROOT = "LensLink"
+    private const val APP_ROOT = "连镜"
+    private const val PHONE_ALBUM_ROOT = "连镜"
+    private const val LEGACY_APP_ROOT = "Douk"
+    private const val LEGACY_PHONE_ALBUM_ROOT = "LensLink"
 
-    /** 应用自己的目录：Pictures/Douk 与 DCIM/Douk，外加 0.0.139 之前的 LutCameraPro 旧目录。 */
+    /**
+     * 应用自己的目录：新数据统一写入 Pictures/连镜 与 DCIM/连镜。
+     * 旧的 Pictures/Douk、DCIM/Douk、DCIM/LensLink 以及 LutCameraPro 目录继续参与扫描，
+     * 保证升级后老照片不会从应用图库里消失；只是不再往旧目录写新文件。
+     */
     fun appRoots(): List<File> = listOf(
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), APP_ROOT),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), APP_ROOT),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), LEGACY_APP_ROOT),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), LEGACY_APP_ROOT),
+        File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), LEGACY_PHONE_ALBUM_ROOT),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "LutCameraPro"),
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCameraPro")
     )
@@ -542,7 +551,7 @@ object GalleryFileOps {
         )
     }
 
-    /** 把一段内容写进公共图片库。dir 形如 Pictures/Douk、DCIM/LensLink/旅行。 */
+    /** 把一段内容写进公共图片库。dir 形如 Pictures/连镜、DCIM/连镜/旅行。 */
     fun writeToGallery(
         context: Context,
         dir: String,

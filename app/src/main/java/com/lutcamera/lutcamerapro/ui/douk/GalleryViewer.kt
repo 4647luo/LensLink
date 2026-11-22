@@ -1,19 +1,26 @@
 package com.lutcamera.lutcamerapro.ui.douk
 
 import android.app.Activity
+import android.graphics.drawable.ColorDrawable
+import android.view.View
+import android.view.WindowManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import android.net.Uri
 import android.provider.MediaStore
 import com.lutcamera.lutcamerapro.log.DoukHttp
 import okhttp3.Request
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.chrisbanes.haze.hazeSource
 import androidx.compose.foundation.background
@@ -71,6 +78,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -168,9 +176,15 @@ internal fun PhotoViewerScreen(
     var videoOpen by remember { mutableStateOf(false) }
     // 网格里的是 320–400px 的缩略图，全屏要单独加载一张大的，否则放大就糊
     var hd by remember { mutableStateOf<ImageBitmap?>(null) }
+    // 高清图也有归属：换图首帧不能把上一张的大图顶上来
+    var hdKey by remember { mutableStateOf<String?>(null) }
     // 真 HDR：Ultra HDR JPEG 的「底图 + 增益图」，或 PQ/HLG 图直接解出的 16bit 位图
     var hdrPair by remember { mutableStateOf<ImageDecode.HdrPair?>(null) }
     var hdrPq by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    // HDR 数据属于哪一张：换图瞬间旧数据立刻失效，避免 SurfaceView 还挂着上一张的帧
+    var hdrKey by remember { mutableStateOf<String?>(null) }
+    // SurfaceView 真正画出新纹理的 key；没有它就用缩略图盖着，避免翻页闪黑
+    var hdrFrameKey by remember { mutableStateOf<String?>(null) }
     // 「显示原图」：这张单独从相机拉全尺寸（或跟「始终显示原图」总开关走）
     var wantOriginal by remember { mutableStateOf(false) }
     var loadingOriginal by remember { mutableStateOf(false) }
@@ -239,6 +253,7 @@ internal fun PhotoViewerScreen(
         loadingOriginal = true
         message = "正在从相机取原图…"
         hd = withContext(Dispatchers.IO) { state.cameraOriginalBitmap(item.key) }
+        hdKey = item.stableKey
         loadingOriginal = false
         message = if (hd == null) "取原图失败，先显示缩略图" else null
     }
@@ -255,14 +270,20 @@ internal fun PhotoViewerScreen(
         // 高清图再在后台替换。以前这里先 hd=null 等 decode，5120 万像素的
         // 原图要几百毫秒，看起来就是「点开先黑一下」。
         hd = bitmap
+        hdKey = item.stableKey
         hdrPair = null
         hdrPq = null
+        hdrKey = null
+        hdrFrameKey = null
         if (item.origin == "cam" && !item.isVideo && showOriginal) {
             // 「始终显示原图」总开关：每张打开就直接拉全尺寸
             fetchOriginal()
         } else {
             val large = withContext(Dispatchers.IO) { loadLargeBitmap(context, item) }
-            if (large != null) hd = large
+            if (large != null) {
+                hd = large
+                hdKey = item.stableKey
+            }
         }
         // Live 图探测：只读文件头，几十毫秒；真正播放再抽视频
         isLive = withContext(Dispatchers.IO) { LivePhoto.probe(context, item) }
@@ -277,6 +298,7 @@ internal fun PhotoViewerScreen(
                 } else null
                 hdrPair = pair
                 hdrPq = pq
+                hdrKey = item.stableKey
                 com.lutcamera.lutcamerapro.log.DoukLog.i(
                     "HdrViewer", "HDR_LOAD",
                     "file" to file.name,
@@ -306,6 +328,7 @@ internal fun PhotoViewerScreen(
                 if (pair == null) {
                     hdrPq = withContext(Dispatchers.IO) { ImageDecode.decodeHdrBitmap(file, 3200) }
                 }
+                hdrKey = item.stableKey
             }
         }
     }
@@ -364,15 +387,51 @@ internal fun PhotoViewerScreen(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
     ) {
+        // 查看器只留纯黑：照片上下不再透出 App 的浅色界面，系统栏也一起融进去
+        val dialogView = LocalView.current
+        DisposableEffect(dialogView) {
+            val window = (dialogView.parent as? DialogWindowProvider)?.window
+            val oldStatus = window?.statusBarColor
+            val oldNav = window?.navigationBarColor
+            val controller = window?.let { WindowCompat.getInsetsController(it, dialogView) }
+            val oldLightStatus = controller?.isAppearanceLightStatusBars
+            val oldLightNav = controller?.isAppearanceLightNavigationBars
+            window?.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS)
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION)
+            // Activity 是 edge-to-edge，系统栏本身是透明的；只改 statusBarColor 在
+            // Android 15 / 部分 ROM 上会被忽略，栏里透出的还是下面那个浅色页面。
+            // 把 Dialog 窗口和 decor 都铺成纯黑，系统栏才真正和看图背景融成一块。
+            window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.BLACK))
+            window?.decorView?.setBackgroundColor(android.graphics.Color.BLACK)
+            window?.setLayout(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT
+            )
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                window?.attributes?.let { attrs ->
+                    attrs.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    window.attributes = attrs
+                }
+            }
+            window?.statusBarColor = android.graphics.Color.BLACK
+            window?.navigationBarColor = android.graphics.Color.BLACK
+            window?.isNavigationBarContrastEnforced = false
+            window?.isStatusBarContrastEnforced = false
+            controller?.isAppearanceLightStatusBars = false
+            controller?.isAppearanceLightNavigationBars = false
+            onDispose {
+                oldStatus?.let { window?.statusBarColor = it }
+                oldNav?.let { window?.navigationBarColor = it }
+                oldLightStatus?.let { controller?.isAppearanceLightStatusBars = it }
+                oldLightNav?.let { controller?.isAppearanceLightNavigationBars = it }
+            }
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                // 纯黑和 App 的浅色界面切换太生硬，改成带一点层次的深灰渐变
-                .background(
-                    androidx.compose.ui.graphics.Brush.verticalGradient(
-                        listOf(Color(0xFF0B0C0F), Color(0xFF191B21), Color(0xFF0B0C0F))
-                    )
-                )
+                .background(Color.Black)
         ) {
             Box(
                 modifier = Modifier
@@ -445,10 +504,10 @@ internal fun PhotoViewerScreen(
                                     animate(0f, 1f, animationSpec = tween(200, easing = FastOutSlowInEasing)) { v, _ ->
                                         dragX = from + (to - from) * v
                                     }
-                                    // 先换图再归零：两者在同一次快照里生效，新图直接落在屏幕中间，
-                                    // 不会出现「弹回旧图再跳新图」的一帧闪烁
+                                    // 先换图，拖到位移不要立刻归零：父层真正换 item 之前
+                                    // 归零会让旧图先弹回中间一帧，看起来就是“抽搐”。
+                                    // 新 item 的 LaunchedEffect 会统一把 dragX 复位。
                                     onSwipe(swipeDir)
-                                    dragX = 0f
                                 }
                             } else {
                                 if (dragX != 0f) {
@@ -501,29 +560,55 @@ internal fun PhotoViewerScreen(
                         .hazeSource(viewerHaze),
                     contentAlignment = Alignment.Center
                 ) {
-                val shown = hd ?: bitmap
-                val pair = hdrPair
-                val pq = hdrPq
+                val shown = if (hdKey == item.stableKey) (hd ?: bitmap) else bitmap
+                val pair = if (hdrKey == item.stableKey) hdrPair else null
+                val pq = if (hdrKey == item.stableKey) hdrPq else null
                 // 拖动时不能再用 graphicsLayer 去拖 SurfaceView（它不吃），但也不能把它拆掉：
                 // 拆掉就 destroy surface，松手重建 GL 要几十上百毫秒，看着就是「一卡一卡」、
                 // 中间还会闪一下灰底。改成 SurfaceView 常驻，拖动时在上面盖一层普通 Image，
                 // 松手后移走这层，HDR 画面本来就是热的，不用重新初始化。
                 val dragging = dragX != 0f
                 val hasHdr = pair != null || pq != null
-                if (hasHdr && !editing) {
-                    BoxWithConstraints(
-                        modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
-                    ) {
+                val hdrFrameReady = hdrFrameKey == item.stableKey
+                // 新 HDR 纹理还没上屏前，缩略图先盖在上面；上屏后 120ms 淡出，
+                // 翻页就不会先黑一帧再突然跳亮。
+                val hdrOverlayAlpha by animateFloatAsState(
+                    targetValue = if (hasHdr && !hdrFrameReady) 1f else 0f,
+                    animationSpec = tween(120),
+                    label = "hdrOverlay"
+                )
+                // 这一层必须常驻：换图时如果把它从组合里拿掉，Surface 会被销毁，
+                // 新图回来再重建 GL，就会看到“抽一下”的灰闪/旧帧。
+                if (!editing) {
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                         val quarter = (rotation % 180f) != 0f
                         val w = if (quarter) maxHeight else maxWidth
                         val h = if (quarter) maxWidth else maxHeight
-                        // SurfaceView 不吃 graphicsLayer，缩放/平移/旋转都交给 GL 做
                         AndroidView(
                             factory = { ctx -> HdrImageView(ctx) },
                             update = { view ->
-                                if (pair != null) view.setGainPair(pair.base, pair.gain, pair.ratioMax)
-                                else view.setBitmap(pq)
+                                val key = item.stableKey
+                                view.sourceTag = if (pair != null || pq != null) key else null
+                                view.onFrameReady = { tag ->
+                                    if (tag == key) hdrFrameKey = tag
+                                }
+                                if (pair != null) {
+                                    view.setGainPair(
+                                        pair.base, pair.gain,
+                                        pair.ratioMax, pair.ratioMin, pair.gamma,
+                                        pair.epsSdr, pair.epsHdr,
+                                        pair.displayRatioFull, pair.minDisplayRatio
+                                    )
+                                } else if (pq != null) {
+                                    view.setBitmap(pq)
+                                } else {
+                                    view.setBitmap(null)
+                                }
                                 view.setTransform(scale, offsetX, offsetY, quarter)
+                                // SurfaceView 只有位置能跟着 View 一起移动；
+                                // 拖动时让它整层跟手，下面不再另画一张当前图，避免双重影子。
+                                view.translationX = dragX
+                                view.visibility = if (hasHdr) View.VISIBLE else View.INVISIBLE
                                 if (!view.loggedReady) {
                                     view.loggedReady = true
                                     com.lutcamera.lutcamerapro.log.DoukLog.i(
@@ -541,7 +626,7 @@ internal fun PhotoViewerScreen(
                 if (editing || dragging || !hasHdr) {
                     if (shown != null || dragging) {
                     BoxWithConstraints(
-                        modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
+                        modifier = Modifier.fillMaxSize()
                     ) {
                         // 转到 90/270 度时把可用宽高对调，否则竖图旋转后会撑出屏幕
                         val quarter = (rotation % 180f) != 0f
@@ -571,11 +656,16 @@ internal fun PhotoViewerScreen(
                                     .graphicsLayer { translationX = dragX + pageWidth }
                             )
                         }
-                        if (shown != null) {
+                        // 有 HDR 层时，当前这张由 SurfaceView 出；新纹理还没上屏
+                        // 或正在淡出遮罩时，这里继续画缩略图，避免黑闪。
+                        if (shown != null && (editing || !hasHdr || !hdrFrameReady ||
+                                hdrOverlayAlpha > 0.01f)
+                        ) {
                             Image(
                                 bitmap = shown,
                                 contentDescription = item.fileName,
                                 contentScale = ContentScale.Fit,
+                                alpha = if (hasHdr) hdrOverlayAlpha else 1f,
                                 modifier = Modifier
                                     .align(Alignment.Center)
                                     .size(w, h)
@@ -788,6 +878,8 @@ internal fun PhotoViewerScreen(
                                     // 编辑器还要再解一张 4096 的图，先把 HDR 那两张放掉腾内存
                                     hdrPair = null
                                     hdrPq = null
+                                    hdrKey = null
+                                    hdrFrameKey = null
                                     editing = true
                                 }
                             }
@@ -1141,7 +1233,7 @@ private fun AddToSheet(
     var busy by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<List<Uri>>(emptyList()) }
     val isCamera = item.origin == "cam" || item.origin == "usb"
-    val appDir = "Pictures/Douk/" + (item.album ?: "连镜")
+    val appDir = GalleryFileOps.PHONE_FOLDER + "/" + (item.album ?: "连镜")
 
     fun allowed(name: String): Boolean {
         if (!isCamera || item.isVideo) return true

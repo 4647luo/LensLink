@@ -1,0 +1,28 @@
+Douk 运行日志
+导出时间: 2026-11-15 22:20:16
+设备: Xiaomi 23043RP34C
+系统: Android 14 (SDK 34)
+应用: com.lutcamera.lutcamerapro
+格式: 时间 级别/标签: 事件 key=value
+===== 本次会话 =====
+11-15 22:18:01.181 I/ViewModel: STEP msg=通信引擎就绪，等待连接...
+11-15 22:18:14.695 W/Scan: NOT_FOUND mode=WIFI_AP nets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:18:21.990 I/ViewModel: STEP msg=未发现广播设备；可从相机网络状态或手机热点设备列表读取相机 IP，手动连接
+11-15 22:18:36.114 I/ViewModel: STEP msg=Camera disconnected
+11-15 22:19:01.314 I/ViewModel: STEP msg=通信引擎就绪，等待连接...
+11-15 22:19:30.252 W/Scan: NOT_FOUND mode=WIFI_AP nets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:19:37.601 I/ViewModel: STEP msg=未发现广播设备；可从相机网络状态或手机热点设备列表读取相机 IP，手动连接
+===== 历史文件 =====
+11-15 22:15:06.112 I/Connect: PRECHECK_BEGIN target=192.168.1.1:15740 mode=WIFI_AP
+11-15 22:15:07.327 E/Connect: PREFLIGHT_FAIL target=192.168.1.1:15740 localNets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:15:23.715 I/ViewModel: STEP msg=Camera disconnected
+11-15 22:15:25.043 I/ViewModel: STEP msg=通信引擎就绪，等待连接...
+11-15 22:17:16.237 W/Scan: NOT_FOUND mode=WIFI_AP nets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:17:23.561 I/ViewModel: STEP msg=未发现广播设备；可从相机网络状态或手机热点设备列表读取相机 IP，手动连接
+11-15 22:17:38.674 I/ViewModel: STEP msg=Camera disconnected
+11-15 22:18:14.695 W/Scan: NOT_FOUND mode=WIFI_AP nets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:18:21.990 I/ViewModel: STEP msg=未发现广播设备；可从相机网络状态或手机热点设备列表读取相机 IP，手动连接
+11-15 22:18:36.114 I/ViewModel: STEP msg=Camera disconnected
+11-15 22:19:01.314 I/ViewModel: STEP msg=通信引擎就绪，等待连接...
+11-15 22:19:30.252 W/Scan: NOT_FOUND mode=WIFI_AP nets=wlan1 192.168.125.x；wlan0 10.98.15.x
+11-15 22:19:37.601 I/ViewModel: STEP msg=未发现广播设备；可从相机网络状态或手机热点设备列表读取相机 IP，手动连接

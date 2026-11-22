@@ -79,6 +79,12 @@ class NikonBleRemoteClient(private val context: Context) {
     val isReady: Boolean get() = _phase.value == Phase.READY
 
     private var gatt: BluetoothGatt? = null
+    // 断链自动重连：记住用户最后选的那台相机，掉线后按 1/2/4/8 秒退避重试，
+    // 最多 4 次；重新接上（配对到阶段 4）就把计数清零，避免偶发掉线就要手动重连。
+    private var lastCamera: RemoteCamera? = null
+    private var keepAlive = false
+    private var retryCount = 0
+    private var retryJob: Job? = null
     private var scanCallback: ScanCallback? = null
     private var scanTimeout: Job? = null
     private var pendingSubscriptions = 0
@@ -173,10 +179,26 @@ class NikonBleRemoteClient(private val context: Context) {
             fail("缺少蓝牙或定位权限")
             return
         }
+        lastCamera = camera
+        keepAlive = true
+        retryCount = 0
+        retryJob?.cancel()
+        retryJob = null
+        connectInternal(camera)
+    }
+
+    /** 真正发起 GATT 连接；重连也走这里，不动 keepAlive 意图。 */
+    private fun connectInternal(camera: RemoteCamera) {
         stopScan()
-        disconnect()
+        runCatching { gatt?.disconnect() }
+        runCatching { gatt?.close() }
+        gatt = null
+        pendingSubscriptions = 0
+        started = false
+        shutterBusy = false
         _phase.value = Phase.CONNECTING
-        _status.value = "正在连接 ${camera.name}"
+        _status.value = if (retryCount > 0) "正在重连 ${camera.name}（第 $retryCount 次）"
+        else "正在连接 ${camera.name}"
         val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
         val device = adapter?.getRemoteDevice(camera.address) ?: run {
             fail("找不到这台蓝牙设备")
@@ -185,10 +207,39 @@ class NikonBleRemoteClient(private val context: Context) {
         gatt = runCatching {
             device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }.getOrNull()
-        if (gatt == null) fail("GATT 连接启动失败")
+        if (gatt == null) {
+            fail("GATT 连接启动失败")
+            return
+        }
         scope.launch {
             delay(9000)
-            if (_phase.value == Phase.CONNECTING) fail("连接超时，请让相机保持在配对界面")
+            if (_phase.value == Phase.CONNECTING) {
+                // 连接超时也走重连退避，不要直接判死
+                if (keepAlive && lastCamera != null && retryCount < 4) {
+                    runCatching { gatt?.close() }
+                    gatt = null
+                    scheduleReconnect("连接超时")
+                } else {
+                    fail("连接超时，请让相机保持在配对界面")
+                }
+            }
+        }
+    }
+
+    private fun scheduleReconnect(reason: String) {
+        if (retryCount >= 4) {
+            fail("蓝牙多次重连失败，请重新扫描")
+            return
+        }
+        retryCount += 1
+        val waitMs = (1000L shl (retryCount - 1)).coerceAtMost(8000L)
+        _phase.value = Phase.CONNECTING
+        _status.value = "$reason，${waitMs / 1000}s 后第 $retryCount 次重试"
+        retryJob?.cancel()
+        retryJob = scope.launch {
+            delay(waitMs)
+            val camera = lastCamera ?: return@launch
+            if (keepAlive) connectInternal(camera)
         }
     }
 
@@ -200,8 +251,17 @@ class NikonBleRemoteClient(private val context: Context) {
                 _status.value = "GATT 已连接，正在发现服务"
                 runCatching { g.discoverServices() }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (_phase.value == Phase.READY || _phase.value == Phase.PAIRING) {
-                    fail("蓝牙连接已断开")
+                val wasActive = _phase.value == Phase.READY || _phase.value == Phase.PAIRING ||
+                    _phase.value == Phase.CONNECTING
+                runCatching { g.close() }
+                if (g === gatt) gatt = null
+                started = false
+                pendingSubscriptions = 0
+                shutterBusy = false
+                when {
+                    wasActive && keepAlive && lastCamera != null ->
+                        scheduleReconnect(if (status == 133) "蓝牙状态 133" else "蓝牙断开")
+                    wasActive -> fail("蓝牙连接已断开")
                 }
             }
         }
@@ -314,6 +374,8 @@ class NikonBleRemoteClient(private val context: Context) {
             }
             4 -> {
                 val serial = String(value.copyOfRange(9, 17), Charsets.US_ASCII).trim()
+                // 配对成功：清零重连计数，之后偶发掉线可以重新从 1 秒开始退避
+                retryCount = 0
                 _phase.value = Phase.READY
                 _status.value = if (serial.isBlank()) "遥控已就绪" else "遥控已就绪 · 相机 $serial"
             }
@@ -322,6 +384,12 @@ class NikonBleRemoteClient(private val context: Context) {
     }
 
     fun disconnect() {
+        // 用户主动断开：停掉重连意图，别在后台反复连回去
+        keepAlive = false
+        retryJob?.cancel()
+        retryJob = null
+        retryCount = 0
+        lastCamera = null
         runCatching { gatt?.disconnect() }
         runCatching { gatt?.close() }
         gatt = null

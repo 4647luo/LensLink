@@ -174,7 +174,9 @@ class AppForegroundService : Service() {
                 }
 
                 while (isActive && _isWatching.value) {
-                    delay(2000)
+                    // MTP 枚举每次都要跟相机通信，2 秒一轮在后台很费电；
+                    // 3 秒一轮对「拍完自动回传」的体感没有区别。
+                    delay(3000)
 
                     try {
                         var storageIds = mtpDevice?.storageIds

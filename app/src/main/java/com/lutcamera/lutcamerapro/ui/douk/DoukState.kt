@@ -179,6 +179,25 @@ class DoukState(
     /** 每保存一张照片自增，图库「应用内」据此重新扫描。 */
     var galleryRefreshTick by mutableStateOf(0)
 
+    // ===== 图库多选的批量操作：按钮画在 Douk 底栏上方，由图库页写入状态 =====
+    /** 当前选中的数量；0 = 不在多选态 */
+    var gallerySelCount by mutableStateOf(0)
+    /** 批量动作类型：delete（应用内删除）/ save（相机内保存到应用相册）/ 空 */
+    var gallerySelKind by mutableStateOf("")
+    /** 底栏卡片被点了一下就自增，图库页据此执行真正的操作 */
+    var galleryBulkTick by mutableStateOf(0)
+    var galleryBulkBusy by mutableStateOf(false)
+
+    fun requestGalleryBulk() {
+        if (gallerySelCount > 0 && gallerySelKind.isNotBlank()) galleryBulkTick++
+    }
+
+    fun clearGallerySelectionState() {
+        gallerySelCount = 0
+        gallerySelKind = ""
+        galleryBulkBusy = false
+    }
+
     /**
      * 局域网 TCP 探测到的相机（端口 15740 可达即视为相机）。
      * 这是比 mDNS 更可靠的发现方式：尼康很多机型不广播 _ptp._tcp。
@@ -241,7 +260,9 @@ class DoukState(
      * 完全交随机身自己的节能设置。
      */
     fun applyWifiPowerSave() {
-        vm.ptpClient.keepAliveIntervalMs = 15_000L
+        // 空闲心跳放到 60 秒：以前 15 秒一次 GetDeviceInfo，相机的 Wi‑Fi 灯几乎一直在闪。
+        // 取景时心跳整段跳过（画面数据流本身就在保活），不必再补命令。
+        vm.ptpClient.keepAliveIntervalMs = 60_000L
         vm.ptpClient.takeoverHostControl = DoukPrefs.takeoverCamera
     }
 
@@ -664,6 +685,60 @@ class DoukState(
     fun paramOrderFor(mode: CaptureMode): MutableList<String> =
         if (mode == CaptureMode.VIDEO) videoParamOrder else stillParamOrder
 
+    /**
+     * 相机现在到底是拍照还是视频：机身拨到视频档时，拍照那套参数会被机身停报，
+     * 视频那套才有值。按「哪一组参数真的在报」推断，推断不出就沿用界面上手动选的档。
+     */
+    val detectedVideoMode: Boolean?
+        get() {
+            if (!vm.isConnected) return null
+            fun reporting(v: String?): Boolean =
+                v != null && v.isNotBlank() && v != "—" && v != "相机未上报" && v != "读取中…"
+            val still = listOf("shutter", "aperture", "iso").count { reporting(valueOf(it)) }
+            val movie = listOf("movieShutter", "movieAperture", "movieIso").count { reporting(valueOf(it)) }
+            // 视频档独占的属性：只有机身真的拨到视频档时才有值。
+            // 拿它做主要判据，避免「拍照档也照样回报 movie 快门/光圈」造成的误判。
+            val movieOnly = listOf("movieFileType", "movieScreenSize", "movieQuality", "movieMic")
+                .count { reporting(vm.extraProps[it]?.value) }
+            return when {
+                movieOnly >= 3 -> true
+                movie >= 2 && still == 0 -> true
+                still >= 2 && movie == 0 && movieOnly == 0 -> false
+                else -> null
+            }
+        }
+
+    /**
+     * 用户在本机手动切过一次档之后，界面就以用户的选择为准，机身识别只做提示。
+     * 机身在录像档/拍照档之间拨动（detectedVideoMode 变化）时，由界面把 override 清掉重新跟随。
+     */
+    var modeManualOverride by mutableStateOf(false)
+        private set
+
+    fun selectMode(target: CaptureMode) {
+        modeManualOverride = true
+        if (mode != target) mode = target
+    }
+
+    /** 机身识别的档位变了：清掉手动覆盖，再跟随一次，之后仍允许用户自由切换 */
+    fun followDetectedMode(detected: Boolean) {
+        modeManualOverride = false
+        val target = if (detected) CaptureMode.VIDEO else CaptureMode.STILL
+        if (mode != target) mode = target
+    }
+
+    /** 界面显示用：手动选过就听手动，没选过才跟相机实际状态 */
+    val effectiveMode: CaptureMode
+        get() = if (!modeManualOverride) {
+            when (detectedVideoMode) {
+                true -> CaptureMode.VIDEO
+                false -> CaptureMode.STILL
+                null -> mode
+            }
+        } else {
+            mode
+        }
+
     fun isParamHidden(key: String): Boolean =
         key.startsWith("movie") && key in hiddenVideoParamKeys ||
             !key.startsWith("movie") && key in hiddenStillParamKeys
@@ -755,6 +830,8 @@ class DoukState(
         "movieAperture" -> vm.extraValue("movieAperture")
         "movieIso" -> vm.extraValue("movieIso")
         "movieEv" -> vm.extraValue("movieEv")
+        "isoAuto" -> vm.extraValue("isoAuto")
+        "isoAutoHigh" -> vm.extraValue("isoAutoHigh")
         "movieFileType", "movieScreenSize", "movieQuality", "movieFocusMode",
         "movieAfAreaMode", "movieIsoAuto", "movieIsoAutoHigh", "movieMic",
         "movieMicLevel", "movieWindNoise", "movieFlicker", "movieHighFreqFlicker",
@@ -796,6 +873,8 @@ class DoukState(
         "movieAperture" -> vm.extraOptions("movieAperture")
         "movieIso" -> vm.extraOptions("movieIso")
         "movieEv" -> vm.extraOptions("movieEv")
+        "isoAuto" -> vm.extraOptions("isoAuto")
+        "isoAutoHigh" -> vm.extraOptions("isoAutoHigh")
         "movieFileType", "movieScreenSize", "movieQuality", "movieFocusMode",
         "movieAfAreaMode", "movieIsoAuto", "movieIsoAutoHigh", "movieMic",
         "movieMicLevel", "movieWindNoise", "movieFlicker", "movieHighFreqFlicker",
@@ -837,6 +916,8 @@ class DoukState(
             "movieAperture" -> vm.extraProps["movieAperture"]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra("movieAperture", it) }
             "movieIso" -> vm.extraProps["movieIso"]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra("movieIso", it) }
             "movieEv" -> vm.extraProps["movieEv"]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra("movieEv", it) }
+            "isoAuto" -> vm.extraProps["isoAuto"]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra("isoAuto", it) }
+            "isoAutoHigh" -> vm.extraProps["isoAutoHigh"]?.options?.firstOrNull { it.label == value }?.let { vm.applyExtra("isoAutoHigh", it) }
             "movieFileType", "movieScreenSize", "movieQuality", "movieFocusMode",
             "movieAfAreaMode", "movieIsoAuto", "movieIsoAutoHigh", "movieMic",
             "movieMicLevel", "movieWindNoise", "movieFlicker", "movieHighFreqFlicker",
@@ -1000,7 +1081,11 @@ class DoukState(
      *
      * 探测只扫端口，不往「搜索到的设备」列表里塞东西。
      */
+    /** 未连接时的后台探测周期：5 秒一轮，够快又不至于让相机机和手机都一直醒着 */
+    private val deviceWatchdogMs = 5_000L
     private var autoConnectJob: Job? = null
+    /** 没连任何设备时的后台短扫：几秒一次，让「搜索到的设备」列表自己刷出来 */
+    private var deviceWatchdogJob: Job? = null
     private var autoReconnectObserver: Job? = null
     /** 连上相机后按设置预加载机身图库第一屏；避免用户打开图库时空白等待 */
     private var galleryPreloadObserver: Job? = null
@@ -1021,14 +1106,19 @@ class DoukState(
         if (autoConnectJob != null) return
         registerAutoConnectNetwork(context)
         autoConnectJob = ioScope.launch {
+            var failStreak = 0
             while (isActive) {
-                // 有 Wi-Fi 事件立即醒；没有就按设置间隔兜底一次（默认 20 秒）。
-                withTimeoutOrNull(DoukPrefs.autoReconnectSeconds * 1000L) { autoConnectSignal.receive() }
+                // 刚掉线时先快速重试三次（机身从休眠醒来往往就差这几秒），
+                // 连续失败再退回设置里的长间隔，避免一直空转耗电。
+                val wait = if (failStreak in 1..3) 4_000L
+                else DoukPrefs.autoReconnectSeconds * 1000L
+                withTimeoutOrNull(wait) { autoConnectSignal.receive() }
                 try {
                     autoConnectOnce(context)
                 } catch (e: Exception) {
                     DoukLog.w("Scan", "AUTO_LOOP_ERROR", "error" to (e.message ?: "unknown"))
                 }
+                failStreak = if (isConnected) 0 else (failStreak + 1).coerceAtMost(6)
             }
         }
         // 真掉线时不要等满 30 秒：会话从「已连接」变「未连接」，1.5 秒后立刻补连一次。
@@ -1043,6 +1133,45 @@ class DoukState(
                     autoConnectSignal.trySend(Unit)
                 }
                 wasConnected = connected
+            }
+        }
+        // 没有连接任何设备时，后台每 5 秒自己探一次（网关 + 历史 IP + 尼康默认地址），
+        // 相机一开机就能在「搜索到的设备」里出现，不用手点搜索。
+        // 已经连上（Wi‑Fi / USB / PTP 会话在）、正在连、蓝牙已就绪时一律跳过，避免多路互抢。
+        deviceWatchdogJob = ioScope.launch {
+            while (isActive) {
+                delay(deviceWatchdogMs)
+                if (isConnected || isConnecting || vm.ptpClient.hasConnection || usbConnected) continue
+                if (ble.phase.value == com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient.Phase.READY) continue
+                if (lanScanning) continue
+                if (connectMode == ConnectMode.BLUETOOTH) {
+                    // 蓝牙模式：只是把扫描轮起来（READY/CONNECTING 时 startScan 自己会忽略）
+                    if (ble.phase.value == com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient.Phase.IDLE) {
+                        withContext(Dispatchers.Main) { ble.startScan() }
+                    }
+                    continue
+                }
+                if (connectMode == ConnectMode.USB_PTP) continue
+                val known = DoukPrefs.knownDevices()
+                val hits = runCatching {
+                    CameraLanProbe.scan(
+                        context = context.applicationContext,
+                        timeoutMs = 320,
+                        preferred = CameraLanProbe.priorityTargets(context, known.map { it.ip })
+                    )
+                }.getOrNull() ?: emptyList()
+                withContext(Dispatchers.Main) {
+                    if (hits.isNotEmpty() && hits.map { it.ip } != lanFound.map { it.ip }) lanFound = hits
+                    if (hits.isEmpty() && lanFound.isNotEmpty()) lanFound = emptyList()
+                }
+                // 历史设备重新出现就顺手连上；用户刚手动断开（autoConnectPaused）时只列出来不连
+                if (autoConnectPaused) continue
+                val hit = hits.firstOrNull { h -> known.any { it.ip == h.ip } } ?: hits.singleOrNull() ?: continue
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastAutoConnectAttemptAt < DoukPrefs.autoReconnectSeconds * 1000L) continue
+                lastAutoConnectAttemptAt = nowMs
+                DoukLog.i("Scan", "WATCHDOG_CONNECT", "ip" to hit.ip, "via" to hit.iface)
+                withContext(Dispatchers.Main) { connectSafely(context, hit.ip, skipPreflight = true) }
             }
         }
         // 自动回传/保护文件导入落盘后让图库立刻重扫，不用退出再进来才看到新照片
@@ -1091,7 +1220,9 @@ class DoukState(
                 var lastScanAt = 0L
                 var round = 0
                 while (isActive && isConnected && DoukPrefs.lockedOnly && DoukPrefs.lockedAutoImport) {
-                    delay(2_000)
+                    // 取景中让路更久一点：实时取景本身就在占 PTP 通道，
+                    // 巡检没必要每 2 秒醒一次去确认「有没有新锁定文件」。
+                    delay(if (vm.ptpClient.isLiveViewActive.value) 5_000 else 3_000)
                     if (!isConnected) break
                     if (vm.isImportingLocked) continue
                     // 实时取景时让路，避免每次巡检都把取景打断
@@ -1203,6 +1334,8 @@ class DoukState(
         autoReconnectObserver = null
         galleryPreloadObserver?.cancel()
         galleryPreloadObserver = null
+        deviceWatchdogJob?.cancel()
+        deviceWatchdogJob = null
         bluetoothReadyObserver?.cancel()
         bluetoothReadyObserver = null
         autoNetworkCallback?.let { callback ->
@@ -1736,7 +1869,9 @@ class DoukState(
     // ===== 图库：相机内照片（PTP 读取） =====
     val cameraPhotos: List<CameraStorageFile> get() = vm.cameraStoragePhotos
 
-    fun loadCameraPhotos(count: Int = 4000) = vm.loadStoragePhotos(prepareTransfer = true, count = count)
+    // 枚举本身要遍历所有目录，成本与 count 无关；一次读满整表，图库才不会「显示不全」。
+    fun loadCameraPhotos(count: Int = 4000) =
+        vm.loadStoragePhotos(prepareTransfer = true, count = maxOf(count, 4000))
     /** 用户主动刷新时才强制重枚举；进图库复用会话内缓存 */
     fun refreshCameraPhotos() = vm.loadStoragePhotos(prepareTransfer = true, force = true)
     val cameraPhotosHasMore: Boolean get() = vm.storageHasMore

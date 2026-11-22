@@ -5,12 +5,27 @@ import java.io.File
 import kotlin.math.cbrt
 import kotlin.math.roundToInt
 
-/** 滤镜列表项：id 内置用名字，导入的用 res:<文件名>，category 来自设置里的滤镜分类。 */
+/**
+ * 滤镜 / LUT 列表项：
+ * - kind = LUT（.cube/.3dl/.look，通常做视频监看与还原）或 滤镜（尼康 Picture Control，做图片风格）
+ * - use  = 通用 / 图片 / 视频，决定它出现在图片编辑器还是监看 LUT 列表
+ */
 internal data class FilterEntry(
     val id: String,
     val label: String,
-    val category: String
-)
+    val category: String,
+    val kind: String = "LUT",
+    val use: String = "通用"
+) {
+    /** 图片编辑器（含颜色调整）能不能用 */
+    val forPhoto: Boolean get() = use != "视频"
+    /** 监看 / 视频还原能不能用 */
+    val forVideo: Boolean get() = use != "图片"
+}
+
+/** 资源页与分类页共用的两组标签。 */
+internal val RESOURCE_KINDS = listOf("LUT", "滤镜")
+internal val RESOURCE_USES = listOf("通用", "图片", "视频")
 
 /** 颜色 LUT，按 0..1 的三线性插值取色，供 .cube / .3dl / 尼康预设共用。 */
 internal class Lut3D(val size: Int, val data: FloatArray) {
@@ -105,7 +120,9 @@ internal object FilterLibrary {
             entries += FilterEntry(
                 id = id,
                 label = file.nameWithoutExtension,
-                category = DoukPrefs.filterCategory(file.name)
+                category = DoukPrefs.filterCategory(file.name),
+                kind = DoukPrefs.resourceKind(file.name),
+                use = DoukPrefs.resourceUse(file.name)
             )
         }
         return FilterLibraryResult(entries, FilterRuntime(luts))
@@ -125,13 +142,17 @@ internal object FilterLibrary {
             val line = raw.trim()
             if (line.isEmpty() || line.startsWith("#")) return@forEach
             if (line.startsWith("LUT_3D_SIZE")) {
-                size = line.substringAfter("LUT_3D_SIZE").trim().toIntOrNull() ?: 0
+                val numText = line.substringAfter("LUT_3D_SIZE").trim()
+                    .removePrefix("=").trim()
+                    .substringBefore(" ").substringBefore(",")
+                size = numText.toIntOrNull() ?: 0
                 return@forEach
             }
             if (line.startsWith("DOMAIN_") || line.startsWith("TITLE") ||
-                line.startsWith("LUT_1D") || line.contains("=")
+                line.startsWith("LUT_1D") || line.startsWith("LUT_3D_INPUT_RANGE") ||
+                line.startsWith("LUT_3D_OUTPUT_RANGE")
             ) return@forEach
-            val parts = line.split(Regex("\\s+"))
+            val parts = line.split(Regex("[,\\s]+")).filter { it.isNotEmpty() }
             if (parts.size >= 3) {
                 val r = parts[0].toFloatOrNull() ?: return@forEach
                 val g = parts[1].toFloatOrNull() ?: return@forEach
@@ -142,8 +163,10 @@ internal object FilterLibrary {
             }
         }
         if (size < 2 || size > 128) return null
-        if (values.size != size * size * size * 3) return null
-        return Lut3D(size, FloatArray(values.size) { values[it] })
+        val need = size * size * size * 3
+        // 有些导出工具会在文件尾部多写注释/空行或重复数据；这里只取前 need 个，少一个数才算坏
+        if (values.size < need) return null
+        return Lut3D(size, FloatArray(need) { values[it] })
     }
 
     /**
@@ -306,6 +329,8 @@ internal object BundledLuts {
             val target = File(dir, name)
             if (target.exists() && target.length() > 1024) {
                 if (DoukPrefs.filterCategory(name) == "未分类") DoukPrefs.setFilterCategory(name, CATEGORY)
+                DoukPrefs.setResourceKind(name, "LUT")
+                DoukPrefs.setResourceUse(name, "视频")
                 return@forEach
             }
             runCatching {
@@ -313,6 +338,8 @@ internal object BundledLuts {
                     target.outputStream().use { output -> input.copyTo(output) }
                 }
                 DoukPrefs.setFilterCategory(name, CATEGORY)
+                DoukPrefs.setResourceKind(name, "LUT")
+                DoukPrefs.setResourceUse(name, "视频")
                 com.lutcamera.lutcamerapro.log.DoukLog.i(
                     "Lut", "BUNDLED_INSTALL", "file" to name, "bytes" to target.length()
                 )

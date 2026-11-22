@@ -3,9 +3,18 @@
 package com.lutcamera.lutcamerapro.ui.douk
 
 import android.app.Activity
+import android.Manifest
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.compose.runtime.mutableFloatStateOf
 import com.lutcamera.lutcamerapro.log.DoukLog
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -85,6 +94,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -96,6 +106,8 @@ import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -117,6 +129,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -140,7 +153,23 @@ private data class FrameAnalysis(
 fun MonitorFullscreen(state: DoukState) {
     val wifiBmp by state.vm.liveViewBitmap.collectAsStateWithLifecycle()
     val usbBmp by state.usb.ptp.liveViewBitmap.collectAsStateWithLifecycle()
-    val frame = if (state.usbConnected) usbBmp else wifiBmp
+    // 模拟相机：真机不在时用合成画面顶替取景，只用于本地验收监看功能
+    var mockBmp by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(MockCamera.active) {
+        if (!MockCamera.active) {
+            mockBmp = null
+            return@LaunchedEffect
+        }
+        while (isActive) {
+            mockBmp = MockCamera.render(android.os.SystemClock.uptimeMillis())
+            delay(MockCamera.frameIntervalMs())
+        }
+    }
+    val frame = when {
+        MockCamera.active -> mockBmp
+        state.usbConnected -> usbBmp
+        else -> wifiBmp
+    }
 
     val view = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -191,6 +220,8 @@ fun MonitorFullscreen(state: DoukState) {
     var lutEntries by remember { mutableStateOf<List<FilterEntry>>(emptyList()) }
     var lutRuntime by remember { mutableStateOf<FilterRuntime?>(null) }
     var lutLoading by remember { mutableStateOf(false) }
+    var lutReload by remember { mutableIntStateOf(0) }
+    var lutBrokenIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var lutFrame by remember { mutableStateOf<ImageBitmap?>(null) }
     var analysis by remember { mutableStateOf(FrameAnalysis()) }
     var viewRotation by remember { mutableIntStateOf(0) }
@@ -214,6 +245,7 @@ fun MonitorFullscreen(state: DoukState) {
     }
     var railConfigOpen by remember { mutableStateOf(false) }
     var paramToast by remember { mutableStateOf<String?>(null) }
+    val uiScope = rememberCoroutineScope()
 
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -273,42 +305,72 @@ fun MonitorFullscreen(state: DoukState) {
         }
     }
 
-    // LUT 只在打开监视或选中时才解析，避免每次进全屏都读一遍磁盘
-    LaunchedEffect(deck, lutOn, lutId) {
-        if ((deck == MonitorDeck.TOOLS || lutOn) && lutRuntime == null && !lutLoading) {
+    // LUT 只在打开监看工具或打开 LUT 时解析；每次打开都重读，资源页刚导入的文件立刻可见
+    LaunchedEffect(deck, lutOn, lutReload) {
+        if ((deck == MonitorDeck.TOOLS || lutOn) && !lutLoading) {
             lutLoading = true
             val loaded = withContext(Dispatchers.IO) { runCatching { FilterLibrary.load(context) }.getOrNull() }
-            lutEntries = loaded?.entries ?: emptyList()
-            lutRuntime = loaded?.runtime
+            val runtime = loaded?.runtime
+            val parsedIds = runtime?.luts?.keys ?: emptySet()
+            // 不再按资源页标签过滤（以前 kind!="LUT" 就整条消失），改成扫目录里所有 LUT 后缀文件：
+            // 能解析的直接可用，解析不了的也列出来并标「解析失败」，避免用户看到空列表。
+            val extSet = setOf("cube", "3dl", "look", "np3", "ncp", "np2")
+            val files = withContext(Dispatchers.IO) { DoukPrefs.importedResources(context) }
+                .filter { it.extension.lowercase() in extSet }
+            val broken = HashSet<String>()
+            lutEntries = files.map { file ->
+                val id = "res:${file.name}"
+                val ok = id in parsedIds
+                if (!ok) broken += id
+                FilterEntry(
+                    id = id,
+                    label = file.nameWithoutExtension + if (ok) "" else "（解析失败）",
+                    category = DoukPrefs.filterCategory(file.name),
+                    kind = DoukPrefs.resourceKind(file.name),
+                    use = DoukPrefs.resourceUse(file.name)
+                )
+            }
+            lutBrokenIds = broken
+            lutRuntime = runtime
             lutLoading = false
+            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                "Mon", "LUT_SCAN",
+                "files" to (loaded?.entries?.size ?: 0).toString(),
+                "parsed" to parsedIds.size.toString()
+            )
         }
     }
 
     // 直方图 / 波形 / LUT 预览：统一在 IO 线程低频计算，不跟着 30fps 取景帧跑
+    var lastAnalyzedFrame: Bitmap? = null
     LaunchedEffect(Unit) {
         while (isActive) {
-            val bmp = latestFrame?.asImageBitmap()
+            val frameBmp = latestFrame
+            val bmp = frameBmp?.asImageBitmap()
             val selectedLutId = lutId
             val anyOn = histOn || waveOn || (lutOn && selectedLutId != null)
-            if (bmp != null && anyOn) {
+            // 同一帧不重复算：30fps 取景时缓存命中能省掉绝大部分 CPU/GPU 开销，
+            // 也是监看不烫手、不掉电的关键之一。
+            val sameFrame = frameBmp != null && frameBmp === lastAnalyzedFrame
+            if (bmp != null && anyOn && !sameFrame) {
+                lastAnalyzedFrame = frameBmp
                 val result = withContext(Dispatchers.IO) { analyzeFrame(bmp, histOn, waveOn) }
                 analysis = result
+                var processed: ImageBitmap? = null
                 if (lutOn && selectedLutId != null) {
                     val lut = lutRuntime?.lut(selectedLutId)
-                    if (lut != null) {
-                        lutFrame = withContext(Dispatchers.IO) { renderLut(bmp, lut) }
-                    }
-                } else {
-                    lutFrame = null
+                    if (lut != null) processed = withContext(Dispatchers.IO) { renderLut(bmp, lut) }
                 }
+                lutFrame = processed
             } else if (!anyOn) {
+                lastAnalyzedFrame = null
                 analysis = FrameAnalysis()
                 lutFrame = null
             }
             delay(
                 when {
-                    // 预览 LUT 和直方图都降频：全尺寸帧每 100ms 复制/缩放一次会制造 GC 峰值，
-                    // 画面看起来仍是实时刷新，但计算不再和 30fps 取景抢主线程。
+                    // 预览 LUT 降频：全尺寸帧每 100ms 复制一次会制造 GC 峰值，
+                    // 画面看起来仍是实时刷新，但计算不再和取景帧抢 CPU。
                     lutOn && selectedLutId != null -> 200L
                     anyOn -> 150L
                     // 没开任何监看叠加时低频空转，避免无意义地唤醒线程耗电
@@ -379,7 +441,7 @@ fun MonitorFullscreen(state: DoukState) {
                         }
                 ) {
                     val processed = lutFrame
-                    val shown: ImageBitmap = if (lutOn && processed != null) processed else source
+                    val shown: ImageBitmap = processed ?: source
                     Image(
                         bitmap = shown,
                         contentDescription = "相机实时取景全屏",
@@ -524,7 +586,8 @@ fun MonitorFullscreen(state: DoukState) {
             }
 
             // 曝光参数与自定义按钮分到左右两栏：中间整块留给取景画面
-            val video = state.mode == CaptureMode.VIDEO
+            // 档位优先跟相机实际状态（机身拨到视频档时自动切过来），不让界面一直停在「拍照」
+            val video = state.effectiveMode == CaptureMode.VIDEO
             fun expValue(still: String, movie: String): String {
                 val m = state.valueOf(movie)
                 if (video && m.isNotBlank() && m != "—" && m != "相机未上报") return m
@@ -605,11 +668,10 @@ fun MonitorFullscreen(state: DoukState) {
                         )
                     }
                     Spacer(Modifier.weight(1f))
-                    Text(
-                        if (video) "视频" else "拍照",
-                        color = if (video) Color(0xFFFF8A8A) else Color(0xFFC9FFA8),
-                        fontSize = 10.sp
-                    )
+                    // 左下角档位胶囊：点一下就在拍摄/视频之间切换，工具与参数面板跟着换
+                    MonitorModePill(video = video, compact = true, onToggle = {
+                        state.selectMode(if (video) CaptureMode.STILL else CaptureMode.VIDEO)
+                    })
                 }
 
                 // 右栏：功能一行一个，快门放在剩余空间正中，互不遮挡
@@ -930,6 +992,7 @@ fun MonitorFullscreen(state: DoukState) {
                         MonitorTool("视频减震", Icons.Rounded.Speed, false, anchorAware = { pickerAnchor = it; pickerKey = "movieVr" })
                         MonitorTool("曝光补偿", Icons.Rounded.Exposure, false, anchorAware = { pickerAnchor = it; pickerKey = "movieEv" })
                     } else {
+                        MonitorTool("ISO 自动", Icons.Rounded.Tune, state.valueOf("isoAuto").contains("开"), anchorAware = { pickerAnchor = it; pickerKey = "isoAuto" })
                         MonitorTool("测光", Icons.Rounded.LightMode, false, anchorAware = { pickerAnchor = it; pickerKey = "metering" })
                         MonitorTool("对焦", Icons.Rounded.CenterFocusStrong, false, anchorAware = { pickerAnchor = it; pickerKey = "focusMode" })
                         MonitorTool("AF 区域", Icons.Rounded.CropFree, false, anchorAware = { pickerAnchor = it; pickerKey = "afAreaMode" })
@@ -956,39 +1019,72 @@ fun MonitorFullscreen(state: DoukState) {
                 }
             }
 
-            // LUT 资源选择：贴着工具面板上方，按导入顺序列出
-            if (toolSheetVisible && lutOn) {
+            // LUT 资源选择：只要 LUT 是开着的就显示，不依赖工具面板是否展开
+            // （以前必须「监看工具面板 + LUT 打开」两个条件同时成立，面板一收起列表就消失，
+            //  看着就像 LUT 文件没显示出来）
+            if (lutOn) {
                 Column(
                     modifier = Modifier
                         .align(if (landscape) Alignment.CenterEnd else Alignment.BottomCenter)
                         .then(
                             if (landscape) Modifier.padding(end = railRightWidth + 372.dp)
-                            else Modifier.padding(bottom = 360.dp)
+                            // 工具面板展开时往上让开，收起时贴着底栏上沿
+                            else Modifier.padding(bottom = if (toolSheetVisible) 360.dp else 112.dp)
                         )
                         .widthIn(max = if (landscape) 420.dp else 360.dp)
                         .clip(RoundedCornerShape(22.dp))
                         .background(Color(0xF217181B))
-                        .padding(10.dp)
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        if (lutLoading) "正在读取 LUT…" else if (lutEntries.isEmpty()) "设置 → 资源导入里还没有 LUT" else "选择 LUT",
-                        color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
-                    )
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        item {
-                            LutChip("无", lutId == null) {
-                                lutId = null
-                                lutOn = false
+                    if (lutOn) {
+                        Column {
+                            Text(
+                                when {
+                                    lutLoading -> "正在读取 LUT…"
+                                    lutEntries.isEmpty() -> "没扫描到 LUT 文件：设置 → 资源 里导入 .cube / .3dl / .NP3 即可，不用改标签"
+                                    else -> "LUT（${lutEntries.size} 个）· 点此重新扫描"
+                                },
+                                color = Color.White.copy(alpha = 0.7f),
+                                fontSize = 11.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { lutReload++ }
+                                    .padding(horizontal = 6.dp, vertical = 6.dp)
+                            )
+                            // 用户要求：LUT 列表改为从上往下排，不再左右横滑
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = if (landscape) 300.dp else 240.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                item(key = "none") {
+                                    LutRow("无（不使用 LUT）", lutId == null) {
+                                        lutId = null
+                                        lutOn = false
+                                    }
+                                }
+                                items(
+                                    lutEntries,
+                                    key = { it.id },
+                                    contentType = { "lut-row" }
+                                ) { entry ->
+                                    LutRow(entry.label, lutId == entry.id) {
+                                        if (entry.id in lutBrokenIds) {
+                                            val hint = "「${entry.label}」解析失败：需要标准 3D .cube（有 LUT_3D_SIZE，且数值条数 = size³）。1D LUT 暂时不支持。"
+                                            paramToast = hint
+                                            uiScope.launch {
+                                                delay(3600)
+                                                if (paramToast == hint) paramToast = null
+                                            }
+                                        } else {
+                                            lutId = entry.id
+                                            lutOn = true
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        items(
-                            lutEntries,
-                            key = { it.id },
-                            contentType = { "lut-chip" }
-                        ) { entry ->
-                            LutChip(entry.label, lutId == entry.id) { lutId = entry.id }
                         }
                     }
                 }
@@ -1126,6 +1222,21 @@ fun MonitorFullscreen(state: DoukState) {
                 }
             }
 
+            // 竖屏左下角档位胶囊：与横屏左栏底部同一个开关
+            if (!landscape) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .navigationBarsPadding()
+                        .padding(start = 14.dp, bottom = DoukSpace.xl)
+                ) {
+                    // 只显示当前这一档（视频 / 拍摄），点一下切到另一档
+                    MonitorModePill(video = video, compact = true, onToggle = {
+                        state.selectMode(if (video) CaptureMode.STILL else CaptureMode.VIDEO)
+                    })
+                }
+            }
+
             // 竖屏兜底快门：横屏时快门固定在右栏垂直中心
             if (!landscape) {
                 Box(
@@ -1144,7 +1255,7 @@ fun MonitorFullscreen(state: DoukState) {
                             .fillMaxSize()
                             .clip(CircleShape)
                             .background(
-                                if (state.mode == CaptureMode.VIDEO) Color(0xFFE5484D)
+                                if (state.effectiveMode == CaptureMode.VIDEO) Color(0xFFE5484D)
                                 else DoukColors.accent
                             )
                             .clickable { state.shoot() }
@@ -1506,17 +1617,84 @@ private fun RailChip(label: String, active: Boolean, onClick: () -> Unit) {
     )
 }
 
+/**
+ * 档位胶囊「视频 | 拍摄」：显示当前档，点一下就切到另一档。
+ * 只影响本机界面与快门行为，不改机身拨盘；机身拨档后这里会自动跟着变。
+ */
 @Composable
-private fun LutChip(label: String, active: Boolean, onClick: () -> Unit) {    Text(
-        label,
-        color = if (active) Color(0xFFC9FFA8) else Color.White.copy(alpha = 0.85f),
-        fontSize = 11.sp,
+private fun MonitorModePill(video: Boolean, compact: Boolean = false, onToggle: () -> Unit) {
+    // 横屏左栏只有几十 dp 宽，两段式会被挤成竖排，这里退化成单段开关
+    if (compact) {
+        Text(
+            text = if (video) "视频" else "拍摄",
+            color = if (video) Color(0xFFFF8A8A) else Color(0xFFC9FFA8),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(if (video) Color(0xFF3A2226) else Color(0xFF2F3F2C))
+                .clickable { onToggle() }
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+        )
+        return
+    }
+    Row(
         modifier = Modifier
             .clip(RoundedCornerShape(50))
-            .background(if (active) Color(0xFF3A4A38) else Color.White.copy(alpha = 0.09f))
+            .background(Color(0xCC0E0F12))
+            .border(1.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(50))
+            .clickable { onToggle() }
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "视频",
+            color = if (video) Color(0xFFFF8A8A) else Color.White.copy(alpha = 0.58f),
+            fontSize = 11.sp,
+            fontWeight = if (video) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(if (video) Color(0xFF3A2226) else Color.Transparent)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+        Text(
+            "拍摄",
+            color = if (!video) Color(0xFFC9FFA8) else Color.White.copy(alpha = 0.58f),
+            fontSize = 11.sp,
+            fontWeight = if (!video) FontWeight.SemiBold else FontWeight.Normal,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(if (!video) Color(0xFF2F3F2C) else Color.Transparent)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun LutRow(label: String, active: Boolean, onClick: () -> Unit) {
+    // 竖排一行：整行可点，当前生效的右侧打勾并高亮
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (active) Color(0xFF2F3F2C) else Color.White.copy(alpha = 0.07f))
             .clickable { onClick() }
-            .padding(horizontal = 12.dp, vertical = 7.dp)
-    )
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            color = if (active) Color(0xFFC9FFA8) else Color.White.copy(alpha = 0.86f),
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        if (active) {
+            Text("●", color = Color(0xFFC9FFA8), fontSize = 12.sp)
+        }
+    }
 }
 
 @Composable
@@ -1561,21 +1739,40 @@ private fun HistogramPanel(analysis: FrameAnalysis, modifier: Modifier = Modifie
 
 @Composable
 private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
     val mic = state.valueOf("movieMic")
     val level = state.valueOf("movieMicLevel")
     val wind = state.valueOf("movieWindNoise")
-    // 相机没有实时音频电平通道；这里按「麦克风档位 / 录音电平」换算成 L/R 两条声道柱，
-    // 让用户至少能看到机身收音的左右声道状态，而不是一行冷冰冰的「未上报」。
-    val numeric = Regex("\\d+").find(level)?.value?.toIntOrNull()
-    val gain = when {
-        !state.isConnected -> 0f
-        level.contains("高") -> 0.82f
-        level.contains("中") -> 0.58f
-        level.contains("低") -> 0.34f
-        numeric != null -> (0.28f + numeric * 0.12f).coerceIn(0.25f, 0.85f)
-        else -> 0.46f
+
+    // 每次组合都真查一次权限：用户可能刚在系统设置里授权、或在别的页面点过允许，
+    // 以前只在 remember 里查一次，界面会一直停在「未授权」，看着就像电平坏了。
+    var granted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+        )
     }
-    val stereo = !mic.contains("单声道")
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val askPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { ok -> granted = ok }
+    val micLevel = rememberMicLevel(granted)
+    val db = micLevel.db
+    val peakDb = micLevel.peak
+    val gain = ((db + 60f) / 60f).coerceIn(0f, 1f)
+
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(18.dp))
@@ -1585,45 +1782,149 @@ private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("相机声道", color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp)
+            Text("手机麦克风 · 实测", color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp)
             Spacer(Modifier.weight(1f))
             Box(
                 Modifier
                     .size(6.dp)
                     .clip(CircleShape)
-                    .background(if (state.isConnected) Color(0xFF9BFF6A) else Color.White.copy(alpha = 0.3f))
+                    .background(if (granted) Color(0xFF9BFF6A) else Color.White.copy(alpha = 0.3f))
             )
             Spacer(Modifier.width(5.dp))
-            Text(if (state.isConnected) "收音中" else "未连接", color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp)
+            Text(
+                if (granted) "拾音中" else "未授权",
+                color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp
+            )
         }
-        ChannelMeter("L", if (stereo) gain else gain * 0.94f)
-        ChannelMeter("R", if (stereo) gain * 0.94f else 0f)
-        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text("-40", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-            Spacer(Modifier.weight(1f))
-            Text("-20", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-            Spacer(Modifier.weight(1f))
-            Text("-12", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-            Spacer(Modifier.weight(1f))
-            Text("-6", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-            Spacer(Modifier.weight(1f))
-            Text("0 dB", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+
+        if (granted) {
+            ChannelMeter("MIC", gain)
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("-40", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                Spacer(Modifier.weight(1f))
+                Text("-20", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                Spacer(Modifier.weight(1f))
+                Text("-12", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                Spacer(Modifier.weight(1f))
+                Text("-6", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                Spacer(Modifier.weight(1f))
+                Text("0 dB", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+            }
+            Text(
+                if (db <= -59f) "环境声很安静（−60 dB 以下）"
+                else "当前 %.0f dB · 峰值 %.0f dB".format(db, peakDb),
+                color = Color.White.copy(alpha = 0.75f), fontSize = 10.sp
+            )
+        } else {
+            Text(
+                "点下面开启，手机麦克风会被用来测音量（不录音、不保存）",
+                color = Color.White.copy(alpha = 0.7f), fontSize = 9.sp, maxLines = 2
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "开启麦克风电平",
+                color = Color(0xFF9BFF6A), fontSize = 11.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(percent = 50))
+                    .background(Color.White.copy(alpha = 0.08f))
+                    .clickable { askPermission.launch(Manifest.permission.RECORD_AUDIO) }
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            )
         }
+
+        val bodyAudio = listOf(mic, level, wind).any { it.isNotBlank() && it != "—" && it != "相机未上报" }
         Text(
-            "麦克风 ${mic.ifBlank { "—" }} · 电平 ${level.ifBlank { "—" }} · 风噪 ${wind.ifBlank { "—" }}",
-            color = Color.White.copy(alpha = 0.5f), fontSize = 9.sp, maxLines = 1
+            if (bodyAudio) "机身：麦克风 ${mic.ifBlank { "—" }} · ${level.ifBlank { "电平 —" }} · 风噪 ${wind.ifBlank { "—" }}"
+            else "机身音频：Wi-Fi 直播只传画面，不传声音（录像会写进文件）",
+            color = Color.White.copy(alpha = 0.5f), fontSize = 9.sp, maxLines = 2
         )
         Text(
-            "PTP 无实时电平，柱高按收音档位估算",
-            color = Color.White.copy(alpha = 0.5f), fontSize = 8.5.sp, maxLines = 2
+            "尼康 Wi-Fi 只传取景画面，不传实时音频；相机的声音随录像写进文件，这里用手机麦克风做现场电平参考",
+            color = Color.White.copy(alpha = 0.5f), fontSize = 8.5.sp, maxLines = 3
         )
     }
+}
+
+/** 麦克风电平的实时值 + 峰值，两者都是真实的 AudioRecord 采样结果。 */
+private class MicLevel {
+    var db by mutableFloatStateOf(-60f)
+    var peak by mutableFloatStateOf(-60f)
+}
+
+/**
+ * 手机麦克风电平（dBFS）：只在面板可见时开 AudioRecord，面板关掉就停，
+ * 避免一直占着麦克风（既费电也会和系统录音抢设备）。
+ * 只取幅度做电平，不做任何录音落盘。
+ */
+@Composable
+private fun rememberMicLevel(granted: Boolean): MicLevel {
+    val level = remember { MicLevel() }
+    val owner = LocalLifecycleOwner.current
+    LaunchedEffect(granted, owner) {
+        if (!granted) {
+            level.db = -60f
+            level.peak = -60f
+            return@LaunchedEffect
+        }
+        var record: AudioRecord? = null
+        try {
+            val minBuf = AudioRecord.getMinBufferSize(
+                48000,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(2048)
+            record = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                48000,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf * 2
+            )
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                level.db = -60f
+                return@LaunchedEffect
+            }
+            record.startRecording()
+            val buf = ShortArray(1024)
+            var smooth = -60f
+            var peak = -60f
+            while (isActive) {
+                val n = record.read(buf, 0, buf.size)
+                if (n <= 0) {
+                    delay(60)
+                    continue
+                }
+                var sum = 0.0
+                for (i in 0 until n) {
+                    val v = buf[i] / 32768.0
+                    sum += v * v
+                }
+                val rms = kotlin.math.sqrt(sum / n)
+                val cur = if (rms <= 1.0e-6) -60f
+                else (20.0 * kotlin.math.log10(rms)).toFloat().coerceIn(-60f, 0f)
+                // 快速上升、慢速回落，柱状条不会闪
+                smooth = max(cur, smooth - 4f)
+                // 峰值保持后缓慢回落，方便看刚才那一下到底多大
+                peak = max(cur, peak - 0.8f)
+                level.db = smooth
+                level.peak = peak
+                delay(50)
+            }
+        } catch (_: Throwable) {
+            level.db = -60f
+            level.peak = -60f
+        } finally {
+            runCatching { record?.stop() }
+            runCatching { record?.release() }
+        }
+    }
+    return level
 }
 
 @Composable
 private fun ChannelMeter(label: String, level: Float) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp, modifier = Modifier.width(12.dp))
+        Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 9.sp, modifier = Modifier.width(24.dp))
         Canvas(
             modifier = Modifier
                 .weight(1f)
@@ -1634,11 +1935,14 @@ private fun ChannelMeter(label: String, level: Float) {
             val segW = (size.width - gap * (segments - 1)) / segments
             val active = (level.coerceIn(0f, 1f) * segments).toInt()
             for (i in 0 until segments) {
+                // 以前这里把红/黄段无条件画出来，电平一直是满的，看着像「假数据」；
+                // 现在只有真正被点亮的格子才上色，其余保持暗格。
+                val lit = i < active
                 val color = when {
+                    !lit -> Color.White.copy(alpha = 0.10f)
                     i >= segments - 3 -> Color(0xFFE5484D)
                     i >= segments - 7 -> Color(0xFFFFC44D)
-                    i < active -> Color(0xFF9BFF6A)
-                    else -> Color.White.copy(alpha = 0.10f)
+                    else -> Color(0xFF9BFF6A)
                 }
                 drawRect(
                     color = color,
@@ -1813,22 +2117,30 @@ private fun analyzeFrame(src: ImageBitmap, hist: Boolean, wave: Boolean): FrameA
 
 private fun renderLut(src: ImageBitmap, lut: Lut3D): ImageBitmap? = runCatching {
     val android = src.asAndroidBitmap()
-    val maxW = 420
+    // 以前是 420px + 64 级最近邻查表，灰片还原出来糊、还有色阶断层；
+    // 现在按原 LUT 做真三线性插值（Lut3D.map），并把预览尺寸提到 640px，
+    // 监看能看出真实的还原效果，而不是一块发灰的糊图。
+    val maxW = 640
     val scale = min(1f, maxW.toFloat() / android.width)
     val w = max(1, ceil(android.width * scale).toInt())
     val h = max(1, ceil(android.height * scale).toInt())
     val small = if (android.width == w && android.height == h) android else Bitmap.createScaledBitmap(android, w, h, true)
     val pixels = IntArray(w * h)
     small.getPixels(pixels, 0, w, 0, 0, w, h)
-    val table = lut.previewRgb()
+    val out = FloatArray(3)
     for (i in pixels.indices) {
         val c = pixels[i]
         val a = c ushr 24
-        val r6 = (AndroidColor.red(c) shr 2) and 63
-        val g6 = (AndroidColor.green(c) shr 2) and 63
-        val b6 = (AndroidColor.blue(c) shr 2) and 63
-        val rgb = table[(r6 shl 12) or (g6 shl 6) or b6]
-        pixels[i] = (a shl 24) or rgb
+        lut.map(
+            AndroidColor.red(c) / 255f,
+            AndroidColor.green(c) / 255f,
+            AndroidColor.blue(c) / 255f,
+            out
+        )
+        val r = (out[0].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+        val g = (out[1].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+        val b = (out[2].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+        pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
     }
     Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
 }.getOrNull()

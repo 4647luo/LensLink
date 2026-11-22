@@ -250,6 +250,7 @@ fun DeviceScreen(
                     Spacer(modifier = Modifier.height(DoukSpace.lg))
                     PrimaryButton(text = "添加设备", icon = Icons.Rounded.Add, onClick = onAddDevice)
                 }
+                // 之前这里挂了一个「模拟相机（测试监看）」的入口，正式版不需要，去掉
 
                 // 连接过的设备：只有这次搜索真的搜到了这台（IP 对上）才列出来；
                 // 搜不到就什么都不显示，等于回到原本的界面

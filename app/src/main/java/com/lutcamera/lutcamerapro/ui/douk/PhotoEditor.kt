@@ -65,12 +65,15 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Undo
 import androidx.compose.material.icons.rounded.Wallpaper
 import androidx.compose.material.icons.rounded.WbSunny
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -291,6 +294,49 @@ internal fun PhotoEditorScreen(
     var highQualityPreview by remember { mutableStateOf(true) }
     var fastBase by remember { mutableStateOf<Bitmap?>(null) }
     var hdBase by remember { mutableStateOf<Bitmap?>(null) }
+
+    // ---- 编辑源格式：同一张照片可能同时有 JPG / HEIC / RAW，先选再编辑 ----
+    val availableFormats = remember(item.stableKey) {
+        val seen = LinkedHashSet<String>()
+        item.formats.forEach { f ->
+            val u = f.uppercase()
+            if (u.isNotBlank()) seen.add(if (u == "JPG") "JPG" else u)
+        }
+        if (seen.isEmpty()) {
+            item.fileName.substringAfterLast('.', "JPG").uppercase().let { seen.add(it) }
+        }
+        seen.toList()
+    }
+    val rawExts = setOf("NEF", "DNG", "NRW", "CR2", "CR3", "ARW", "RAF", "ORF", "RW2")
+    var srcFormat by remember(item.stableKey) {
+        val preferred = DoukPrefs.defaultEditFormat.takeIf { it.isNotBlank() }
+            ?.let { want ->
+                availableFormats.firstOrNull { it.equals(want, ignoreCase = true) }
+                    ?: if (want == "RAW") availableFormats.firstOrNull { it in rawExts } else null
+            }
+        mutableStateOf(
+            preferred
+                // 没设默认时：RAW 在编辑里只能拿内嵌预览，色彩不如 JPG，先给非 RAW
+                ?: availableFormats.firstOrNull { it !in rawExts }
+                ?: availableFormats.first()
+        )
+    }
+    var editSource by remember(item.stableKey) { mutableStateOf(source) }
+    // 同一张同时有 JPG 和 RAW、且设置里没指定默认格式时，进编辑先问一句用哪种
+    var showSourceSheet by remember(item.stableKey) {
+        mutableStateOf(availableFormats.size > 1 && DoukPrefs.defaultEditFormat.isBlank())
+    }
+
+    // ---- 导出设置：格式 / 质量 / HDR ----
+    var showExportSheet by remember { mutableStateOf(false) }
+    // 设置里给了默认导出格式就不必每次问；没给才在面板里选
+    val fixedExportFormat = DoukPrefs.defaultExportFormat.takeIf { it.isNotBlank() }
+    var exportFormat by remember(item.stableKey) {
+        mutableStateOf(fixedExportFormat ?: DoukPrefs.editorFormat)
+    }
+    var exportQuality by remember { mutableIntStateOf(DoukPrefs.editorQuality) }
+    // RAW 编辑出来的结果默认就带 HDR 效果（用户要求 RAW 导出直接是 HDR）
+    var exportHdr by remember(item.stableKey) { mutableStateOf(srcFormat in rawExts) }
     val showGrid = remember { DoukPrefs.editorGrid }
     val canCompare = remember { DoukPrefs.editorCompare }
     val previewSide = remember { DoukPrefs.editorPreview }
@@ -335,9 +381,23 @@ internal fun PhotoEditorScreen(
         }
     }
 
+    // 切换编辑源格式：从同一张照片的 JPG / HEIC / RAW 里换一张底座
+    LaunchedEffect(item.stableKey, srcFormat) {
+        val file = withContext(Dispatchers.IO) { resolveSourceFile(item, srcFormat) }
+        if (file == null) return@LaunchedEffect
+        val loaded = withContext(Dispatchers.IO) {
+            if (ImageDecode.isRawFile(file.name)) {
+                ImageDecode.extractEmbeddedPreview(file, 4096)
+            } else {
+                ImageDecode.decodeFile(file, 4096)
+            }
+        } ?: return@LaunchedEffect
+        if (loaded.asAndroidBitmap() !== editSource?.asAndroidBitmap()) editSource = loaded
+    }
+
     // 预览底座只缩一次：快速档与高清档各缓存一张，拖动时不再从原图重复缩放
-    LaunchedEffect(item.stableKey, source, previewSide) {
-        val bmp = source?.asAndroidBitmap()
+    LaunchedEffect(item.stableKey, editSource, previewSide) {
+        val bmp = editSource?.asAndroidBitmap()
         if (bmp != null) {
             val pair = withContext(Dispatchers.IO) {
                 scaleToMax(bmp, FAST_PREVIEW_SIDE) to scaleToMax(bmp, previewSide)
@@ -348,8 +408,8 @@ internal fun PhotoEditorScreen(
     }
 
     // 滤镜：读取资源页导入的 LUT / 尼康预设，生成缩略图
-    LaunchedEffect(item.stableKey, source) {
-        val bmp = source?.asAndroidBitmap()
+    LaunchedEffect(item.stableKey, editSource) {
+        val bmp = editSource?.asAndroidBitmap()
         val library = withContext(Dispatchers.IO) { FilterLibrary.load(context) }
         filterRuntime = library.runtime
         filterEntries = FILTERS.map { FilterEntry(it, it, "自带") } + library.entries
@@ -463,21 +523,22 @@ internal fun PhotoEditorScreen(
                     "重做",
                     enabled = undoIndex < undoStack.lastIndex
                 ) { redo() }
+                if (availableFormats.size > 1) {
+                    Box(
+                        modifier = Modifier
+                            .doukFlatSurface(RoundedCornerShape(percent = 50))
+                            .clickable { showSourceSheet = true }
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(srcFormat, fontSize = 12.sp, color = Color(0xFF222222))
+                    }
+                }
                 Spacer(modifier = Modifier.weight(1f))
                 Box(
                     modifier = Modifier
-                        .doukCardSurface(RoundedCornerShape(percent = 50))
-                        .clickable(enabled = !saving && source != null) {
-                            saving = true
-                            scope.launch {
-                                val result = withContext(Dispatchers.IO) { saveEdited(context, item, state, filterRuntime) }
-                                saving = false
-                                result.onSuccess { name ->
-                                    onSaved(name)
-                                }.onFailure {
-                                    message = it.message ?: "保存失败"
-                                }
-                            }
+                        .doukFlatSurface(RoundedCornerShape(percent = 50))
+                        .clickable(enabled = !saving && editSource != null) {
+                            showExportSheet = true
                         }
                         .padding(horizontal = 22.dp, vertical = 11.dp)
                 ) {
@@ -513,7 +574,7 @@ internal fun PhotoEditorScreen(
                                 .width(drawW)
                                 .height(drawH)
                                 .then(
-                                    if (canCompare && source != null && !state.cropFree)
+                                    if (canCompare && editSource != null && !state.cropFree)
                                         Modifier.pointerInput(item.stableKey) {
                                             detectTapGestures(onPress = {
                                                 comparePressed = true
@@ -524,7 +585,7 @@ internal fun PhotoEditorScreen(
                                 )
                         ) {
                             Image(
-                                bitmap = if (comparePressed && source != null) source else shown,
+                                bitmap = if (comparePressed) (editSource ?: shown) else shown,
                                 contentDescription = "编辑预览",
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier.fillMaxSize()
@@ -654,7 +715,9 @@ internal fun PhotoEditorScreen(
                         }
                     }
                     else -> {
-                        val shown = filterEntries.filter { it.category == filterCategory }
+                        // 图片编辑器只显示标为「仅图片」或「图片 + 视频」的资源，
+                        // 资源页里标成「仅视频」的还原 LUT 不会出现在这里
+                        val shown = filterEntries.filter { it.category == filterCategory && it.forPhoto }
                         SliderRow(
                             state = state.copy(filterAmount = state.filterAmount),
                             tab = "滤镜强度",
@@ -697,8 +760,181 @@ internal fun PhotoEditorScreen(
                         .padding(horizontal = 12.dp, vertical = 8.dp)
                 )
             }
+
+            if (showSourceSheet) {
+                AlertDialog(
+                    onDismissRequest = { showSourceSheet = false },
+                    containerColor = Color.White,
+                    title = { Text("用哪种格式编辑", fontSize = 15.sp, fontWeight = FontWeight.SemiBold) },
+                    text = {
+                        Column {
+                            availableFormats.forEach { f ->
+                                val isRaw = f == "NEF" || f == "DNG" || f == "CR2" || f == "ARW" || f == "RAF"
+                                Text(
+                                    if (isRaw) "$f（用相机内嵌预览，可导出 HDR 效果）" else f,
+                                    fontSize = 13.sp,
+                                    color = if (f == srcFormat) DoukColors.accent else Color(0xFF333333),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            srcFormat = f
+                                            showSourceSheet = false
+                                        }
+                                        .padding(vertical = 10.dp)
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {}
+                )
+            }
+
+            if (showExportSheet) {
+                ExportSheet(
+                    format = exportFormat,
+                    fixedFormat = fixedExportFormat != null,
+                    quality = exportQuality,
+                    hdr = exportHdr,
+                    srcIsRaw = ImageDecode.isRawFile(
+                        resolveSourceFile(item, srcFormat)?.name ?: item.fileName
+                    ),
+                    onFormat = { exportFormat = it },
+                    onQuality = { exportQuality = it },
+                    onHdr = { exportHdr = it },
+                    onDismiss = { showExportSheet = false },
+                    onConfirm = {
+                        showExportSheet = false
+                        saving = true
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                saveEdited(
+                                    context, item, state, filterRuntime,
+                                    srcFormat = srcFormat,
+                                    format = exportFormat,
+                                    quality = exportQuality,
+                                    hdr = exportHdr
+                                )
+                            }
+                            saving = false
+                            result.onSuccess { name -> onSaved(name) }
+                                .onFailure { message = it.message ?: "保存失败" }
+                        }
+                    }
+                )
+            }
         }
     }
+}
+
+/** 保存前的导出设置：格式 / 质量 / HDR 效果。 */
+@Composable
+private fun ExportSheet(
+    format: String,
+    fixedFormat: Boolean = false,
+    quality: Int,
+    hdr: Boolean,
+    srcIsRaw: Boolean,
+    onFormat: (String) -> Unit,
+    onQuality: (Int) -> Unit,
+    onHdr: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color.White,
+        title = { Text("导出设置", fontSize = 15.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column {
+                Text("格式", fontSize = 12.sp, color = Color(0xFF888888))
+                if (fixedFormat) {
+                    // 图库设置里已指定默认导出格式：直接按它走，不用每次再选
+                    Text(
+                        "$format（已在「设置 → 图库」固定）",
+                        fontSize = 13.sp,
+                        color = Color(0xFF333333),
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                } else Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
+                    listOf("JPG", "PNG").forEach { f ->
+                        val active = f == format
+                        Text(
+                            f,
+                            fontSize = 12.sp,
+                            color = if (active) Color.White else Color(0xFF333333),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(if (active) DoukColors.accent else Color(0xFFEFEFEF))
+                                .clickable { onFormat(f) }
+                                .padding(horizontal = 14.dp, vertical = 7.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+                Text("质量 $quality", fontSize = 12.sp, color = Color(0xFF888888))
+                androidx.compose.material3.Slider(
+                    value = quality.toFloat(),
+                    onValueChange = { onQuality(it.toInt()) },
+                    valueRange = 60f..100f,
+                    steps = 7,
+                    colors = androidx.compose.material3.SliderDefaults.colors(
+                        thumbColor = DoukColors.accent,
+                        activeTrackColor = DoukColors.accent
+                    )
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onHdr(!hdr) }
+                        .padding(vertical = 6.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("HDR 效果", fontSize = 13.sp, color = Color(0xFF333333))
+                        Text(
+                            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                                if (srcIsRaw) {
+                                    "RAW 没有现成 HDR 层，按亮度直方图反推增益图（最高 2.8x），" +
+                                        "导出 Ultra HDR JPEG，图库/相册按真 HDR 显示"
+                                } else {
+                                    "JPG 本身没有 HDR 数据层，勾选后按画面亮度反推一张增益图（最高 2.8x），" +
+                                        "导出 Ultra HDR JPEG，HDR 屏上亮部会顶出 SDR 白"
+                                }
+                            } else {
+                                "当前系统低于 Android 14，只能做高光滚降的普通 JPG"
+                            },
+                            fontSize = 11.sp,
+                            color = Color(0xFF9A9A9A)
+                        )
+                    }
+                    androidx.compose.material3.Switch(
+                        checked = hdr,
+                        onCheckedChange = { onHdr(it) }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onConfirm) {
+                Text("保存", color = DoukColors.accent, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("取消", color = Color(0xFF777777)) }
+        }
+    )
+}
+
+/** 按格式在「主文件 / 配对文件」里找对应源文件。 */
+private fun resolveSourceFile(item: GalleryItem, format: String): File? {
+    val main = GalleryFileOps.locateAppFile(item.fileName)
+    if (main != null && main.extension.equals(format, ignoreCase = true)) return main
+    item.extraFiles.forEach { name ->
+        val f = GalleryFileOps.locateAppFile(name)
+        if (f != null && f.extension.equals(format, ignoreCase = true)) return f
+    }
+    return main
 }
 
 /** 滑杆那一行：基础页是旋转角度，调节页是当前选中的调节项。 */
@@ -753,7 +989,7 @@ private fun MainTabBar(current: String, onPick: (String) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .doukCardSurface(RoundedCornerShape(18.dp))
+            .doukFlatSurface(RoundedCornerShape(18.dp))
             .padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
@@ -1309,7 +1545,7 @@ private fun CurveEditor(points: List<Float>, onChange: (List<Float>) -> Unit) {
             .fillMaxWidth()
             .height(136.dp)
             .padding(top = 6.dp)
-            .doukCardSurface(RoundedCornerShape(12.dp))
+            .doukFlatSurface(RoundedCornerShape(12.dp))
             .pointerInput(Unit) {
                 fun pts(): List<Float> = latestPoints.value
                 detectDragGestures(
@@ -1660,7 +1896,7 @@ private fun CropOptionCard(label: String, icon: ImageVector, active: Boolean, on
         modifier = Modifier
             .width(56.dp)
             .height(64.dp)
-            .doukCardSurface(RoundedCornerShape(11.dp))
+            .doukFlatSurface(RoundedCornerShape(11.dp))
             .background(
                 if (active) Color(0xFFFBF0E3).copy(alpha = 0.92f) else Color.Transparent,
                 RoundedCornerShape(11.dp)
@@ -1738,7 +1974,7 @@ private fun AdjustRow(
 private fun BaseChip(label: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
     Row(
         modifier = Modifier
-            .doukCardSurface(RoundedCornerShape(percent = 50))
+            .doukFlatSurface(RoundedCornerShape(percent = 50))
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -1789,7 +2025,7 @@ private fun RoundIconButton(
     Box(
         modifier = Modifier
             .size(42.dp)
-            .doukCardSurface(CircleShape)
+            .doukFlatSurface(CircleShape)
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
@@ -1864,22 +2100,28 @@ private fun render(
     var work = geometry(src, s)
     work = if (s.cropFree) cropByRect(work, s.cropL, s.cropT, s.cropR, s.cropB)
     else cropByRatio(work, s.cropRatio)
-    val pixels = work.getPixelsArray()
+    // Ultra HDR / 硬件解码出来的位图是不可变的，setPixels 会直接抛 IllegalStateException
+    val target = if (work.isMutable && work.config == Bitmap.Config.ARGB_8888) {
+        work
+    } else {
+        work.copy(Bitmap.Config.ARGB_8888, true) ?: work
+    }
+    val pixels = target.getPixelsArray()
     applyColor(pixels, s, runtime)
     // 拖动时只算当前正在调的那一个细节项，其余细节等松手后的高清预览补
     if (s.denoise > 0.5f && (!quick || activeDetail == "降噪")) {
-        blurInto(pixels, work.width, work.height, (s.denoise / 100f * 0.6f))
+        blurInto(pixels, target.width, target.height, (s.denoise / 100f * 0.6f))
     }
     if (s.sharpen > 0.5f && (!quick || activeDetail == "锐化")) {
-        unsharp(pixels, work.width, work.height, s.sharpen / 100f)
+        unsharp(pixels, target.width, target.height, s.sharpen / 100f)
     }
     if (s.clarity > 0.5f && (!quick || activeDetail == "清晰度")) {
-        unsharp(pixels, work.width, work.height, s.clarity / 100f * 0.5f)
+        unsharp(pixels, target.width, target.height, s.clarity / 100f * 0.5f)
     }
     if (s.grain > 0.5f && (!quick || activeDetail == "颗粒")) {
         addGrain(pixels, s.grain / 100f)
     }
-    return work.putPixels(pixels)
+    return target.putPixels(pixels)
 }
 
 /** 旋转 + 翻转；90/270 度时宽高对调 */
@@ -2181,18 +2423,32 @@ private fun addGrain(px: IntArray, strength: Float) {
 }
 
 /** 保存：算出全尺寸结果，写进 Pictures/Douk，文件名 = 原名 + _edit + 序号 */
-private fun saveEdited(context: Context, item: GalleryItem, s: EditState, runtime: FilterRuntime): Result<String> {
-    val file = GalleryFileOps.locateAppFile(item.fileName)
+private fun saveEdited(
+    context: Context,
+    item: GalleryItem,
+    s: EditState,
+    runtime: FilterRuntime,
+    srcFormat: String = item.formats.firstOrNull()?.uppercase() ?: "JPG",
+    format: String = DoukPrefs.editorFormat,
+    quality: Int = DoukPrefs.editorQuality,
+    hdr: Boolean = false
+): Result<String> {
+    val file = resolveSourceFile(item, srcFormat)
         ?: return Result.failure(IllegalStateException("只有应用内下载的照片可以编辑，相机与手机相册的原图请先保存到应用"))
     var src: Bitmap? = null
     var rendered: Bitmap? = null
     try {
         // 45MP 不再整图 decode；先采样到 4096 长边，峰值内存从 ~270MB 降到 ~90MB。
-        val decoded = decodeSampledForEdit(file, 4096)
-            ?: return Result.failure(IllegalStateException("这张图解码失败，可能格式不支持"))
+        // RAW（NEF/DNG）没有系统解码器，改用相机写进去的内嵌全尺寸预览。
+        val decoded = if (ImageDecode.isRawFile(file.name)) {
+            ImageDecode.extractEmbeddedPreview(file, 4096)?.asAndroidBitmap()
+        } else {
+            decodeSampledForEdit(file, 4096)
+        } ?: return Result.failure(IllegalStateException("这张图解码失败，可能格式不支持"))
         src = decoded
         val output = renderFull(decoded, s, runtime)
         rendered = output
+        val finalBmp = if (hdr) hdrTone(output) else output
         val base = file.nameWithoutExtension
         val dir = File(
             android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES),
@@ -2200,7 +2456,6 @@ private fun saveEdited(context: Context, item: GalleryItem, s: EditState, runtim
         )
         if (!dir.exists()) dir.mkdirs()
 
-        val format = DoukPrefs.editorFormat
         val ext = when (format) {
             "PNG" -> "png"
             "WebP" -> "webp"
@@ -2211,21 +2466,32 @@ private fun saveEdited(context: Context, item: GalleryItem, s: EditState, runtim
             "WebP" -> Bitmap.CompressFormat.WEBP
             else -> Bitmap.CompressFormat.JPEG
         }
-        val quality = DoukPrefs.editorQuality.coerceIn(60, 100)
+        val q = quality.coerceIn(60, 100)
 
-        var name = "${base}_edit.$ext"
+        var name = "${base}_edit${if (hdr) "_hdr" else ""}.$ext"
         var index = 2
         while (File(dir, name).exists()) {
-            name = "${base}_edit${index}.$ext"
+            name = "${base}_edit${if (hdr) "_hdr" else ""}${index}.$ext"
             index++
         }
         val targetFile = File(dir, name)
 
         val attempt = runCatching {
-            targetFile.outputStream().use { out ->
-                output.compress(compressFormat, quality, out)
+            // JPG + HDR 开关：写真正的 Ultra HDR（JPEG + gainmap），
+            // 系统相册 / 本 App 图库都会识别成 HDR 图，亮部会真的超过 SDR 白。
+            var ultraHdrWritten = false
+            if (hdr && format == "JPG" && android.os.Build.VERSION.SDK_INT >= 34) {
+                ultraHdrWritten = runCatching { writeUltraHdrJpeg(targetFile, finalBmp, q) }
+                    .getOrDefault(false)
+                if (!ultraHdrWritten) {
+                    com.lutcamera.lutcamerapro.log.DoukLog.w("PhotoEditor", "ULTRA_HDR_FAIL")
+                }
             }
-            // MediaStore 里补一条记录，其它相册应用也能立刻看到
+            if (!ultraHdrWritten) {
+                targetFile.outputStream().use { out ->
+                    finalBmp.compress(compressFormat, q, out)
+                }
+            }
             runCatching {
                 MediaStore.Images.Media.insertImage(
                     context.contentResolver,
@@ -2247,4 +2513,126 @@ private fun saveEdited(context: Context, item: GalleryItem, s: EditState, runtim
         if (src !== rendered) runCatching { src?.recycle() }
         runCatching { rendered?.recycle() }
     }
+}
+
+/**
+ * 写 Ultra HDR JPEG（Android 14 起的标准 HDR 照片格式）：
+ * 一张普通 8bit JPEG 当底图 + 一张单通道 gainmap（ALPHA_8），
+ * 亮部在 gainmap 里带 0–2.6x 的额外亮度，HDR 屏打开时会真的更亮。
+ * 失败返回 false，调用方回退成普通 JPEG。
+ */
+private fun writeUltraHdrJpeg(target: File, bmp: Bitmap, quality: Int): Boolean {
+    if (android.os.Build.VERSION.SDK_INT < 34) return false
+    var base: Bitmap? = null
+    var gainContents: Bitmap? = null
+    return try {
+        base = if (bmp.config == Bitmap.Config.ARGB_8888 && bmp.isMutable) {
+            bmp
+        } else {
+            bmp.copy(Bitmap.Config.ARGB_8888, true) ?: return false
+        }
+        // gainmap 用一半边长就行，它只是逐像素的亮度增益，不需要和底图一样大
+        val gw = (base.width / 2).coerceIn(1, 1024)
+        val gh = (base.height / 2).coerceIn(1, 1024)
+        val scaled = Bitmap.createScaledBitmap(base, gw, gh, true)
+        val src = IntArray(gw * gh)
+        scaled.getPixels(src, 0, gw, 0, 0, gw, gh)
+        if (scaled !== base) scaled.recycle()
+
+        // ---- SDR → HDR 反色调映射（inverse tone mapping）----
+        // 普通 JPG 只有 8bit、没有 HDR 数据层，这里按画面自己的亮度分布「造」一张增益图：
+        // 先取亮度直方图，用 96 分位当高光起点，再按幂函数把高光往上推，最高 2.8x，
+        // 暗部/中间调基本不动，避免把整张图洗白。思路与 google/libultrahdr 的
+        // gain map 生成一致（SDR 底图 + 单通道增益），只是没有真实 HDR 参考图可对照，
+        // 所以用局部亮度分布估算，而不是逐像素做物理还原。
+        val lum = FloatArray(src.size)
+        for (i in src.indices) {
+            val p = src[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            lum[i] = (0.2126f * r + 0.7152f * g + 0.0722f * b) / 255f
+        }
+        // 96 分位：既保证只有最亮的一小撮被当成「超白」候选，又不会因为整张偏暗而全图爆掉
+        val hist = IntArray(64)
+        lum.forEach { y -> hist[(y * 63f).toInt().coerceIn(0, 63)]++ }
+        var acc = 0
+        var hi = 63
+        val targetCount = (lum.size * 0.04f).toInt().coerceAtLeast(1)
+        for (bin in 63 downTo 0) {
+            acc += hist[bin]
+            if (acc >= targetCount) { hi = bin; break }
+        }
+        val hiLum = ((hi + 1) / 64f).coerceIn(0.30f, 0.92f)
+        val maxBoost = 2.8f
+        val alpha = IntArray(gw * gh)
+        for (i in src.indices) {
+            val y = lum[i]
+            // 高光起点以下不动；往上用 1.35 次幂平滑加速，避免出现硬边
+            val t = ((y - hiLum) / (1f - hiLum + 1e-3f)).coerceIn(0f, 1f)
+            val expanded = Math.pow(t.toDouble(), 1.35).toFloat()
+            // 越靠近纯白，再叠加一点「灯感」，让亮部在 HDR 屏上真的顶出去
+            val boost = 1f + expanded * (maxBoost - 1f)
+            val a = (((boost - 1f) / (maxBoost - 1f)) * 255f).toInt().coerceIn(0, 255)
+            alpha[i] = a shl 24
+        }
+        gainContents = Bitmap.createBitmap(gw, gh, Bitmap.Config.ALPHA_8)
+        gainContents.setPixels(alpha, 0, gw, 0, 0, gw, gh)
+
+        val gm = android.graphics.Gainmap(gainContents)
+        gm.setRatioMin(1f, 1f, 1f)
+        gm.setRatioMax(maxBoost, maxBoost, maxBoost)
+        gm.setGamma(1f, 1f, 1f)
+        gm.setEpsilonSdr(0.01f, 0.01f, 0.01f)
+        gm.setEpsilonHdr(0.01f, 0.01f, 0.01f)
+        gm.setDisplayRatioForFullHdr(maxBoost)
+        gm.setMinDisplayRatioForHdrTransition(1.0f)
+        base.setGainmap(gm)
+
+        target.outputStream().use { out ->
+            base.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(60, 100), out)
+        }
+        val ok = target.length() > 0
+        com.lutcamera.lutcamerapro.log.DoukLog.i(
+            "PhotoEditor", "ULTRA_HDR",
+            "size" to target.length().toString(),
+            "gain" to "${gw}x${gh}",
+            "ok" to ok.toString()
+        )
+        ok
+    } catch (e: Throwable) {
+        com.lutcamera.lutcamerapro.log.DoukLog.w("PhotoEditor", "ULTRA_HDR_ERR", "msg" to (e.message ?: ""))
+        false
+    } finally {
+        if (base !== bmp) runCatching { base?.recycle() }
+        runCatching { gainContents?.recycle() }
+    }
+}
+
+/**
+ * HDR 效果：把亮度按「高光滚降」重新分配——中间调保持，接近 1.0 的高光压回
+ * 可显示范围而不是直接切平，暗部抬一点，输出成普通 JPG 也能看出层次。
+ * 这是把 16bit / gainmap 的动态范围折进 8bit 的常见做法，不是真 HDR 容器。
+ */
+private fun hdrTone(src: Bitmap): Bitmap {
+    val out = src.copy(Bitmap.Config.ARGB_8888, true) ?: return src
+    val w = out.width
+    val h = out.height
+    val pixels = IntArray(w * h)
+    out.getPixels(pixels, 0, w, 0, 0, w, h)
+    val lut = IntArray(256) { v ->
+        val x = v / 255f
+        // filmic 曲线：暗部轻抬、高光平滑滚降
+        val y = (x * (1.06f + 0.08f * x) / (1f + 0.14f * x)).coerceIn(0f, 1f)
+        (y * 255f).toInt().coerceIn(0, 255)
+    }
+    for (i in pixels.indices) {
+        val p = pixels[i]
+        val r = lut[(p shr 16) and 0xFF]
+        val g = lut[(p shr 8) and 0xFF]
+        val b = lut[p and 0xFF]
+        pixels[i] = (p and 0xFF000000.toInt()) or (r shl 16) or (g shl 8) or b
+    }
+    out.setPixels(pixels, 0, w, 0, 0, w, h)
+    return out
 }

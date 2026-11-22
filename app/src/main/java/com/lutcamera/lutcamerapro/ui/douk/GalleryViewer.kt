@@ -10,6 +10,8 @@ import android.provider.MediaStore
 import com.lutcamera.lutcamerapro.log.DoukHttp
 import okhttp3.Request
 import androidx.compose.foundation.Image
+import androidx.compose.ui.viewinterop.AndroidView
+import dev.chrisbanes.haze.hazeSource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -149,8 +151,13 @@ internal fun PhotoViewerScreen(
     // 右上角那个按钮不再是分享，改成把当前这张转 90° 看（不改文件）
     var rotation by remember { mutableStateOf(0f) }
     var editing by remember { mutableStateOf(false) }
+    // 视频单独走「播放 + 套 LUT 导出」页，图片编辑仍然走 PhotoEditor
+    var videoOpen by remember { mutableStateOf(false) }
     // 网格里的是 320–400px 的缩略图，全屏要单独加载一张大的，否则放大就糊
     var hd by remember { mutableStateOf<ImageBitmap?>(null) }
+    // 真 HDR：Ultra HDR JPEG 的「底图 + 增益图」，或 PQ/HLG 图直接解出的 16bit 位图
+    var hdrPair by remember { mutableStateOf<ImageDecode.HdrPair?>(null) }
+    var hdrPq by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     // 「显示原图」：这张单独从相机拉全尺寸（或跟「始终显示原图」总开关走）
     var wantOriginal by remember { mutableStateOf(false) }
     var loadingOriginal by remember { mutableStateOf(false) }
@@ -166,6 +173,8 @@ internal fun PhotoViewerScreen(
     var lastDismissAt by remember { mutableStateOf(0L) }
     // 双击判定：两次轻点间隔小于 320ms 就当双击放大
     var lastTapAt by remember { mutableStateOf(0L) }
+    // 查看器是独立窗口，必须用自己的 HazeState：图片层做源，底部操作条才有东西可糊
+    val viewerHaze = remember { dev.chrisbanes.haze.HazeState() }
 
     // 提示条自己消失，免得一直挂在图片下面
     androidx.compose.runtime.LaunchedEffect(message) {
@@ -183,27 +192,16 @@ internal fun PhotoViewerScreen(
         ContentUris.withAppendedId(collection, item.key.toLong())
     } else null
 
-    /** 视频交给系统播放器；相机内还没落盘的先提示保存，避免点了没反应 */
+    /**
+     * 视频改成应用内播放：MOV / HEVC 10-bit / N-Log 这些系统播放器经常直接拒播，
+     * 这里用 MediaPlayer + GL 自己上屏，还能当场套还原 LUT。
+     * 相机内还没落盘的先提示保存，避免点了没反应。
+     */
     fun playVideo() {
-        val uri: Uri = when (item.origin) {
-            "phone" -> phoneUri() ?: return
-            "app" -> {
-                val file = appFile() ?: run { message = "视频文件找不到"; return }
-                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-            }
-            else -> {
-                message = "相机内视频请先点「保存」存到手机，再播放"
-                return
-            }
+        when (item.origin) {
+            "phone", "app" -> videoOpen = true
+            else -> message = "相机内视频请先点「保存」存到手机，再播放"
         }
-        runCatching {
-            context.startActivity(
-                Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, "video/*")
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-            )
-        }.onFailure { message = "没有可用的视频播放器" }
     }
 
     suspend fun fetchOriginal() {
@@ -217,13 +215,15 @@ internal fun PhotoViewerScreen(
     androidx.compose.runtime.LaunchedEffect(item.stableKey) {
         // 横滑换到另一张时，缩放、旋转、浮层、收藏状态全部按新这张重置
         scale = 1f; offsetX = 0f; offsetY = 0f; rotation = 0f
-        uiHidden = false; more = false; detail = false; editing = false
+        uiHidden = false; more = false; detail = false; editing = false; videoOpen = false
         wantOriginal = false
         favorite = item.stableKey in GalleryFavorites.all(context)
         // 先把网格里已经解码好的缩略图直接铺上，用户点开就是有画面的；
         // 高清图再在后台替换。以前这里先 hd=null 等 decode，5120 万像素的
         // 原图要几百毫秒，看起来就是「点开先黑一下」。
         hd = bitmap
+        hdrPair = null
+        hdrPq = null
         if (item.origin == "cam" && !item.isVideo && showOriginal) {
             // 「始终显示原图」总开关：每张打开就直接拉全尺寸
             fetchOriginal()
@@ -231,10 +231,44 @@ internal fun PhotoViewerScreen(
             val large = withContext(Dispatchers.IO) { loadLargeBitmap(context, item) }
             if (large != null) hd = large
         }
+        // 真 HDR：只有确实带 gainmap / PQ 的图才走这条，普通 SDR 图不折腾
+        if (!item.isVideo && android.os.Build.VERSION.SDK_INT >= 30) {
+            val file = appFile()
+            if (file != null && withContext(Dispatchers.IO) { ImageDecode.probeHdr(file) }) {
+                val pair = withContext(Dispatchers.IO) { ImageDecode.decodeHdrPair(file, 3200) }
+                val pq = if (pair == null) {
+                    withContext(Dispatchers.IO) { ImageDecode.decodeHdrBitmap(file, 3200) }
+                } else null
+                hdrPair = pair
+                hdrPq = pq
+                com.lutcamera.lutcamerapro.log.DoukLog.i(
+                    "HdrViewer", "HDR_LOAD",
+                    "file" to file.name,
+                    "pair" to (pair != null).toString(),
+                    "ratio" to (pair?.ratioMax?.toString() ?: "-"),
+                    "pq" to (pq != null).toString()
+                )
+            }
+        }
     }
 
-    fun share() {
-        val uri = phoneUri() ?: appFile()?.let { file ->
+    // 从编辑器回来（editing=false）把 HDR 数据补加载回来
+    androidx.compose.runtime.LaunchedEffect(editing) {
+        if (!editing && !item.isVideo && android.os.Build.VERSION.SDK_INT >= 30 &&
+            hdrPair == null && hdrPq == null
+        ) {
+            val file = appFile()
+            if (file != null && withContext(Dispatchers.IO) { ImageDecode.probeHdr(file) }) {
+                val pair = withContext(Dispatchers.IO) { ImageDecode.decodeHdrPair(file, 3200) }
+                hdrPair = pair
+                if (pair == null) {
+                    hdrPq = withContext(Dispatchers.IO) { ImageDecode.decodeHdrBitmap(file, 3200) }
+                }
+            }
+        }
+    }
+
+    fun share() {        val uri = phoneUri() ?: appFile()?.let { file ->
             // 应用内的图片在 MediaStore 里有记录时才能给出 content uri
             runCatching {
                 context.contentResolver.query(
@@ -343,7 +377,11 @@ internal fun PhotoViewerScreen(
                                 // 轻点：先判双击放大，再判收 / 显示上下两条 UI
                                 elapsed < 280L && !moved -> {
                                     val now = System.currentTimeMillis()
-                                    if (now - lastTapAt < 320L) {
+                                    // 视频没有可看的大图；中间那个播放键的点击会被这层手势吃掉，
+                                    // 所以轻点整屏就直接进播放页，不再走双击放大那套。
+                                    if (item.isVideo) {
+                                        if (now - lastDismissAt > 150L) playVideo()
+                                    } else if (now - lastTapAt < 320L) {
                                         if (scale > 1f) {
                                             scale = 1f; offsetX = 0f; offsetY = 0f
                                         } else {
@@ -363,8 +401,44 @@ internal fun PhotoViewerScreen(
                     },
                 contentAlignment = Alignment.Center
             ) {
+                // 图片这一层做模糊源：底部操作条压在它上面，才能糊到这张图本身
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .hazeSource(viewerHaze),
+                    contentAlignment = Alignment.Center
+                ) {
                 val shown = hd ?: bitmap
-                if (shown != null) {
+                val pair = hdrPair
+                val pq = hdrPq
+                if ((pair != null || pq != null) && !editing) {
+                    BoxWithConstraints(
+                        modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
+                    ) {
+                        val quarter = (rotation % 180f) != 0f
+                        val w = if (quarter) maxHeight else maxWidth
+                        val h = if (quarter) maxWidth else maxHeight
+                        // SurfaceView 不吃 graphicsLayer，缩放/平移/旋转都交给 GL 做
+                        AndroidView(
+                            factory = { ctx -> HdrImageView(ctx) },
+                            update = { view ->
+                                if (pair != null) view.setGainPair(pair.base, pair.gain, pair.ratioMax)
+                                else view.setBitmap(pq)
+                                view.setTransform(scale, offsetX, offsetY, quarter)
+                                if (!view.loggedReady) {
+                                    view.loggedReady = true
+                                    com.lutcamera.lutcamerapro.log.DoukLog.i(
+                                        "HdrViewer", "HDR_VIEW",
+                                        "pair" to (pair != null).toString()
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(w, h)
+                        )
+                    }
+                } else if (shown != null) {
                     BoxWithConstraints(
                         modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
                     ) {
@@ -386,7 +460,7 @@ internal fun PhotoViewerScreen(
                                 }
                         )
                     }
-                } else {
+                } else if (!item.isVideo) {
                     Text("原图未加载", fontSize = 13.sp, color = Color.White.copy(alpha = 0.7f))
                 }
 
@@ -410,6 +484,7 @@ internal fun PhotoViewerScreen(
                             modifier = Modifier.size(38.dp)
                         )
                     }
+                }
                 }
             }
 
@@ -458,8 +533,11 @@ internal fun PhotoViewerScreen(
                 ) {
                     Row(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(percent = 50))
-                            .background(Color.White.copy(alpha = 0.96f))
+                            .doukCardSurface(
+                                shape = RoundedCornerShape(percent = 50),
+                                haze = viewerHaze,
+                                fillAlpha = 0.80f
+                            )
                             .padding(horizontal = 10.dp, vertical = 10.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -475,8 +553,17 @@ internal fun PhotoViewerScreen(
                         )
                         PillAction(
                             icon = Icons.Rounded.Edit,
-                            label = "编辑",
-                            onClick = { editing = true }
+                            label = if (item.isVideo) "视频 LUT" else "编辑",
+                            onClick = {
+                                if (item.isVideo) {
+                                    videoOpen = true
+                                } else {
+                                    // 编辑器还要再解一张 4096 的图，先把 HDR 那两张放掉腾内存
+                                    hdrPair = null
+                                    hdrPq = null
+                                    editing = true
+                                }
+                            }
                         )
                         PillAction(
                             icon = Icons.Rounded.DeleteOutline,
@@ -613,6 +700,25 @@ internal fun PhotoViewerScreen(
                     onDismiss = { addTo = false }
                 )
             }
+        }
+    }
+
+    if (videoOpen) {
+        // 看图层本身是一个全屏 Dialog（独立窗口），视频页直接写在它外面会被这个窗口盖住，
+        // 看起来就是「点了没反应」。所以视频页自己再开一个全屏 Dialog，叠在最上面。
+        Dialog(
+            onDismissRequest = { videoOpen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
+        ) {
+            VideoLutScreen(
+                item = item,
+                onDismiss = { videoOpen = false },
+                onExported = { name ->
+                    videoOpen = false
+                    message = "已导出 $name"
+                    onChanged()
+                }
+            )
         }
     }
 
@@ -1035,6 +1141,17 @@ private fun AddRow(title: String, subtitle: String, onClick: () -> Unit) {
 /** 详情页：左边灰色标签、右边蓝色值，和参考图一致。 */
 @Composable
 private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
+    // HDR 判断：落盘在应用目录的图直接探 gainmap / PQ；相机内原图未落盘就明确写「未检测」
+    var hdrFlag by remember { mutableStateOf<Boolean?>(null) }
+    androidx.compose.runtime.LaunchedEffect(item.stableKey) {
+        hdrFlag = withContext(Dispatchers.IO) {
+            when (item.origin) {
+                "app" -> GalleryFileOps.locateAppFile(item.fileName)?.let { ImageDecode.probeHdr(it) } ?: false
+                else -> null
+            }
+        }
+    }
+
     val context = LocalContext.current
     var meta by remember { mutableStateOf<GalleryFileOps.Meta?>(null) }
 
@@ -1113,13 +1230,15 @@ private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
                     else -> "相机机身存储 · 通过 PTP 读取，未落到本机"
                 }
             )
-            // EXIF：机身、镜头、曝光三要素、白平衡、色彩空间等，两列标签/值逐行排
-            if (!m?.exifRows.isNullOrEmpty()) {
-                DetailRow(
-                    "EXIF",
-                    m!!.exifRows.joinToString("\n") { (key, value) -> "$key：$value" }
-                )
-            }
+            // HDR 检测（替换掉原来的 EXIF 长列表）
+            DetailRow(
+                "HDR",
+                when (hdrFlag) {
+                    true -> "是 · 带 HDR 增益图（Ultra HDR），HDR 屏上高光会更亮"
+                    false -> "否 · 普通 SDR 图片"
+                    null -> "未检测 · 文件还没落到应用目录（相机内原图请先保存）"
+                }
+            )
             // IPTC 字段一个都没有就整行不显示，不再写「这张没有写入 IPTC」这种废话
             val iptcLines = buildList {
                 m?.title?.let { add("标题：$it") }
@@ -1378,28 +1497,24 @@ private fun downloadTile(url: String): android.graphics.Bitmap? = runCatching {
 
 /** 全屏用的大图：应用内直接解原文件到长边 1600，手机内让系统按 1600 出缩略。相机内没有本地文件。 */
 private fun loadLargeBitmap(context: Context, item: GalleryItem): ImageBitmap? = runCatching {
+    // 按屏幕长边解码，不再统一压到 1600px：平板 2880 宽，压到 1600 就是把
+    // 两亿像素的原片削成 1600 万，放大一看全是糊的。
+    val screenLong = runCatching {
+        maxOf(
+            context.resources.displayMetrics.widthPixels,
+            context.resources.displayMetrics.heightPixels
+        )
+    }.getOrDefault(2400).coerceIn(1600, 3200)
     when (item.origin) {
         "app" -> {
             val file = GalleryFileOps.locateAppFile(item.fileName)
-            if (file == null) {
-                null
-            } else {
-                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
-                var sample = 1
-                while (bounds.outWidth / sample > 1600) sample *= 2
-                val bmp = android.graphics.BitmapFactory.decodeFile(
-                    file.absolutePath,
-                    android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
-                ) ?: return@runCatching null
-                GalleryFileOps.applyExifOrientation(bmp, GalleryFileOps.exifOrientationOf(file)).asImageBitmap()
-            }
+            if (file == null) null else ImageDecode.decodeFile(file, screenLong)
         }
         "phone" -> {
             val collection = if (item.isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI
             else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             val uri = ContentUris.withAppendedId(collection, item.key.toLong())
-            context.contentResolver.loadThumbnail(uri, android.util.Size(1600, 1600), null)?.asImageBitmap()
+            ImageDecode.decodeUri(context, uri, screenLong)
         }
         else -> null
     }

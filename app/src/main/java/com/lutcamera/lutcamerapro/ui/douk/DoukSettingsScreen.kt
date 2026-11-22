@@ -156,6 +156,91 @@ private fun saveSupportQrToGallery(context: Context, bitmap: Bitmap): Boolean {
 /** 导入滤镜可归入的分类；内置滤镜固定「自带」。 */
 private val FILTER_CATEGORIES = listOf("未分类", "人像", "风光", "胶片", "黑白", "自定义")
 
+/**
+ * 资源页的一组文件（LUT 或 滤镜）：每条带「通用 / 图片 / 视频」适用范围切换。
+ * tick 只用来触发重组，分类与适用范围都落在 DoukPrefs。
+ */
+@Composable
+private fun ResourceGroup(
+    title: String,
+    subtitle: String,
+    files: List<File>,
+    tick: Int,
+    onChange: () -> Unit,
+    onDelete: (File) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = DoukColors.textPrimary)
+        Text(subtitle, fontSize = 11.sp, color = DoukColors.textTertiary)
+        Spacer(modifier = Modifier.height(8.dp))
+        if (files.isEmpty()) {
+            SettingCard {
+                Text(
+                    "这一类还没有文件。",
+                    fontSize = 12.sp,
+                    color = DoukColors.textTertiary,
+                    modifier = Modifier.padding(14.dp)
+                )
+            }
+        } else {
+            SettingCard {
+            files.forEachIndexed { index, f ->
+                if (index > 0) SettingDivider()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(f.name, fontSize = 14.sp, color = DoukColors.textPrimary)
+                            Text(
+                                DoukPrefs.readableSize(f.length()),
+                                fontSize = 11.sp,
+                                color = DoukColors.textSecondary
+                            )
+                        }
+                        TextButton(onClick = { onDelete(f) }) {
+                            Text("删除", fontSize = 12.sp, color = DoukColors.textSecondary)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val use = DoukPrefs.resourceUse(f.name)
+                        RESOURCE_USES.forEach { u ->
+                            val on = use == u
+                            Text(
+                                when (u) {
+                                    "通用" -> "图片 + 视频"
+                                    "图片" -> "仅图片"
+                                    else -> "仅视频"
+                                },
+                                fontSize = 11.sp,
+                                color = if (on) Color(0xFFE08A2E) else DoukColors.textSecondary,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(percent = 50))
+                                    .background(if (on) Color(0xFFFFEEDC) else DoukColors.surfaceMuted)
+                                    .clickable {
+                                        DoukPrefs.setResourceUse(f.name, u)
+                                        onChange()
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+        }
+        // tick 仅用于让 Compose 认识「已变更」，实际数据来自 DoukPrefs
+        if (tick < 0) Spacer(modifier = Modifier.size(0.dp))
+    }
+}
+
 /** 一个「标题 + 若干选项」的选择弹窗，设置页里十几种下拉都用它，避免重复写 AlertDialog */
 private data class ValuePick(
     val title: String,
@@ -455,7 +540,7 @@ fun DoukSettingsScreen(state: DoukState) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .doukCardSurface(RoundedCornerShape(18.dp))
+                            .doukFlatSurface(RoundedCornerShape(18.dp))
                             .clickable(enabled = !downloading) {
                                 scope.launch {
                                     downloading = true
@@ -897,13 +982,13 @@ fun DoukSettingsScreen(state: DoukState) {
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 SettingCard {
-                    SettingRow("导出格式", "JPG 体积小；PNG 无损；WebP 折中", format) {
-                        pick = ValuePick("导出格式", listOf("JPG", "PNG", "WebP"), format) { v ->
+                    SettingRow("导出格式", "JPG 体积小；PNG 无损", format) {
+                        pick = ValuePick("导出格式", listOf("JPG", "PNG"), format) { v ->
                             format = v; DoukPrefs.editorFormat = v
                         }
                     }
                     SettingDivider()
-                    SettingRow("导出质量", "只对 JPG / WebP 生效", "$quality%") {
+                    SettingRow("导出质量", "只对 JPG 生效", "$quality%") {
                         pick = ValuePick("导出质量", listOf("90", "95", "100"), quality) { v ->
                             quality = v; DoukPrefs.editorQuality = v.toIntOrNull() ?: 95
                         }
@@ -999,8 +1084,10 @@ fun DoukSettingsScreen(state: DoukState) {
             }
             "resources" -> SettingsSubPage(title = "资源", onBack = back) {
                 val files = DoukPrefs.importedResources(context)
+                val tick = categoryTick
                 Text(
-                    "支持主流 3D LUT 与尼康 Picture Control：.cube、.3dl、.look，以及 .NP3 / .NCP / .NP2。导入后在编辑器滤镜页按分类显示，强度滑杆实时预览。",
+                    "两类文件分开管理：LUT（.cube / .3dl / .look）用于视频监看与灰片还原；滤镜（尼康 .NP3 / .NCP / .NP2）用于图片风格。" +
+                        "每条再标适用范围，标了「视频」的会出现在监看 LUT 列表，标了「图片」的只出现在图片编辑器。",
                     fontSize = 12.sp,
                     color = DoukColors.textSecondary
                 )
@@ -1017,31 +1104,35 @@ fun DoukSettingsScreen(state: DoukState) {
                         )
                     }
                 } else {
-                    SettingCard {
-                        files.forEachIndexed { index, f ->
-                            if (index > 0) SettingDivider()
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(f.name, fontSize = 14.sp, color = DoukColors.textPrimary)
-                                    Text(
-                                        DoukPrefs.readableSize(f.length()),
-                                        fontSize = 11.sp,
-                                        color = DoukColors.textSecondary
-                                    )
-                                }
-                                TextButton(onClick = {
-                                    f.delete()
-                                    lutCount = DoukPrefs.importedResources(context).size
-                                    lutBytes = DoukPrefs.dirSize(DoukPrefs.lutDir(context))
-                                }) { Text("删除", fontSize = 12.sp, color = DoukColors.textSecondary) }
-                            }
+                    val luts = files.filter { DoukPrefs.resourceKind(it.name) == "LUT" }
+                    val looks = files.filter { DoukPrefs.resourceKind(it.name) == "滤镜" }
+                    ResourceGroup(
+                        title = "LUT 文件",
+                        subtitle = "监看 / 视频还原用，.cube / .3dl / .look",
+                        files = luts,
+                        tick = tick,
+                        onChange = { categoryTick += 1 },
+                        onDelete = { f ->
+                            f.delete()
+                            lutCount = DoukPrefs.importedResources(context).size
+                            lutBytes = DoukPrefs.dirSize(DoukPrefs.lutDir(context))
+                            filterFiles = DoukPrefs.importedResources(context).map { it.name }
                         }
-                    }
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    ResourceGroup(
+                        title = "滤镜格式",
+                        subtitle = "图片风格用，尼康 Picture Control .NP3 / .NCP / .NP2",
+                        files = looks,
+                        tick = tick,
+                        onChange = { categoryTick += 1 },
+                        onDelete = { f ->
+                            f.delete()
+                            lutCount = DoukPrefs.importedResources(context).size
+                            lutBytes = DoukPrefs.dirSize(DoukPrefs.lutDir(context))
+                            filterFiles = DoukPrefs.importedResources(context).map { it.name }
+                        }
+                    )
                 }
                 Spacer(modifier = Modifier.height(30.dp))
             }
@@ -1099,32 +1190,7 @@ fun DoukSettingsScreen(state: DoukState) {
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text("卡片不透明度", fontSize = 14.sp, color = DoukColors.textPrimary)
-                                Text(
-                                    "${(materialAlpha * 100).roundToInt()}%",
-                                    fontSize = 13.sp,
-                                    color = DoukColors.textSecondary
-                                )
-                            }
-                            Slider(
-                                value = materialAlpha,
-                                onValueChange = {
-                                    materialAlpha = it
-                                    DoukPrefs.materialAlpha = it
-                                    DoukColors.applyMaterial(it, materialBlur)
-                                },
-                                valueRange = 0.55f..1f,
-                                colors = SliderDefaults.colors(
-                                    thumbColor = DoukColors.accent,
-                                    activeTrackColor = DoukColors.accent
-                                )
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text("底栏模糊度", fontSize = 14.sp, color = DoukColors.textPrimary)
+                                Text("模糊强度", fontSize = 14.sp, color = DoukColors.textPrimary)
                                 Text(
                                     "${materialBlur.roundToInt()} dp",
                                     fontSize = 13.sp,
@@ -1138,84 +1204,20 @@ fun DoukSettingsScreen(state: DoukState) {
                                     DoukPrefs.materialBlur = it
                                     DoukColors.applyMaterial(materialAlpha, it)
                                 },
-                                valueRange = 0f..20f,
+                                valueRange = 0f..40f,
                                 colors = SliderDefaults.colors(
                                     thumbColor = DoukColors.accent,
                                     activeTrackColor = DoukColors.accent
                                 )
                             )
                             Text(
-                                "卡片改用静态磨砂渐变，滚动时不会逐张重算模糊；"
-                                    + "真实模糊只保留在底栏，观感一致但更省性能。",
+                                "卡片底固定为浅色 60% 不透明度，这里只调背后的模糊半径："
+                                    + "数值越大，卡片后面的文字和图标糊得越彻底（默认 24dp）。",
                                 fontSize = 12.sp,
                                 lineHeight = 18.sp,
                                 color = DoukColors.textSecondary
                             )
                         }
-                    }
-                    SettingDivider()
-                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("界面对比度", fontSize = 14.sp, color = DoukColors.textPrimary)
-                            Text(
-                                "${(uiContrast * 100).roundToInt()}%",
-                                fontSize = 13.sp,
-                                color = DoukColors.textSecondary
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("柔和" to 0f, "标准" to 0.35f, "高对比" to 0.8f).forEach { (label, value) ->
-                                val active = kotlin.math.abs(uiContrast - value) < 0.05f
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clip(DoukShapes.pill)
-                                        .background(if (active) DoukColors.accentSoft else DoukColors.surfaceMuted)
-                                        .border(
-                                            1.dp,
-                                            if (active) DoukColors.accent.copy(alpha = 0.45f) else Color.Transparent,
-                                            DoukShapes.pill
-                                        )
-                                        .clickable {
-                                            uiContrast = value
-                                            DoukPrefs.uiContrast = value
-                                            DoukColors.applyContrast(value)
-                                        }
-                                        .padding(vertical = 9.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        label,
-                                        fontSize = 12.sp,
-                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                        color = if (active) DoukColors.accent else DoukColors.textSecondary
-                                    )
-                                }
-                            }
-                        }
-                        Slider(
-                            value = uiContrast,
-                            onValueChange = {
-                                uiContrast = it
-                                DoukPrefs.uiContrast = it
-                                DoukColors.applyContrast(it)
-                            },
-                            valueRange = 0f..1f,
-                            colors = SliderDefaults.colors(
-                                thumbColor = DoukColors.accent,
-                                activeTrackColor = DoukColors.accent
-                            )
-                        )
-                        Text(
-                            "提高后文字、分割线和选中态更清晰；降低后更柔和。只影响界面，不改变照片颜色。",
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp,
-                            color = DoukColors.textSecondary
-                        )
                     }
                     SettingDivider()
                     SettingRow(
@@ -1456,7 +1458,7 @@ fun DoukSettingsScreen(state: DoukState) {
                         .fillMaxWidth()
                         .weight(1f)
                         .clip(DoukShapes.cardSmall)
-                        .doukCardSurface(DoukShapes.cardSmall)
+                        .doukFlatSurface(DoukShapes.cardSmall)
                 ) {
                     LazyColumn(
                         state = listState,
@@ -1645,9 +1647,10 @@ fun DoukSettingsScreen(state: DoukState) {
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     SettingCard {
-                        val keys = state.paramOrderFor(groupMode)
-                        keys.forEachIndexed { index, key ->
-                            val param = state.cameraParams.firstOrNull { it.key == key } ?: return@forEachIndexed
+                        val params = state.paramOrderFor(groupMode).mapNotNull { k ->
+                            state.cameraParams.firstOrNull { it.key == k }
+                        }
+                        params.forEachIndexed { index, param ->
                             if (index > 0) SettingDivider()
                             SettingSwitchRow(
                                 param.label,
@@ -1920,6 +1923,34 @@ fun DoukSettingsScreen(state: DoukState) {
                         DoukPrefs.galleryCameraPreload = it
                     }
                 )
+                SettingDivider()
+                SettingRow(
+                    "图片默认导出格式",
+                    "选了就导出不再问；不选每次导出时再挑",
+                    DoukPrefs.defaultExportFormat.ifBlank { "每次选择" }
+                ) {
+                    pick = ValuePick(
+                        "图片默认导出格式",
+                        listOf("每次选择", "JPG", "PNG"),
+                        DoukPrefs.defaultExportFormat.ifBlank { "每次选择" }
+                    ) { v ->
+                        DoukPrefs.defaultExportFormat = if (v == "每次选择") "" else v
+                    }
+                }
+                SettingDivider()
+                SettingRow(
+                    "编辑默认格式",
+                    "同一张有 JPG+RAW 时，编辑默认用哪种",
+                    DoukPrefs.defaultEditFormat.ifBlank { "每次选择" }
+                ) {
+                    pick = ValuePick(
+                        "编辑默认格式",
+                        listOf("每次选择", "JPG", "HEIC", "RAW"),
+                        DoukPrefs.defaultEditFormat.ifBlank { "每次选择" }
+                    ) { v ->
+                        DoukPrefs.defaultEditFormat = if (v == "每次选择") "" else v
+                    }
+                }
                 SettingDivider()
                 SettingRow("图像编辑", "导出格式、质量与预览", null) {
                     subPage = "editor"
@@ -2232,12 +2263,11 @@ private fun InfoLines(lines: List<String>) {
 }
 
 private fun gpsSummary(import: Boolean, ble: Boolean): String {
-    if (!DoukPrefs.gpsEnabled) return "总开关已关闭"
     val on = buildList {
         if (import) add("导入时补充")
         if (ble) add("蓝牙推送")
     }
-    return if (on.isEmpty()) "已开启，但两种方式都未打开" else on.joinToString(" / ")
+    return on.joinToString(" / ").ifBlank { "蓝牙推送" }
 }
 
 private fun accentOf(name: String): Color = when (name) {
@@ -2320,7 +2350,7 @@ private fun GpsPanel(
     val sp = remember { context.getSharedPreferences("douk_nikon_ble", Context.MODE_PRIVATE) }
     var importAttach by remember { mutableStateOf(DoukPrefs.gpsAttachImport) }
     var bleAttach by remember { mutableStateOf(DoukPrefs.gpsAttachBle) }
-    var masterOn by remember { mutableStateOf(DoukPrefs.gpsEnabled) }
+    val masterOn = true
     var interval by remember { mutableStateOf(ble.intervalMinutes.value) }
     var accuracy by remember { mutableStateOf(ble.locationAccuracy.value) }
     var syncTime by remember { mutableStateOf(ble.syncTime.value) }
@@ -2400,41 +2430,22 @@ private fun GpsPanel(
         return
     }
 
+    // 总开关与「蓝牙 GPS 附加」开关已按反馈移除：进到这个页面就是启用状态，
+    // 蓝牙推送跟着蓝牙链路自动走，只保留「导入图片时附加」一个选择。
+    LaunchedEffect(Unit) {
+        DoukPrefs.gpsEnabled = true
+        DoukPrefs.gpsAttachBle = true
+        bleAttach = true
+        ble.setGpsEnabled(true)
+    }
+
     SettingsSubPage(title = "GPS 数据导入", onBack = onBack) {
         SettingCard {
             SettingSwitchRow(
-                "GPS 数据导入总开关",
-                "关闭后，下面的附加方式、蓝牙推送与定位全部停用",
-                masterOn
-            ) { v ->
-                masterOn = v
-                DoukPrefs.gpsEnabled = v
-                ble.setGpsEnabled(v)
-                if (!v) {
-                    importAttach = false
-                    bleAttach = false
-                    DoukPrefs.gpsAttachImport = false
-                    DoukPrefs.gpsAttachBle = false
-                }
-            }
-            SettingDivider()
-            SettingSwitchRow(
                 "导入图片时附加",
                 "把相机照片导入应用时补上手机坐标",
-                importAttach,
-                enabled = masterOn
+                importAttach
             ) { importAttach = it; DoukPrefs.gpsAttachImport = it }
-            SettingDivider()
-            SettingSwitchRow(
-                "蓝牙 GPS 附加",
-                "通过蓝牙持续向相机推送定位",
-                bleAttach,
-                enabled = masterOn
-            ) {
-                bleAttach = it
-                DoukPrefs.gpsAttachBle = it
-                ble.setGpsEnabled(masterOn && it)
-            }
         }
 
         Spacer(modifier = Modifier.height(18.dp))
@@ -2964,7 +2975,7 @@ private fun AboutPanel(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(DoukShapes.card)
-                    .doukCardSurface(DoukShapes.card)
+                    .doukFlatSurface(DoukShapes.card)
                     .padding(vertical = DoukSpace.xl),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
@@ -3068,7 +3079,7 @@ private fun SettingCard(content: @Composable () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(DoukShapes.cardSmall)
-            .doukCardSurface(DoukShapes.cardSmall)
+            .doukFlatSurface(DoukShapes.cardSmall)
     ) {
         content()
     }

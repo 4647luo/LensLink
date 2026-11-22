@@ -27,6 +27,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CameraAlt
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.PhotoLibrary
@@ -252,8 +254,11 @@ fun DoukRoot() {
                 .fillMaxSize()
                 .background(DoukColors.backgroundBrush)
         ) {
+            // hazeSource 只挂页面内容这一层：底栏、服务切换条、批量操作卡都是它的兄弟节点、
+            // 画在它之后，hazeEffect 才能取到真正压在下面的内容。
+            // （之前把源上移到根层，源里连底栏自己也一起被捕获，糊到的是自己，看着就是一块实色。）
             Box(Modifier.fillMaxSize()) {
-            // 背景只负责铺色；不再单独做 hazeSource，避免底栏模糊时多抓一层全屏画面。
+            // 背景只负责铺色。
             Box(
                 Modifier
                     .fillMaxSize()
@@ -310,12 +315,11 @@ fun DoukRoot() {
                                 .fillMaxSize()
                                 .padding(top = padding.calculateTopPadding())
                         ) {
-                        // 页面内容单独做一层 haze 源：底栏是它的兄弟节点，不在源里，
-                        // 所以底栏只糊「页面上的文字和图标」，不会糊自己。
+                        // 页面内容这层做源：底栏与浮层都在它上面，那句话才能糊出内容本身。
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .hazeSource(DoukColors.hazeState, zIndex = 0f)
+                                .hazeSource(DoukColors.hazeState)
                         ) {
                         NavHost(
                             navController = nav,
@@ -367,6 +371,40 @@ fun DoukRoot() {
                                         deviceServicePinned = true
                                     }
                                 )
+                            }
+                            // 图库多选的批量操作卡：贴在底栏正上方（不再塞在图库页底部）
+                            if (state.gallerySelCount > 0 && state.gallerySelKind.isNotBlank()) {
+                                val pill = RoundedCornerShape(percent = 50)
+                                val isDelete = state.gallerySelKind == "delete"
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 18.dp, vertical = 4.dp)
+                                        .clip(pill)
+                                        .doukCardSurface(pill)
+                                        .clickable(enabled = !state.galleryBulkBusy) { state.requestGalleryBulk() }
+                                        .padding(horizontal = 18.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(
+                                        if (isDelete) Icons.Rounded.Delete else Icons.Rounded.Save,
+                                        contentDescription = null,
+                                        tint = if (isDelete) Color(0xFFE5484D) else DoukColors.accent,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        when {
+                                            state.galleryBulkBusy -> if (isDelete) "正在删除…" else "正在保存…"
+                                            isDelete -> "删除选中 ${state.gallerySelCount} 张"
+                                            else -> "保存选中 ${state.gallerySelCount} 张到应用相册"
+                                        },
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (isDelete) Color(0xFFE5484D) else DoukColors.accent
+                                    )
+                                }
                             }
                             DoukBottomBar(
                                 nav = nav,

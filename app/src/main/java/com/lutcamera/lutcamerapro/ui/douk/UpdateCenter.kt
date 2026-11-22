@@ -151,9 +151,8 @@ object UpdateCenter {
     suspend fun download(context: Context, info: Info, onProgress: (Int) -> Unit): File =
         withContext(Dispatchers.IO) {
             val apkUrl = info.apkUrl?.trim().orEmpty()
-            require(apkUrl.startsWith("http://") || apkUrl.startsWith("https://")) {
-                "APK 地址必须是 http/https 直链"
-            }
+            // 只接受 https：以前允许 http，局域网里被劫持就能塞一个别的安装包进来。
+            require(apkUrl.startsWith("https://")) { "APK 地址必须是 https 直链" }
             val dir = File(context.cacheDir, "updates").apply { mkdirs() }
             dir.listFiles()?.forEach { runCatching { it.delete() } }
             val safeVersion = info.version.filter { it.isLetterOrDigit() || it == '.' || it == '-' }
@@ -194,6 +193,15 @@ object UpdateCenter {
                 }
                 if (target.length() <= 0L) error("下载到的文件为空")
                 if (total > 0 && target.length() < total) error("下载不完整")
+                // 装之前先核对包名：下载源被中间人替换成别的 App 时，系统安装器是照装的。
+                val archiveInfo = context.packageManager.getPackageArchiveInfo(
+                    target.absolutePath,
+                    android.content.pm.PackageManager.GET_ACTIVITIES
+                )
+                if (archiveInfo == null || archiveInfo.packageName != context.packageName) {
+                    target.delete()
+                    error("安装包校验失败：不是连镜的更新包")
+                }
                 target
             } finally {
                 conn.disconnect()

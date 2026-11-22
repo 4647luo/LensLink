@@ -20,6 +20,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -88,6 +89,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -105,11 +107,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 import java.io.File
 
 /** 图库缩略图解码上限：快速滚动时同时解码太多 320px 图会突然卡一下 */
@@ -330,6 +336,65 @@ fun GalleryScreen(
     // 多选态下按返回键只退出选择模式，不离开图库页（和系统相册一致）
     BackHandler(enabled = selecting) { resetSelection() }
 
+    // 把选择状态交给底栏：应用内 -> 删除卡；相机内 -> 保存到应用相册卡
+    LaunchedEffect(selecting, selected, source, currentItems) {
+        state.gallerySelCount = if (selecting) selected.size else 0
+        state.gallerySelKind = when {
+            !selecting || selected.isEmpty() -> ""
+            source == GallerySource.APP -> "delete"
+            source == GallerySource.CAMERA -> "save"
+            else -> ""
+        }
+    }
+
+    // 底栏卡片被点击：真正执行批量动作
+    LaunchedEffect(state.galleryBulkTick) {
+        if (state.galleryBulkTick <= 0) return@LaunchedEffect
+        when (state.gallerySelKind) {
+            "delete" -> confirmDelete = true
+            "save" -> {
+                val targets = currentItems.filter { it.stableKey in selected }
+                if (targets.isEmpty()) return@LaunchedEffect
+                state.galleryBulkBusy = true
+                var ok = 0
+                var failed = 0
+                try {
+                    targets.forEach { target ->
+                        val handles = listOf(target.key to target.fileName) + target.extraHandles
+                        handles.forEach { (handle, _) ->
+                            val success: Boolean = if (target.fromUsb) {
+                                suspendCancellableCoroutine { cont ->
+                                    state.saveUsbPhoto(context, handle, target.fileName) { msg ->
+                                        if (cont.isActive) cont.resume(msg.startsWith("已保存"))
+                                    }
+                                }
+                            } else {
+                                // downloadPhoto 是串行的：上一次没下完就等它，避免直接 return 出去
+                                while (state.vm.downloadingPhotoHandles.isNotEmpty()) delay(300)
+                                suspendCancellableCoroutine { cont ->
+                                    state.vm.downloadPhoto(handle) { r ->
+                                        if (cont.isActive) cont.resume(r)
+                                    }
+                                }
+                            }
+                            if (success) ok++ else failed++
+                        }
+                    }
+                } finally {
+                    state.galleryBulkBusy = false
+                }
+                state.galleryRefreshTick++
+                Toast.makeText(
+                    context,
+                    if (failed == 0) "已保存 $ok 个文件到应用相册"
+                    else "已保存 $ok 个，$failed 个失败（相机可能已断开）",
+                    Toast.LENGTH_SHORT
+                ).show()
+                resetSelection()
+            }
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -485,6 +550,8 @@ fun GalleryScreen(
                     selecting = true
                     selected = selected + item.stableKey
                 },
+                onSelect = { item -> selected = selected + item.stableKey },
+                onDeselect = { item -> selected = selected - item.stableKey },
                 onToggle = { item ->
                     selected = if (item.stableKey in selected) {
                         selected - item.stableKey
@@ -506,6 +573,8 @@ fun GalleryScreen(
                     selecting = true
                     selected = selected + item.stableKey
                 },
+                onSelect = { item -> selected = selected + item.stableKey },
+                onDeselect = { item -> selected = selected - item.stableKey },
                 onToggle = { item ->
                     selected = if (item.stableKey in selected) {
                         selected - item.stableKey
@@ -526,6 +595,8 @@ fun GalleryScreen(
                     selecting = true
                     selected = selected + item.stableKey
                 },
+                onSelect = { item -> selected = selected + item.stableKey },
+                onDeselect = { item -> selected = selected - item.stableKey },
                 onToggle = { item ->
                     selected = if (item.stableKey in selected) {
                         selected - item.stableKey
@@ -538,46 +609,7 @@ fun GalleryScreen(
             }
         }
 
-        if (selecting) {
-            val deletable = source == GallerySource.APP
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = DoukSpace.page, vertical = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = when (source) {
-                        GallerySource.APP -> "应用内照片可以在这里删除"
-                        GallerySource.PHONE -> "手机相册里的照片请到系统相册删除"
-                        GallerySource.CAMERA -> "相机里的照片请到相机上删除"
-                    },
-                    style = DoukType.caption,
-                    color = DoukColors.textTertiary,
-                    modifier = Modifier.weight(1f)
-                )
-                if (deletable) {
-                    Row(
-                        modifier = Modifier
-                            .clip(DoukShapes.pill)
-                            .background(
-                                if (selected.isEmpty()) DoukColors.surfaceMuted else DoukColors.accentSoft
-                            )
-                            .clickable(enabled = selected.isNotEmpty() && !deleting) { confirmDelete = true }
-                            .padding(horizontal = 16.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            if (deleting) "正在删除…" else "删除 ${selected.size}",
-                            style = DoukType.caption,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (selected.isEmpty()) DoukColors.textTertiary else DoukColors.accent
-                        )
-                    }
-                }
-            }
-        }
+        // 批量按钮不再放在这里：改成 Douk 底栏上方的悬浮卡（见 DoukRoot）
         // 网格自己的 contentPadding 已经留了 124dp 底部空白（滚到底时越过胶囊），这里只收边。
         Spacer(modifier = Modifier.height(4.dp))
     }
@@ -773,7 +805,10 @@ private fun mergePairedFormats(
     files.forEach { file ->
         val base = file.fileName.substringBeforeLast('.', file.fileName).lowercase()
         val folder = file.folder ?: "机身存储"
-        groups.getOrPut("$folder|$base") { mutableListOf() }.add(file)
+        // 图片和视频不合并：机身里基名相同的 JPG 与 MOV 是两种素材，混在一起标 JPG+MOV 反而看不懂
+        val ext = file.fileName.substringAfterLast('.', "").lowercase()
+        val kind = if (ext in setOf("mov", "mp4")) "v" else "i"
+        groups.getOrPut("$folder|$base|$kind") { mutableListOf() }.add(file)
     }
     return groups.map { (_, group) ->
         val exts = group.map { it.fileName.substringAfterLast('.', "").lowercase() }.distinct()
@@ -805,19 +840,22 @@ private fun CameraGallery(
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
     onToggle: (GalleryItem) -> Unit,
+    onSelect: (GalleryItem) -> Unit,
+    onDeselect: (GalleryItem) -> Unit,
     onItemsReady: (List<GalleryItem>) -> Unit,
     filter: GalleryFilter = GalleryFilter(),
     albumFilter: String? = null
 ) {
     val usbMode = state.usbOnly
 
-    LaunchedEffect(usbMode, state.usbConnected, state.isConnected) {
+    LaunchedEffect(usbMode, state.usbConnected, state.isConnected, albumFilter) {
         if (usbMode && state.usbConnected) {
             if (state.usbPhotos.isEmpty()) state.loadUsbPhotos()
         }
         // 连接后预加载已经填过列表时不要重复整表重读，否则打开图库会闪一下
         if (!usbMode && state.isConnected && state.cameraPhotos.isEmpty()) {
-            val count = if (DoukPrefs.galleryLoadAll) 4000 else DoukPrefs.galleryPageSize
+            // 「全部」页直接读整表，避免只显示最新一屏
+            val count = if (DoukPrefs.galleryLoadAll || albumFilter == null) 4000 else DoukPrefs.galleryPageSize
             state.loadCameraPhotos(count = count)
         }
     }
@@ -877,7 +915,9 @@ private fun CameraGallery(
         return
     }
 
-    val loadAll = DoukPrefs.galleryLoadAll
+    // 没有指定相册（也就是「全部」）时直接把机身整表读完再显示：
+    // 以前只给前 60 张，用户以为相机里照片丢了。
+    val loadAll = DoukPrefs.galleryLoadAll || albumFilter == null
     val loaded = state.cameraPhotos
     // 开启「加载全部」后，如果后台只预读了第一屏，这里继续把整表补上
     LaunchedEffect(loadAll, state.isConnected, loaded.size) {
@@ -885,6 +925,19 @@ private fun CameraGallery(
             state.loadCameraPhotos(count = 4000)
         }
     }
+    // 「全部」页补读：连接后后台只预读了第一屏时，这里把整表补满（最多重试 3 次），
+    // 免得用户看到「已读到 796 个文件，返回区间 [0 - 40]」却只有 40 张。
+    LaunchedEffect(albumFilter, state.isConnected, state.cameraPhotosHasMore) {
+        if (usbMode || albumFilter != null || !state.isConnected) return@LaunchedEffect
+        repeat(3) {
+            if (!state.cameraPhotosHasMore) return@LaunchedEffect
+            if (!state.vm.isLoadingStorageFiles) {
+                state.loadCameraPhotos(count = 4000)
+            }
+            delay(900)
+        }
+    }
+
     val displayed = if (loadAll) visibleItems else visibleItems.take(shownCount)
     val hasMore = state.cameraPhotosHasMore || displayed.size < visibleItems.size
 
@@ -896,6 +949,8 @@ private fun CameraGallery(
         onOpen = onOpen,
         onLongPress = onLongPress,
         onToggle = onToggle,
+        onSelect = onSelect,
+        onDeselect = onDeselect,
         hasMore = hasMore,
         onLoadMore = {
             if (loadAll) {
@@ -922,6 +977,8 @@ private fun AppGallery(
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
     onToggle: (GalleryItem) -> Unit,
+    onSelect: (GalleryItem) -> Unit,
+    onDeselect: (GalleryItem) -> Unit,
     onItemsReady: (List<GalleryItem>) -> Unit,
     albumFilter: String? = null,
     filter: GalleryFilter = GalleryFilter()
@@ -1024,6 +1081,8 @@ private fun AppGallery(
         onOpen = onOpen,
         onLongPress = onLongPress,
         onToggle = onToggle,
+        onSelect = onSelect,
+        onDeselect = onDeselect,
         loadThumb = { item ->
             withContext(Dispatchers.IO) {
                 GalleryFileOps.locateAppFile(item.fileName)?.let { decodeFileThumb(it) }
@@ -1040,6 +1099,8 @@ private fun PhoneGallery(
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
     onToggle: (GalleryItem) -> Unit,
+    onSelect: (GalleryItem) -> Unit,
+    onDeselect: (GalleryItem) -> Unit,
     onItemsReady: (List<GalleryItem>) -> Unit,
     albumFilter: String? = null,
     filter: GalleryFilter = GalleryFilter()
@@ -1237,6 +1298,8 @@ private fun PhoneGallery(
         onOpen = onOpen,
         onLongPress = onLongPress,
         onToggle = onToggle,
+        onSelect = onSelect,
+        onDeselect = onDeselect,
         loadThumb = { item ->
             withContext(Dispatchers.IO) {
                 val collection = if (item.isVideo) {
@@ -1267,6 +1330,10 @@ private fun PhotoGrid(
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
     onToggle: (GalleryItem) -> Unit,
+    /** 滑动选择：拖过的格子强制选中（不切换），用于一次拉一排 */
+    onSelect: (GalleryItem) -> Unit = {},
+    /** 反向：拖过已选中的格子把它取消掉 */
+    onDeselect: (GalleryItem) -> Unit = {},
     loadThumb: suspend (GalleryItem) -> ImageBitmap?,
     hasMore: Boolean = false,
     onLoadMore: (() -> Unit)? = null
@@ -1277,6 +1344,51 @@ private fun PhotoGrid(
     var columns by remember { mutableIntStateOf(DoukPrefs.galleryColumns) }
     val liveColumns by rememberUpdatedState(columns)
     val totalGridItems = sections.size + items.size + if (hasMore) 1 else 0
+    // 扁平索引：日期头占一格，其余是照片；拖动选择时按可见格子的 index 反查
+    val flatItems = remember(sections, hasMore) {
+        buildList<GalleryItem?> {
+            sections.forEach { section ->
+                add(null)
+                addAll(section.items)
+            }
+            if (hasMore) add(null)
+        }
+    }
+    // 滑动选择靠每个格子自己上报手势；这里把根坐标换算回网格坐标，再命中到具体一张
+    var gridRoot by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
+    val dragVisited = remember { mutableSetOf<String>() }
+    fun cellAt(root: Offset): GalleryItem? {
+        val gc = gridRoot ?: return null
+        // 网格层没有旋转/缩放，直接把网格原点换算到根坐标，再按 item 偏移叠上去
+        val origin = gc.localToRoot(Offset.Zero)
+        gridState.layoutInfo.visibleItemsInfo.forEach { info ->
+            val cell = flatItems.getOrNull(info.index) ?: return@forEach
+            val x0 = origin.x + info.offset.x
+            val y0 = origin.y + info.offset.y
+            if (root.x >= x0 && root.x <= x0 + info.size.width &&
+                root.y >= y0 && root.y <= y0 + info.size.height
+            ) return cell
+        }
+        return null
+    }
+    // 这一手是加选还是取消：长按到已选中的格子就进「擦除」模式，长按未选中的就进「加选」模式
+    var dragErasing by remember { mutableStateOf(false) }
+    val dragStartAt: (Offset) -> Unit = { root ->
+        dragVisited.clear()
+        cellAt(root)?.let { cell ->
+            val already = cell.stableKey in selected
+            dragErasing = already
+            dragVisited += cell.stableKey
+            if (already) onDeselect(cell) else onLongPress(cell)
+        }
+    }
+    val dragAt: (Offset) -> Unit = { root ->
+        cellAt(root)?.let { cell ->
+            if (dragVisited.add(cell.stableKey)) {
+                if (dragErasing) onDeselect(cell) else onSelect(cell)
+            }
+        }
+    }
 
     LaunchedEffect(gridState, items, hasMore) {
         if (!hasMore || onLoadMore == null) return@LaunchedEffect
@@ -1295,30 +1407,30 @@ private fun PhotoGrid(
             .pointerInput(Unit) {
                 awaitEachGesture {
                     awaitFirstDown(requireUnconsumed = false)
+                    val startColumns = liveColumns
                     var accum = 1f
-                    var handled = false
+                    var lastTarget = startColumns
                     while (true) {
                         val event = awaitPointerEvent()
-                        if (event.changes.size >= 2 && !handled) {
+                        if (event.changes.size >= 2) {
+                            // 每一档 = 缩放 1.22 倍。放大 -> 列数变少（格子变大），缩小 -> 列数变多。
                             accum *= event.calculateZoom()
-                            val target = when {
-                                accum > 1.25f -> 3
-                                accum < 0.8f -> 6
-                                else -> null
-                            }
-                            if (target != null) {
+                            val steps = (kotlin.math.ln(accum) / kotlin.math.ln(1.22f)).toInt()
+                            val target = (startColumns - steps).coerceIn(2, 7)
+                            if (target != lastTarget) {
+                                lastTarget = target
                                 if (liveColumns != target) {
                                     columns = target
                                     DoukPrefs.galleryColumns = target
                                 }
-                                handled = true
-                                event.changes.forEach { it.consume() }
                             }
+                            event.changes.forEach { it.consume() }
                         }
                         if (!event.changes.any { it.pressed }) break
                     }
                 }
-            },
+            }
+            .onGloballyPositioned { gridRoot = it },
         horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
         // 底部留出比透明胶囊更高的一块：网格可以滚到胶囊下面，滚到底时最后一行完整露出来
@@ -1361,7 +1473,9 @@ private fun PhotoGrid(
                     selectionMode = selectionMode,
                     onClick = { if (selectionMode) onToggle(item) else onOpen(item) },
                     onLongPress = { onLongPress(item) },
-                    loader = { loadThumb(item) }
+                    loader = { loadThumb(item) },
+                    dragStart = dragStartAt,
+                    dragHit = dragAt
                 )
             }
         }
@@ -1396,7 +1510,11 @@ private fun ThumbCell(
     selectionMode: Boolean,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
-    loader: suspend () -> ImageBitmap?
+    loader: suspend () -> ImageBitmap?,
+    /** 长按起手那一格（根坐标） */
+    dragStart: ((Offset) -> Unit)? = null,
+    /** 拖动过程中滑到的位置（根坐标），一次跟手可以扫过一整排 */
+    dragHit: ((Offset) -> Unit)? = null
 ) {
     LaunchedEffect(item.stableKey) {
         if (!thumbs.containsKey(item.stableKey)) {
@@ -1404,6 +1522,10 @@ private fun ThumbCell(
         }
     }
     val bitmap = thumbs[item.stableKey]
+    var cellCoords by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
+    // 手势协程要长期活着，回调必须是「最新值」而不是创建时那一份
+    val startRef = androidx.compose.runtime.rememberUpdatedState(dragStart)
+    val hitRef = androidx.compose.runtime.rememberUpdatedState(dragHit)
 
     Box(
         modifier = Modifier
@@ -1411,7 +1533,28 @@ private fun ThumbCell(
             .aspectRatio(1f)
             .clip(RoundedCornerShape(2.dp))
             .background(DoukColors.surfaceMuted)
-            .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+            // 长按交给下面的手势处理器统一做（加选/取消都靠它），
+            // 这里只在没有传手势处理器时留个兜底，避免长按被两边各处理一次（选了又取消）
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { if (dragStart == null) onLongPress() }
+            )
+            .onGloballyPositioned { cellCoords = it }
+            // key 只用 stableKey：一旦开始拖，选中集合变化会引起重组，
+            // 如果 key 里带上随时会变的 lambda，手势协程会被重启，拖动就断了。
+            .pointerInput(item.stableKey) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { pos ->
+                        cellCoords?.let { c -> startRef.value?.invoke(c.localToRoot(pos)) }
+                    },
+                    onDrag = { change, _ ->
+                        change.consume()
+                        val hit = hitRef.value
+                        val c = cellCoords
+                        if (hit != null && c != null) hit(c.localToRoot(change.position))
+                    }
+                )
+            }
     ) {
         if (bitmap != null) {
             Image(
@@ -1509,24 +1652,32 @@ private data class AppGroup(
 private fun appFileBaseName(name: String): String =
     name.substringBeforeLast('.', name)
 
-/** 把同目录、同文件主干的 JPG/RAW/HEIF 等合并成一条；视频不与图片配对。 */
+/** 把同目录、同文件主干的 JPG/RAW/HEIF 合并成一条；视频单独一条，和不与图片混。 */
 private fun groupAppFiles(files: List<File>): List<AppGroup> {
-    return files.groupBy { file ->
-        (file.parentFile?.absolutePath ?: "") to appFileBaseName(file.name)
+    fun ext(f: File) = f.name.substringAfterLast('.', "").lowercase()
+    val videos = files.filter { ext(it) in APP_VIDEO_EXTS }
+    // 导出视频时会写一张同名 JPG 当封面，这张不要单独占一格，缩略图仍然拿它来显示
+    val videoKeys = videos.map {
+        (it.parentFile?.absolutePath ?: "") to appFileBaseName(it.name).lowercase()
+    }.toSet()
+    val images = files.filter { ext(it) in APP_IMAGE_EXTS }.filterNot {
+        ((it.parentFile?.absolutePath ?: "") to appFileBaseName(it.name).lowercase()) in videoKeys
+    }
+    val imageGroups = images.groupBy { file ->
+        (file.parentFile?.absolutePath ?: "") to appFileBaseName(file.name).lowercase()
     }.map { (_, members) ->
-        val images = members.filter { it.name.substringAfterLast('.', "").lowercase() in APP_IMAGE_EXTS }
-        val videos = members.filter { it.name.substringAfterLast('.', "").lowercase() in APP_VIDEO_EXTS }
-        val main = images.firstOrNull { it.name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "heic", "heif", "png") }
-            ?: images.firstOrNull()
-            ?: videos.firstOrNull()
+        val main = members.firstOrNull { ext(it) in setOf("jpg", "jpeg", "heic", "heif", "png") }
             ?: members.first()
-        val extras = members.filterNot { it == main }
         AppGroup(
             main = main,
-            extras = extras,
+            extras = members.filterNot { it == main },
             dateMillis = members.maxOfOrNull { it.lastModified() } ?: main.lastModified()
         )
-    }.sortedByDescending { it.dateMillis }
+    }
+    val videoGroups = videos.map {
+        AppGroup(main = it, extras = emptyList(), dateMillis = it.lastModified())
+    }
+    return (imageGroups + videoGroups).sortedByDescending { it.dateMillis }
 }
 
 private fun scanAppImages(): List<File> {
@@ -1570,11 +1721,11 @@ private fun readImageBounds(file: File): Pair<Int, Int>? = runCatching {
     }
 }.getOrNull()
 
-private fun decodeFileThumb(file: File): ImageBitmap? = runCatching {
+private fun decodeFileThumb(file: File): ImageBitmap? = ImageDecode.decodeThumb(file, 960) ?: runCatching {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(file.absolutePath, bounds)
     var sample = 1
-    while (bounds.outWidth / sample > 400) sample *= 2
+    while (bounds.outWidth / sample > 640) sample *= 2
     val options = BitmapFactory.Options().apply { inSampleSize = sample }
     val bmp = BitmapFactory.decodeFile(file.absolutePath, options) ?: return null
     GalleryFileOps.applyExifOrientation(bmp, GalleryFileOps.exifOrientationOf(file)).asImageBitmap()

@@ -57,14 +57,14 @@ object DoukColors {
     internal val accentState = mutableStateOf(Color(0xFFFF6900))
     internal val darkState = mutableStateOf(false)
 
-    /** 「外观设置 → 高级材质」开关：95% 不透明度卡片 + 轻度真实模糊 */
+    /** 「外观设置 → 高级材质」开关：卡片磨砂玻璃 + 可调模糊 */
     internal val glassState = mutableStateOf(true)
-    /** 卡片不透明度（0.55–1.0） */
-    internal val materialAlphaState = mutableStateOf(0.95f)
-    /** 卡片背后模糊半径（dp），只给底栏一层真实模糊，卡片本身用静态磨砂渐变 */
-    internal val materialBlurState = mutableStateOf(8f)
-    /** 界面对比度 0–1：0 柔和，0.35 标准，1 高对比 */
-    internal val contrastState = mutableStateOf(0.35f)
+    /** 卡片不透明度：固定 60%，更透一点，背景模糊更明显 */
+    internal val materialAlphaState = mutableStateOf(0.60f)
+    /** 卡片/底栏背后模糊半径（dp），用户可调，上限 40dp */
+    internal val materialBlurState = mutableStateOf(24f)
+    /** 界面对比度固定 80%：1.0 太硬、0.35 发灰，取中间 */
+    internal val contrastState = mutableStateOf(0.80f)
     /** 全站共享的背景源状态：页面内容画一次，卡片/底栏从里面取真实模糊。 */
     internal val hazeState = dev.chrisbanes.haze.HazeState()
 
@@ -122,6 +122,8 @@ object DoukColors {
         lerp(Color(0xFFF5F6F8), Color.Black, contrastState.value * 0.035f)
     }
     val surface: Color get() = if (darkState.value) Color(0xFF16181C) else Color(0xFFFFFFFF)
+    /** 卡片专用的「浅色」：比页面底色亮，落在 80% 透明度上也不会发灰 */
+    val cardLight: Color get() = if (darkState.value) Color(0xFF2A2E36) else Color(0xFFFBFCFE)
     val surfaceRaised: Color get() = if (darkState.value) Color(0xFF1D1F24) else Color(0xFFFBFBFC)
     val surfaceMuted: Color get() = if (darkState.value) {
         boost(Color(0xFF212429), 0.12f)
@@ -177,13 +179,13 @@ object DoukColors {
 
     fun applyGlass(enabled: Boolean) { glassState.value = enabled }
 
-    /** 界面对比度：0 柔和，0.35 标准，1 高对比 */
-    fun applyContrast(value: Float) { contrastState.value = value.coerceIn(0f, 1f) }
+    /** 界面对比度固定 100%，旧设置项不再生效 */
+    fun applyContrast(value: Float) { contrastState.value = 0.80f }
 
-    /** 高级材质：不透明度越高越接近实心卡片，模糊半径只影响底栏那一层 */
+    /** 高级材质：卡片不透明度固定 80%，只剩下模糊半径可调（0–32dp） */
     fun applyMaterial(alpha: Float, blurDp: Float) {
-        materialAlphaState.value = alpha.coerceIn(0.55f, 1f)
-        materialBlurState.value = blurDp.coerceIn(0f, 20f)
+        materialAlphaState.value = 0.60f
+        materialBlurState.value = blurDp.coerceIn(0f, 40f)
     }
 }
 
@@ -262,22 +264,58 @@ fun Modifier.doukShadow(
 fun Modifier.doukCardSurface(
     shape: Shape = DoukShapes.card,
     tint: Color = Color.Transparent,
-    baseColor: Color = DoukColors.surface
+    baseColor: Color = Color.Transparent,
+    /** 独立窗口（比如图片查看器那种 Dialog）要传自己的 HazeState，全局状态在别的窗口里取不到背景 */
+    haze: dev.chrisbanes.haze.HazeState = DoukColors.hazeState,
+    /** 卡面不透明度：默认 0.60，压在黑底上时调高一点，字才看得清 */
+    fillAlpha: Float = 0.78f
 ): Modifier {
-    if (!DoukColors.glass) {
-        return background(if (tint == Color.Transparent) baseColor else tint, shape)
-    }
     val dark = DoukColors.isDark
-    val opacity = DoukColors.materialAlpha
-    val fill = baseColor.copy(alpha = opacity)
+    // 用户要求：卡片底改成「浅色 + 80% 不透明度」，模糊强度交给设置里的滑杆。
+    // 浅色卡面在浅色主题下比纯白更有层次，在深色主题下也比原来的深灰提亮一档，
+    // 卡上的文字和图标才不会糊在背景里看不清。
+    val cardBase = if (baseColor == Color.Transparent) {
+        DoukColors.cardLight
+    } else {
+        lerp(baseColor, DoukColors.cardLight, 0.55f)
+    }
+    if (!DoukColors.glass) {
+        return background(if (tint == Color.Transparent) cardBase else tint, shape)
+    }
+    val opacity = fillAlpha
+    val fill = cardBase.copy(alpha = opacity)
 
     var surface = this
         .clip(shape)
+        .hazeEffect(
+            state = haze,
+            style = HazeStyle(
+                // 背景色留空，模糊层单独画；浅色卡面自己用 80% 透明度压在上面，
+                // 否则模糊图会盖住底色，卡片就成了「透着一堆照片」的雾面，字看不清。
+                backgroundColor = Color.Transparent,
+                tints = emptyList(),
+                // 直接给满用户设置的模糊半径（0–32dp）。之前封在 20dp 且卡片打七五折，
+                // 小字和图标透过来还是能认出来，看起来就像「没糊」。
+                blurRadius = (DoukColors.materialBlur * 1.9f).coerceIn(0f, 60f).dp,
+                noiseFactor = 0f
+            )
+        )
+        // 浅色卡面：78% 不透明度，压住背后的模糊层，字和图标才立得住。
         .background(fill, shape)
+        // 再叠一层极淡的斜向高光，玻璃才有厚度。
+        .background(
+            androidx.compose.ui.graphics.Brush.linearGradient(
+                listOf(
+                    Color.White.copy(alpha = if (dark) 0.08f else 0.10f),
+                    Color.Transparent,
+                    Color.White.copy(alpha = if (dark) 0.03f else 0.04f)
+                )
+            ),
+            shape
+        )
     if (tint != Color.Transparent) {
         surface = surface.background(tint.copy(alpha = 0.10f), shape)
     }
-    // 平直的玻璃边：只用一层冷灰细边 + 外侧柔光，不再做方向性渐变。
     val edge = if (dark) {
         Color.White.copy(alpha = 0.28f)
     } else {
@@ -297,31 +335,49 @@ fun Modifier.doukCardSurface(
 }
 
 /**
- * 底部 Douk 栏：整条栏是透明的，只留一层极淡的染色 + 背后真实高斯模糊。
- * 不再画 95% 不透明度白底和折光描边——那会看成一张压在页面上的卡片。
- * 模糊半径直接取「外观设置 → 底栏模糊度」，0–20dp 实时生效。
+ * 纯实心卡面：设置页、图片编辑器这类「要看清字」的页面专用。
+ * 不挂 Haze、不叠高光、不做渐变，就是一层浅色底 + 一条细边。
+ */
+fun Modifier.doukFlatSurface(
+    shape: Shape = DoukShapes.card,
+    tint: Color = Color.Transparent,
+    baseColor: Color = Color.Transparent
+): Modifier {
+    val dark = DoukColors.isDark
+    val fill = if (baseColor == Color.Transparent) DoukColors.cardLight else baseColor
+    val edge = if (dark) Color.White.copy(alpha = 0.10f) else Color(0xFFDCE1E9)
+    return this
+        .clip(shape)
+        .background(if (tint == Color.Transparent) fill else tint, shape)
+        .border(1.dp, edge, shape)
+}
+
+/**
+ * 底部 Douk 栏：背后真实高斯模糊 + 一层 80% 的浅色底，图标文字清楚。
+ * 模糊半径直接取「外观设置 → 模糊强度」，0–32dp 实时生效。
  */
 fun Modifier.doukGlassDock(shape: Shape): Modifier {
     if (!DoukColors.glass) return background(DoukColors.surface, shape)
     val dark = DoukColors.isDark
-    // 不透明度滑块只轻微影响染色深浅（最高 0.2），保证始终看得见背后的模糊
-    val tintAlpha = 0.06f + (DoukColors.materialAlpha - 0.55f) * 0.18f
+    // 底栏同样改成「浅色底压 80%」的画法：模糊层在下、浅色层在上，图标文字才够清楚。
+    // 底栏单独按用户要求回到 60%：卡片是 78%，底栏保留更通透的一档
     val fill = if (dark) {
-        Color(0xFF0E1116).copy(alpha = tintAlpha)
+        Color(0xFF20242C).copy(alpha = 0.60f)
     } else {
-        Color.White.copy(alpha = tintAlpha)
+        Color(0xFFFBFCFE).copy(alpha = 0.60f)
     }
     return this
         .clip(shape)
         .hazeEffect(
             state = DoukColors.hazeState,
             style = HazeStyle(
-                backgroundColor = fill,
+                backgroundColor = Color.Transparent,
                 tints = emptyList(),
-                blurRadius = DoukColors.materialBlur.coerceIn(0f, 20f).dp,
+                blurRadius = (DoukColors.materialBlur * 1.9f).coerceIn(0f, 60f).dp,
                 noiseFactor = 0f
             )
         )
+        .background(fill, shape)
         // 主题色只染一点点，不破坏通透感
         .background(DoukColors.accent.copy(alpha = if (dark) 0.05f else 0.04f), shape)
         .drawWithCache {

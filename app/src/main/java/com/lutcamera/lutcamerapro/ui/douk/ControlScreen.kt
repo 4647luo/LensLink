@@ -4,6 +4,7 @@ import android.app.Activity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -133,6 +134,13 @@ fun ControlScreen(
         lastSeenCapture = latest
     }
 
+    // 机身拨到视频档 / 拨回拍照档，界面双向跟着切：控制页、监视页同时换成对应参数。
+    // detectedVideoMode 为 null（判断不出来）时不动，避免误刷新抢走用户选择。
+    LaunchedEffect(state.detectedVideoMode) {
+        // 只做「识别到机身换档就跟随一次」，不锁档：用户随后手动切仍能改
+        val detected = state.detectedVideoMode ?: return@LaunchedEffect
+        state.followDetectedMode(detected)
+    }
     Column(modifier = Modifier.fillMaxSize()) {
         // ===== 顶部：标题 + 拍摄/视频分段控件 =====
         Row(
@@ -141,27 +149,42 @@ fun ControlScreen(
                 .padding(start = DoukSpace.page, end = DoukSpace.sm, top = DoukSpace.sm, bottom = DoukSpace.xxs),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "控制",
-                style = DoukType.h1,
-                color = DoukColors.textPrimary,
-                modifier = Modifier.weight(1f)
-            )
-            ModeSwitch(selected = state.mode, onSelect = { state.mode = it })
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "控制",
+                    style = DoukType.h1,
+                    color = DoukColors.textPrimary
+                )
+                // 机身实际档位只做提示，不接管界面；界面档位可以自己切
+                val detected = state.detectedVideoMode
+                Text(
+                    text = when (detected) {
+                        true -> "机身：视频档"
+                        false -> "机身：拍摄档"
+                        null -> "机身：未识别到档位"
+                    } + if (state.modeManualOverride) " · 已手动切换" else "",
+                    style = DoukType.label,
+                    color = DoukColors.textTertiary
+                )
+            }
+            ModeSwitch(selected = state.effectiveMode, onSelect = { state.selectMode(it) })
             // 拍摄/视频旁边的「更多」：就在图标下面展开，不弹整屏对话框
             Box {
                 var showMore by remember { mutableStateOf(false) }
                 IconButton(
                     onClick = { showMore = true },
                     modifier = Modifier
-                        .size(40.dp)
-                        .doukCardSurface(CircleShape)
+                        .padding(start = 4.dp)
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(DoukColors.surface.copy(alpha = 0.8f))
+                        .border(0.8.dp, DoukColors.outline.copy(alpha = 0.55f), CircleShape)
                 ) {
                     Icon(
                         Icons.Rounded.MoreVert,
                         contentDescription = "更多",
                         tint = DoukColors.textPrimary,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(15.dp)
                     )
                 }
                 DropdownMenu(
@@ -287,7 +310,7 @@ fun ControlScreen(
             MonitorButton(state = state)
 
             Spacer(modifier = Modifier.height(DoukSpace.xl))
-            SectionHead(if (state.mode == CaptureMode.VIDEO) "视频参数" else "拍摄参数")
+            SectionHead(if (state.effectiveMode == CaptureMode.VIDEO) "视频参数" else "拍摄参数")
             state.exposureLockHint?.let { hint ->
                 Spacer(modifier = Modifier.height(DoukSpace.xs))
                 Row(
@@ -325,7 +348,7 @@ fun ControlScreen(
                 )
             }
             Spacer(modifier = Modifier.height(DoukSpace.sm))
-            val paramKeys = state.orderedParamKeys(state.mode)
+            val paramKeys = state.orderedParamKeys(state.effectiveMode)
             if (paramKeys.isEmpty()) {
                 Text(
                     "还没有可显示的参数。可在「设置 → 参数排列顺序」里打开被隐藏的功能，或等相机上报参数后再看。",
@@ -342,7 +365,7 @@ fun ControlScreen(
                 // 当前不是低速连拍时卡片会提示切到 CL 后才生效，避免“点了没反应”。
                 val burstSupported = state.optionsOf("burstCount").isNotEmpty()
                 val visible = paramKeys.toSet()
-                val groups = state.paramGroupsFor(state.mode)
+                val groups = state.paramGroupsFor(state.effectiveMode)
                     .map { group -> group.copy(keys = group.keys.filter { it in visible }) }
                     .filter { it.keys.isNotEmpty() }
                 // 用户取消勾选、没有归到任何卡的功能不能凭空消失，统一放进「其他」
@@ -356,7 +379,7 @@ fun ControlScreen(
                     ParamGroup(
                         state,
                         paramKeys,
-                        title = if (state.mode == CaptureMode.VIDEO) "视频参数" else "拍摄参数",
+                        title = if (state.effectiveMode == CaptureMode.VIDEO) "视频参数" else "拍摄参数",
                         onEdit = { p, a ->
                             editing = ParamEdit(p, a)
                             burstEditing = if (p.key == "drive" && burstSupported) {
@@ -685,7 +708,7 @@ private fun FloatingShutter(
     onOpenGallery: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isVideo = state.mode == CaptureMode.VIDEO
+    val isVideo = state.effectiveMode == CaptureMode.VIDEO
     val recording = state.isRecordingNow
     val accent = if (isVideo) Color(0xFFE5484D) else DoukColors.accent
     val soft = if (isVideo) Color(0x1FE5484D) else DoukColors.accentSoft
@@ -994,7 +1017,10 @@ private fun ParamGroup(
             )
         }
         keys.forEachIndexed { index, key ->
-            val param = state.cameraParams.firstOrNull { it.key == key } ?: return@forEachIndexed
+            val param = state.cameraParams.firstOrNull { it.key == key }
+            // 不能用 return@forEachIndexed 跳过：Compose 的 group 会因此不配对，
+            // 后续重组直接 ArrayIndexOutOfBoundsException（IntStack.peek2）。
+            if (param != null) {
             val locked = state.paramLockReason(key) != null
             // 坐标只给点击时用，不写进 Compose State：滚动时不会因为每帧
             // onGloballyPositioned 回写 IntOffset 而触发整行/整组重组。
@@ -1050,6 +1076,7 @@ private fun ParamGroup(
                         .height(1.dp)
                         .background(DoukColors.divider)
                 )
+            }
             }
         }
     }

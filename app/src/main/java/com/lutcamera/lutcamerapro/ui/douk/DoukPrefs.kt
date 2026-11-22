@@ -149,10 +149,18 @@ object DoukPrefs {
     var saveFormat: String
         get() = str("save_format", "JPG + RAW")
         set(v) = putStr("save_format", v)
-    /** 图片编辑器导出格式：JPG / PNG / WebP */
+    /** 图片编辑器导出格式：JPG / PNG（WebP 已按用户要求去掉） */
     var editorFormat: String
-        get() = str("editor_format", "JPG")
+        get() = str("editor_format", "JPG").let { if (it == "WebP" || it == "WEBP") "JPG" else it }
         set(v) = putStr("editor_format", v)
+    /** 图库默认导出格式："" = 每次导出时再选，JPG / PNG = 导出不再弹格式选择 */
+    var defaultExportFormat: String
+        get() = str("default_export_format", "")
+        set(v) = putStr("default_export_format", v)
+    /** 编辑时默认用哪种源格式："" = 有 JPG+RAW 时先问，JPG / HEIC / RAW = 直接用 */
+    var defaultEditFormat: String
+        get() = str("default_edit_format", "")
+        set(v) = putStr("default_edit_format", v)
     /** 图片编辑器导出质量：90 / 95 / 100 */
     var editorQuality: Int
         get() = str("editor_quality", "95").toIntOrNull()?.coerceIn(60, 100) ?: 95
@@ -294,20 +302,20 @@ object DoukPrefs {
         get() = flag("glass_effect", true)
         set(v) = putFlag("glass_effect", v)
 
-    /** 高级材质卡片不透明度：0.95 = 95% 不透明，仍保留一点透光 */
+    /** 高级材质卡片不透明度：固定 0.60，设置项已取消 */
     var materialAlpha: Float
-        get() = getFloat("material_alpha", 0.95f).coerceIn(0.55f, 1f)
-        set(v) = putFloat("material_alpha", v.coerceIn(0.55f, 1f))
+        get() = 0.60f
+        set(v) = putFloat("material_alpha", 0.60f)
 
-    /** 高级材质背后模糊半径（dp），默认 8dp，仅用于底栏 */
+    /** 卡片/底栏背后模糊半径（dp），默认 24dp，上限 40dp */
     var materialBlur: Float
-        get() = getFloat("material_blur", 8f).coerceIn(0f, 20f)
-        set(v) = putFloat("material_blur", v.coerceIn(0f, 20f))
+        get() = getFloat("material_blur", 24f).coerceIn(0f, 40f)
+        set(v) = putFloat("material_blur", v.coerceIn(0f, 40f))
 
-    /** 界面对比度 0–1：0 柔和，0.35 标准，1 高对比 */
+    /** 界面对比度固定 80%，旧的可调项已取消 */
     var uiContrast: Float
-        get() = getFloat("ui_contrast", 0.35f).coerceIn(0f, 1f)
-        set(v) = putFloat("ui_contrast", v.coerceIn(0f, 1f))
+        get() = 0.80f
+        set(v) = putFloat("ui_contrast", 0.80f)
     /** 悬浮 Douk 栏 */
     var floatingBar: Boolean
         get() = flag("floating_bar", false)
@@ -343,10 +351,10 @@ object DoukPrefs {
         get() = flag("gallery_load_all", false)
         set(v) = putFlag("gallery_load_all", v)
 
-    /** 图库网格列数：双指放大缩到 3 列，缩小放到 6 列 */
+    /** 图库网格列数：双指缩放连续切换 2 / 3 / 4 / 5 / 6 / 7 列 */
     var galleryColumns: Int
-        get() = getInt("gallery_columns", 4).coerceIn(3, 6)
-        set(v) = putInt("gallery_columns", v.coerceIn(3, 6))
+        get() = getInt("gallery_columns", 4).coerceIn(2, 7)
+        set(v) = putInt("gallery_columns", v.coerceIn(2, 7))
 
     /** 图库分批显示的每批张数（默认 60，正好铺满平板两三屏） */
     var galleryPageSize: Int
@@ -407,6 +415,41 @@ object DoukPrefs {
 
     fun importedResources(context: Context): List<File> =
         lutDir(context).listFiles()?.sortedBy { it.name.lowercase() } ?: emptyList()
+
+    /**
+     * 资源类型：LUT（.cube/.3dl/.look）还是滤镜（尼康 Picture Control .NP3/.NCP/.NP2）。
+     * 只按扩展名判断，用户手动改过就以用户的为准。
+     */
+    fun resourceKind(fileName: String): String {
+        val saved = str("res_kind_$fileName", "")
+        if (saved.isNotEmpty()) return saved
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        return if (ext in setOf("np3", "ncp", "np2")) "滤镜" else "LUT"
+    }
+
+    fun setResourceKind(fileName: String, kind: String) {
+        putStr("res_kind_$fileName", kind)
+    }
+
+    /**
+     * 适用范围：通用 / 图片 / 视频。
+     * 默认猜测：文件名带 Log / 还原 / Rec709 的当作视频还原 LUT；尼康 Picture Control 当图片滤镜；
+     * 其余当通用。用户可以在资源页随时改。
+     */
+    fun resourceUse(fileName: String): String {
+        val saved = str("res_use_$fileName", "")
+        if (saved.isNotEmpty()) return saved
+        val lower = fileName.lowercase()
+        val looksLog = listOf("log", "n-log", "nlog", "slog", "v-log", "还原", "rec709", "rec.709", "hlg")
+            .any { lower.contains(it) }
+        if (looksLog) return "视频"
+        if (resourceKind(fileName) == "滤镜") return "图片"
+        return "通用"
+    }
+
+    fun setResourceUse(fileName: String, use: String) {
+        putStr("res_use_$fileName", use)
+    }
 
     /** 导入滤镜的分类：文件名为 key，默认「未分类」；内置滤镜固定「自带」。 */
     fun filterCategory(fileName: String): String = str("filter_cat_$fileName", "未分类")

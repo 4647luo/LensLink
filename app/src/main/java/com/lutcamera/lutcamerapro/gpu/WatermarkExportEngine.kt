@@ -201,7 +201,7 @@ object WatermarkExportEngine {
 
             // 纯黑与深空灰系列
                 BorderMode.CANON_RED_RING,
-            BorderMode.NIKON_HERITAGE_GOLD,
+            BorderMode.RETRO_GOLD_PLATE,
             BorderMode.MATTE_BLACK_STUDIO,
             BorderMode.CINEMATIC_LETTERBOX,
             BorderMode.CYBERPUNK_HUD,
@@ -373,8 +373,8 @@ object WatermarkExportEngine {
                 canvas.drawLine(imgRect.left, lineY, imgRect.right, lineY, redLinePaint)
             }
 
-            // 6. 尼康传承黄铜：炭黑底加黄铜金双细线与复古铭牌
-                BorderMode.NIKON_HERITAGE_GOLD -> {
+            // 6. 复古黄铜铭牌：炭黑底加黄铜金双细线与复古铭牌
+                BorderMode.RETRO_GOLD_PLATE -> {
                 val goldPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = Color.parseColor("#D4AF37") // 黄铜色
                 style = Paint.Style.STROKE
@@ -390,7 +390,7 @@ object WatermarkExportEngine {
                     textSize = baseSize * 0.024f
                     textAlign = Paint.Align.LEFT
                 }
-                canvas.drawText("NIKON HERITAGE", imgRect.left, imgRect.bottom + (canvasH - imgRect.bottom) * 0.45f, labelPaint)
+                canvas.drawText("连镜", imgRect.left, imgRect.bottom + (canvasH - imgRect.bottom) * 0.45f, labelPaint)
             }
 
             // 7. 宝丽来彩虹标：底部彩虹条 (红橙黄绿靛
@@ -603,7 +603,7 @@ object WatermarkExportEngine {
     ) {
         val isDarkBg = when (state.mode) {
             BorderMode.CANON_RED_RING,
-            BorderMode.NIKON_HERITAGE_GOLD,
+            BorderMode.RETRO_GOLD_PLATE,
             BorderMode.MATTE_BLACK_STUDIO,
             BorderMode.CINEMATIC_LETTERBOX,
             BorderMode.CYBERPUNK_HUD,

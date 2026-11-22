@@ -83,7 +83,7 @@ object GitHubUpdateChecker {
             conn.readTimeout = 8000
             conn.requestMethod = "GET"
             conn.setRequestProperty("Accept", "application/vnd.github+json")
-            conn.setRequestProperty("User-Agent", "LensLink-Android/${Build.VERSION.SDK_INT}")
+            conn.setRequestProperty("User-Agent", "LianJing-Android/${Build.VERSION.SDK_INT}")
             when (conn.responseCode) {
                 200 -> conn.inputStream.bufferedReader().use { it.readText() }
                 404 -> null

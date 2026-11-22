@@ -9,7 +9,11 @@ import android.net.Uri
 import android.provider.MediaStore
 import com.lutcamera.lutcamerapro.log.DoukHttp
 import okhttp3.Request
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.chrisbanes.haze.hazeSource
 import androidx.compose.foundation.background
@@ -59,6 +63,7 @@ import androidx.compose.material.icons.rounded.SaveAlt
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarBorder
+import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -138,14 +143,22 @@ internal fun PhotoViewerScreen(
     onDeleted: () -> Unit,
     onChanged: () -> Unit,
     onSwipe: (Int) -> Unit = {},
-    showOriginal: Boolean = false
+    showOriginal: Boolean = false,
+    /** 左右两边各一张（含缩略图），跟手滑动时它们一起位移，松手才真正换图 */
+    prevItem: GalleryItem? = null,
+    nextItem: GalleryItem? = null,
+    prevBitmap: ImageBitmap? = null,
+    nextBitmap: ImageBitmap? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
 
     var scale by remember { mutableStateOf(1f) }
     var offsetX by remember { mutableStateOf(0f) }
     var offsetY by remember { mutableStateOf(0f) }
+    // 单指横滑时这一张的实时位移：图片真跟着手指走，松手再决定回弹还是翻页
+    var dragX by remember { mutableStateOf(0f) }
     // 点一下图片进「纯看图」：顶栏和底部条一起收起来，再点一下回来
     var uiHidden by remember { mutableStateOf(false) }
     // 右上角那个按钮不再是分享，改成把当前这张转 90° 看（不改文件）
@@ -193,6 +206,24 @@ internal fun PhotoViewerScreen(
     } else null
 
     /**
+     * HDR 解析用的文件：应用内直接用原文件；手机相册里的图先落一份缓存副本，
+     * 这样 gainmap / PQ 两套解码都能复用同一套文件实现。以前只认 origin=="app"，
+     * 手机里带 HDR 的照片就被当成普通 SDR 显示了。
+     */
+    suspend fun hdrSourceFile(): File? = withContext(Dispatchers.IO) {
+        if (item.origin == "app") GalleryFileOps.locateAppFile(item.fileName)?.let { return@withContext it }
+        if (item.origin != "phone" || item.isVideo) return@withContext null
+        val uri = phoneUri() ?: return@withContext null
+        ImageDecode.materialize(context, uri, "hdr-${item.key}")
+    }
+
+    // Live 图：先只是探测标记，点开播才把尾部视频切出来，避免每次翻页都读整张图
+    var isLive by remember { mutableStateOf(false) }
+    var liveOpen by remember { mutableStateOf(false) }
+    var liveFile by remember { mutableStateOf<File?>(null) }
+    var liveBusy by remember { mutableStateOf(false) }
+
+    /**
      * 视频改成应用内播放：MOV / HEVC 10-bit / N-Log 这些系统播放器经常直接拒播，
      * 这里用 MediaPlayer + GL 自己上屏，还能当场套还原 LUT。
      * 相机内还没落盘的先提示保存，避免点了没反应。
@@ -215,8 +246,10 @@ internal fun PhotoViewerScreen(
     androidx.compose.runtime.LaunchedEffect(item.stableKey) {
         // 横滑换到另一张时，缩放、旋转、浮层、收藏状态全部按新这张重置
         scale = 1f; offsetX = 0f; offsetY = 0f; rotation = 0f
+        dragX = 0f
         uiHidden = false; more = false; detail = false; editing = false; videoOpen = false
         wantOriginal = false
+        liveOpen = false; liveFile = null; liveBusy = false
         favorite = item.stableKey in GalleryFavorites.all(context)
         // 先把网格里已经解码好的缩略图直接铺上，用户点开就是有画面的；
         // 高清图再在后台替换。以前这里先 hd=null 等 decode，5120 万像素的
@@ -231,9 +264,12 @@ internal fun PhotoViewerScreen(
             val large = withContext(Dispatchers.IO) { loadLargeBitmap(context, item) }
             if (large != null) hd = large
         }
+        // Live 图探测：只读文件头，几十毫秒；真正播放再抽视频
+        isLive = withContext(Dispatchers.IO) { LivePhoto.probe(context, item) }
+
         // 真 HDR：只有确实带 gainmap / PQ 的图才走这条，普通 SDR 图不折腾
         if (!item.isVideo && android.os.Build.VERSION.SDK_INT >= 30) {
-            val file = appFile()
+            val file = hdrSourceFile()
             if (file != null && withContext(Dispatchers.IO) { ImageDecode.probeHdr(file) }) {
                 val pair = withContext(Dispatchers.IO) { ImageDecode.decodeHdrPair(file, 3200) }
                 val pq = if (pair == null) {
@@ -248,6 +284,12 @@ internal fun PhotoViewerScreen(
                     "ratio" to (pair?.ratioMax?.toString() ?: "-"),
                     "pq" to (pq != null).toString()
                 )
+            } else if (file != null) {
+                com.lutcamera.lutcamerapro.log.DoukLog.i(
+                    "HdrViewer", "HDR_SKIP",
+                    "file" to file.name,
+                    "msg" to "no hdr marker"
+                )
             }
         }
     }
@@ -257,7 +299,7 @@ internal fun PhotoViewerScreen(
         if (!editing && !item.isVideo && android.os.Build.VERSION.SDK_INT >= 30 &&
             hdrPair == null && hdrPq == null
         ) {
-            val file = appFile()
+            val file = hdrSourceFile()
             if (file != null && withContext(Dispatchers.IO) { ImageDecode.probeHdr(file) }) {
                 val pair = withContext(Dispatchers.IO) { ImageDecode.decodeHdrPair(file, 3200) }
                 hdrPair = pair
@@ -322,7 +364,16 @@ internal fun PhotoViewerScreen(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)
     ) {
-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // 纯黑和 App 的浅色界面切换太生硬，改成带一点层次的深灰渐变
+                .background(
+                    androidx.compose.ui.graphics.Brush.verticalGradient(
+                        listOf(Color(0xFF0B0C0F), Color(0xFF191B21), Color(0xFF0B0C0F))
+                    )
+                )
+        ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -358,19 +409,60 @@ internal fun PhotoViewerScreen(
                                     totalX += pan.x
                                     totalY += pan.y
                                     if (kotlin.math.abs(totalX) > 24f || kotlin.math.abs(totalY) > 24f) moved = true
+                                    // 单指横滑：图片跟着手指实时位移，左右邻图一起拉进来；
+                                    // 到头了（没有上一张/下一张）只给 30% 的橡皮筋位移
+                                    if (kotlin.math.abs(totalX) > 6f) {
+                                        val raw = totalX
+                                        val limited = when {
+                                            raw > 0f && prevItem == null -> raw * 0.3f
+                                            raw < 0f && nextItem == null -> raw * 0.3f
+                                            else -> raw.coerceIn(-size.width.toFloat(), size.width.toFloat())
+                                        }
+                                        dragX = limited
+                                        event.changes.forEach { it.consume() }
+                                    }
                                 }
                                 if (!event.changes.any { it.pressed }) break
                             }
                             val elapsed = System.currentTimeMillis() - downAt
                             val horizontal = kotlin.math.abs(totalX)
                             val vertical = kotlin.math.abs(totalY)
+                            val widthPx = size.width.toFloat()
+                            // 松手：过阈值就把这一张滑出屏幕并真正换图，否则弹回原位
+                            val swipeDir = when {
+                                zoomed || pointers != 1 || scale > 1.01f -> 0
+                                vertical >= widthPx * 0.2f -> 0
+                                horizontal <= widthPx * 0.2f -> 0
+                                totalX < 0f && nextItem != null -> 1
+                                totalX > 0f && prevItem != null -> -1
+                                else -> 0
+                            }
+                            if (swipeDir != 0) {
+                                // 手势协程是受限作用域，动画放到页面 scope 里跑，动画结束才真正换图
+                                scope.launch {
+                                    val from = dragX
+                                    val to = if (swipeDir == 1) -widthPx else widthPx
+                                    animate(0f, 1f, animationSpec = tween(200, easing = FastOutSlowInEasing)) { v, _ ->
+                                        dragX = from + (to - from) * v
+                                    }
+                                    // 先换图再归零：两者在同一次快照里生效，新图直接落在屏幕中间，
+                                    // 不会出现「弹回旧图再跳新图」的一帧闪烁
+                                    onSwipe(swipeDir)
+                                    dragX = 0f
+                                }
+                            } else {
+                                if (dragX != 0f) {
+                                    scope.launch {
+                                        val from = dragX
+                                        animate(0f, 1f, animationSpec = tween(220, easing = FastOutSlowInEasing)) { v, _ ->
+                                            dragX = from * (1f - v)
+                                        }
+                                        dragX = 0f
+                                    }
+                                }
                             when {
                                 // 已经缩放过的这一手只管缩放，不触发换图和分享
                                 zoomed -> Unit
-                                // 单指横滑：往左看下一张，往右看上一张
-                                pointers == 1 && scale <= 1.01f &&
-                                    horizontal > size.width * 0.2f && vertical < size.width * 0.16f ->
-                                    onSwipe(if (totalX < 0f) 1 else -1)
                                 // 单指上滑：直接拉起分享面板
                                 pointers == 1 && totalY < -size.height * 0.16f &&
                                     horizontal < size.width * 0.16f -> share()
@@ -397,6 +489,7 @@ internal fun PhotoViewerScreen(
                                     }
                                 }
                             }
+                            }
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -411,7 +504,13 @@ internal fun PhotoViewerScreen(
                 val shown = hd ?: bitmap
                 val pair = hdrPair
                 val pq = hdrPq
-                if ((pair != null || pq != null) && !editing) {
+                // 拖动时不能再用 graphicsLayer 去拖 SurfaceView（它不吃），但也不能把它拆掉：
+                // 拆掉就 destroy surface，松手重建 GL 要几十上百毫秒，看着就是「一卡一卡」、
+                // 中间还会闪一下灰底。改成 SurfaceView 常驻，拖动时在上面盖一层普通 Image，
+                // 松手后移走这层，HDR 画面本来就是热的，不用重新初始化。
+                val dragging = dragX != 0f
+                val hasHdr = pair != null || pq != null
+                if (hasHdr && !editing) {
                     BoxWithConstraints(
                         modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
                     ) {
@@ -438,7 +537,9 @@ internal fun PhotoViewerScreen(
                                 .size(w, h)
                         )
                     }
-                } else if (shown != null) {
+                }
+                if (editing || dragging || !hasHdr) {
+                    if (shown != null || dragging) {
                     BoxWithConstraints(
                         modifier = Modifier.fillMaxSize().padding(vertical = 40.dp)
                     ) {
@@ -446,21 +547,50 @@ internal fun PhotoViewerScreen(
                         val quarter = (rotation % 180f) != 0f
                         val w = if (quarter) maxHeight else maxWidth
                         val h = if (quarter) maxWidth else maxHeight
-                        Image(
-                            bitmap = shown,
-                            contentDescription = item.fileName,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .size(w, h)
-                                .graphicsLayer {
-                                    scaleX = scale; scaleY = scale
-                                    translationX = offsetX; translationY = offsetY
-                                    rotationZ = rotation
-                                }
-                        )
+                        val pageWidth = with(density) { maxWidth.toPx() }
+                        // 上一张 / 下一张跟着手指一起位移，滑到哪一张都是连续的画面
+                        if (dragX > 0f && prevBitmap != null) {
+                            Image(
+                                bitmap = prevBitmap,
+                                contentDescription = null,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(w, h)
+                                    .graphicsLayer { translationX = dragX - pageWidth }
+                            )
+                        }
+                        if (dragX < 0f && nextBitmap != null) {
+                            Image(
+                                bitmap = nextBitmap,
+                                contentDescription = null,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(w, h)
+                                    .graphicsLayer { translationX = dragX + pageWidth }
+                            )
+                        }
+                        if (shown != null) {
+                            Image(
+                                bitmap = shown,
+                                contentDescription = item.fileName,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(w, h)
+                                    .graphicsLayer {
+                                        scaleX = scale; scaleY = scale
+                                        translationX = offsetX + dragX; translationY = offsetY
+                                        rotationZ = rotation
+                                    }
+                            )
+                        }
                     }
-                } else if (!item.isVideo) {
+                    }
+                } else if (!item.isVideo && !hasHdr) {
+                    // 只有「没有 HDR 层、也没有缩略图」才是真的没图。
+                    // HDR 图静止时画面由 SurfaceView 出，这里再画一句兜底文字会盖在照片上。
                     Text("原图未加载", fontSize = 13.sp, color = Color.White.copy(alpha = 0.7f))
                 }
 
@@ -485,6 +615,89 @@ internal fun PhotoViewerScreen(
                         )
                     }
                 }
+                // Live 图：底部一个 LIVE 胶囊，点一下播这张图附带的动态片段
+                if (isLive && !item.isVideo && !uiHidden) {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 34.dp)
+                            .clip(RoundedCornerShape(percent = 50))
+                            .background(Color.Black.copy(alpha = 0.45f))
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null
+                            ) {
+                                if (!liveBusy) {
+                                    liveBusy = true
+                                    scope.launch {
+                                        val f = LivePhoto.extractVideo(context, item)
+                                        liveFile = f
+                                        liveBusy = false
+                                        if (f != null) liveOpen = true
+                                        else message = "这段 Live 视频取不出来，可能已被裁剪过"
+                                    }
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFE08A2E))
+                        )
+                        if (liveBusy) {
+                            androidx.compose.material3.CircularProgressIndicator(
+                                modifier = Modifier.size(11.dp),
+                                color = Color.White,
+                                strokeWidth = 1.5.dp
+                            )
+                        } else {
+                            Icon(
+                                Icons.Rounded.Videocam,
+                                contentDescription = "播放 Live 图",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+                }
+            }
+
+            // Live 播放层：系统 VideoView 足够播这段几秒的片段
+            if (liveOpen && liveFile != null) {
+                Dialog(
+                    onDismissRequest = { liveOpen = false },
+                    properties = DialogProperties(usePlatformDefaultWidth = false)
+                ) {
+                    Box(
+                        modifier = Modifier.fillMaxSize().background(Color.Black),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AndroidView(
+                            factory = { ctx ->
+                                android.widget.VideoView(ctx).apply {
+                                    setVideoPath(liveFile!!.absolutePath)
+                                    setOnCompletionListener { liveOpen = false }
+                                    start()
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 640.dp)
+                        )
+                        IconButton(
+                            onClick = { liveOpen = false },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .statusBarsPadding()
+                        ) {
+                            Icon(Icons.Rounded.ArrowBack, contentDescription = "关闭", tint = Color.White)
+                        }
+                    }
                 }
             }
 
@@ -493,29 +706,43 @@ internal fun PhotoViewerScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .background(
+                            androidx.compose.ui.graphics.Brush.verticalGradient(
+                                listOf(Color.Black.copy(alpha = 0.62f), Color.Transparent)
+                            )
+                        )
                         .statusBarsPadding()
-                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onDismiss) {
-                        Icon(Icons.Rounded.ArrowBack, contentDescription = "返回", tint = Color.White)
+                    IconButton(onClick = onDismiss, modifier = Modifier.size(38.dp)) {
+                        Icon(
+                            Icons.Rounded.ArrowBack,
+                            contentDescription = "返回",
+                            tint = Color.White,
+                            modifier = Modifier.size(21.dp)
+                        )
                     }
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = GalleryFileOps.shortDateText(item.dateMillis) ?: "相机内照片",
-                            fontSize = 16.sp,
+                            fontSize = 15.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.White
                         )
                         GalleryFileOps.timeText(item.dateMillis)?.let {
-                            Text(it, fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+                            Text(it, fontSize = 10.sp, color = Color.White.copy(alpha = 0.6f))
                         }
                     }
-                    IconButton(onClick = { rotation = (rotation + 90f) % 360f }) {
+                    IconButton(
+                        onClick = { rotation = (rotation + 90f) % 360f },
+                        modifier = Modifier.size(38.dp)
+                    ) {
                         Icon(
                             Icons.Rounded.RotateRight,
                             contentDescription = "旋转视图",
-                            tint = Color.White
+                            tint = Color.White,
+                            modifier = Modifier.size(21.dp)
                         )
                     }
                 }
@@ -528,7 +755,7 @@ internal fun PhotoViewerScreen(
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
                         .navigationBarsPadding()
-                        .padding(horizontal = 12.dp, vertical = 14.dp),
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Row(
@@ -538,8 +765,8 @@ internal fun PhotoViewerScreen(
                                 haze = viewerHaze,
                                 fillAlpha = 0.80f
                             )
-                            .padding(horizontal = 10.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            .padding(horizontal = 7.dp, vertical = 7.dp),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         PillAction(
@@ -773,16 +1000,16 @@ private fun PillAction(
 ) {
     Column(
         modifier = Modifier
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 6.dp)
-            .heightIn(min = 50.dp),
+            .padding(horizontal = 11.dp, vertical = 4.dp)
+            .heightIn(min = 42.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(23.dp))
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(label, fontSize = 11.sp, color = tint)
+        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(19.dp))
+        Spacer(modifier = Modifier.height(1.dp))
+        Text(label, fontSize = 10.sp, color = tint)
     }
 }
 
@@ -1141,14 +1368,24 @@ private fun AddRow(title: String, subtitle: String, onClick: () -> Unit) {
 /** 详情页：左边灰色标签、右边蓝色值，和参考图一致。 */
 @Composable
 private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
-    // HDR 判断：落盘在应用目录的图直接探 gainmap / PQ；相机内原图未落盘就明确写「未检测」
+    // HDR 判断：应用内直接探原文件；手机相册里的图先落一份缓存副本再探（和打开大图时同一套逻辑）。
+    // 以前只认 origin=="app"，手机里的 HDR 图一律落到 null，详情里就永远是「未检测」。
     var hdrFlag by remember { mutableStateOf<Boolean?>(null) }
+    val ctx = LocalContext.current
     androidx.compose.runtime.LaunchedEffect(item.stableKey) {
         hdrFlag = withContext(Dispatchers.IO) {
-            when (item.origin) {
-                "app" -> GalleryFileOps.locateAppFile(item.fileName)?.let { ImageDecode.probeHdr(it) } ?: false
+            if (item.isVideo) return@withContext false
+            val file = when (item.origin) {
+                "app" -> GalleryFileOps.locateAppFile(item.fileName)
+                "phone" -> runCatching {
+                    val uri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, item.key.toLong()
+                    )
+                    ImageDecode.materialize(ctx, uri, "hdr-${item.key}")
+                }.getOrNull()
                 else -> null
             }
+            file?.let { ImageDecode.probeHdr(it) }
         }
     }
 
@@ -1233,10 +1470,13 @@ private fun DetailPage(item: GalleryItem, onDismiss: () -> Unit) {
             // HDR 检测（替换掉原来的 EXIF 长列表）
             DetailRow(
                 "HDR",
-                when (hdrFlag) {
-                    true -> "是 · 带 HDR 增益图（Ultra HDR），HDR 屏上高光会更亮"
-                    false -> "否 · 普通 SDR 图片"
-                    null -> "未检测 · 文件还没落到应用目录（相机内原图请先保存）"
+                when {
+                    item.isVideo -> "视频 · 不做 HDR 检测"
+                    hdrFlag == true -> "是 · 带 HDR 增益图（Ultra HDR），HDR 屏上高光会更亮"
+                    hdrFlag == false -> "否 · 普通 SDR 图片"
+                    item.origin == "cam" || item.origin == "usb" ->
+                        "未检测 · 相机内原图请先保存到手机"
+                    else -> "未检测 · 文件读不到，可能已被移动或删除"
                 }
             )
             // IPTC 字段一个都没有就整行不显示，不再写「这张没有写入 IPTC」这种废话
@@ -1484,7 +1724,7 @@ private fun loadTileMap(lat: Double, lon: Double, wPx: Int, hPx: Int): ImageBitm
 private fun downloadTile(url: String): android.graphics.Bitmap? = runCatching {
     val request = Request.Builder()
         .url(url)
-        .header("User-Agent", "Mozilla/5.0 (Linux; Android) LensLink/1.0")
+        .header("User-Agent", "Mozilla/5.0 (Linux; Android) LianJing/1.0")
         .header("Referer", "https://www.amap.com/")
         .build()
     DoukHttp.client.newCall(request).execute().use { response ->

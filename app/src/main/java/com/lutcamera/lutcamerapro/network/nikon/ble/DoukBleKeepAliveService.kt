@@ -119,7 +119,7 @@ class DoukBleKeepAliveService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return builder
-            .setContentTitle("连镜 LensLink")
+            .setContentTitle("连镜")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)

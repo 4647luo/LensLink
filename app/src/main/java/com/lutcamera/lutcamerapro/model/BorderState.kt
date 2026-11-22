@@ -24,7 +24,7 @@ enum class BorderMode(
     HASSELBLAD_ORANGE("哈苏橙标方框", "中画幅经典 · 橙标方框", BorderCategory.CLASSIC),
     SONY_ALPHA_STUDIO("索尼影棚白框", "极简科技 · 希腊阿尔法标", BorderCategory.CLASSIC),
     CANON_RED_RING("佳能红圈典藏", "奢华红圈 · 金色参数", BorderCategory.CLASSIC),
-    NIKON_HERITAGE_GOLD("尼康复古铭牌", "深炭黑底 · 复古黄铜铭牌", BorderCategory.CLASSIC),
+    RETRO_GOLD_PLATE("复古黄铜铭牌", "深炭黑底 · 复古黄铜铭牌", BorderCategory.CLASSIC),
 
     // === 2. 复古胶片系列 (9 款) ===
     FUJI_INSTAX_SQUARE("Fuji Instax Square", "Instant film white", BorderCategory.FILM),

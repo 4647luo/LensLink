@@ -1792,13 +1792,17 @@ class DoukState(
         intervalRunning = true
         intervalProgress = "0 / $total"
         intervalJob = ioScope.launch {
+            // 间隔拍摄按「先等一个间隔、再拍第一张」执行：
+            // 以前 repeat 里第一轮直接 shoot()，点开始就立刻拍一张，看着像多拍了一张。
             repeat(total) { index ->
+                if (!isActive) return@launch
+                intervalProgress = "等待第 ${index + 1} 张 · ${interval}s"
+                delay(interval * 1000L)
                 if (!isActive) return@launch
                 withContext(Dispatchers.Main) {
                     shoot()
                     intervalProgress = "${index + 1} / $total"
                 }
-                if (index != total - 1) delay(interval * 1000L)
             }
             withContext(Dispatchers.Main) {
                 intervalRunning = false

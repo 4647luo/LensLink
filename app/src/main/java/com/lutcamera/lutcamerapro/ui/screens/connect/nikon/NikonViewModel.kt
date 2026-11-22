@@ -2615,11 +2615,17 @@ class NikonViewModel : ViewModel() {
                 } else emptyList()
                 // 尼康的 ISO 枚举里往往没有「自动」这一项，但机身确实支持 0xFFFF 自动档；
                 // 补一个 Auto 选项，视频 ISO 也能选自动（以前只能选固定数值）。
-                val withAuto = if ((key == "movieIso" || key == "movieIsoAutoHigh") &&
-                    options.none { it.label == "自动" } && desc.isEnum
-                ) {
-                    listOf(CameraOption("自动", 0xFFFFL, desc.dataType)) + options
-                } else options
+                val withAuto = when {
+                    (key == "movieIso" || key == "movieIsoAutoHigh") &&
+                        options.none { it.label == "自动" } && desc.isEnum ->
+                        listOf(CameraOption("自动", 0xFFFFL, desc.dataType)) + options
+                    // 不少机身的视频光圈描述里只有 f/ 数值档，没有「自动」这一项；
+                    // 但机身在视频曝光模式为 P/A 时确实支持自动光圈，raw 0 就是自动档。
+                    // 补一个「自动」，否则视频页永远看不到自动挡。
+                    key == "movieAperture" && options.none { it.label == "自动" } ->
+                        listOf(CameraOption("自动", 0L, desc.dataType)) + options
+                    else -> options
+                }
                 result[key] = ExtraPropState(value, withAuto, desc.writable)
             } else {
                 val raw = rawValueOrNull(prop)
@@ -2650,6 +2656,13 @@ class NikonViewModel : ViewModel() {
         if (!isConnected) return
         viewModelScope.launch(Dispatchers.IO) {
             var ok = ptpClient.setPropRawValue(prop.toShort(), option.dataType, option.raw)
+            // 视频光圈选「自动」：0xD1A9 收 0 表示自动，部分机身只接受 UINT16，
+            // 还有的机身要先让曝光模式进 P/A 才认；这里按顺序退让，尽量让按钮点得动。
+            if (!ok && key == "movieAperture" && option.raw == 0L) {
+                ok = ptpClient.setPropRawValue(prop.toShort(), 0x0004, 0L)
+                if (!ok) ok = ptpClient.setPropRawValue(prop.toShort(), option.dataType, 0xFFFFL)
+                if (!ok) ok = ptpClient.setPropRawValue(prop.toShort(), 0x0004, 0xFFFFL)
+            }
             // 视频 ISO 选「自动」：Z50II 对 0xD1AA=0xFFFF 常回 Device Busy(0x201C)。
             // 依次退回「视频 ISO 自动控制 0xD0AD=开」和「0x500F=0xFFFF」，三级都试，
             // 哪一级被机身接受就用哪一级，别让「自动」点了没反应。

@@ -115,7 +115,7 @@ private const val FEEDBACK_MAIL = "lianjingup@outlook.com"
  */
 private fun saveSupportQrToGallery(context: Context, bitmap: Bitmap): Boolean {
     val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-    val name = "LensLink-support-$stamp.jpg"
+    val name = "lianjing-support-$stamp.jpg"
     val resolver = context.contentResolver
     val values = ContentValues().apply {
         put(MediaStore.Images.Media.DISPLAY_NAME, name)
@@ -444,6 +444,8 @@ fun DoukSettingsScreen(state: DoukState) {
                 var checking by remember { mutableStateOf(false) }
                 var downloading by remember { mutableStateOf(false) }
                 var progress by remember { mutableIntStateOf(0) }
+                // 下载细节：百分比 / 已下载 / 总量 / 速度，走 GitHub 时进度肉眼可见
+                var progressDetail by remember { mutableStateOf("") }
                 var autoCheck by remember { mutableStateOf(DoukPrefs.checkUpdateOnLaunch) }
 
                 val runCheck: () -> Unit = {
@@ -545,12 +547,15 @@ fun DoukSettingsScreen(state: DoukState) {
                                 scope.launch {
                                     downloading = true
                                     progress = 0
+                                    progressDetail = ""
                                     val downloadResult = runCatching {
-                                        UpdateCenter.download(context, info) { percent ->
-                                            progress = percent
+                                        UpdateCenter.download(context, info) { p ->
+                                            progress = p.percent.coerceAtLeast(0)
+                                            progressDetail = p.text()
                                         }
                                     }
                                     downloading = false
+                                    progressDetail = ""
                                     downloadResult.onSuccess { file ->
                                         if (!UpdateCenter.install(context, file)) {
                                             Toast.makeText(
@@ -572,7 +577,9 @@ fun DoukSettingsScreen(state: DoukState) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (downloading) "正在下载 ${progress}%" else "下载并安装最新版本",
+                            text = if (downloading) {
+                                progressDetail.ifBlank { "正在下载 ${progress}%" }
+                            } else "下载并安装最新版本",
                             style = DoukType.body,
                             color = DoukColors.textPrimary,
                             modifier = Modifier.weight(1f)
@@ -609,7 +616,7 @@ fun DoukSettingsScreen(state: DoukState) {
                 ) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "连镜 / LensLink 由一个人维护，免费、无广告、无内购。",
+                        "连镜 由一个人维护，免费、无广告、无内购。",
                         style = DoukType.body,
                         color = DoukColors.textSecondary
                     )
@@ -680,7 +687,7 @@ fun DoukSettingsScreen(state: DoukState) {
             onBack = { showPresetExport = false },
             onExport = {
                 val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-                presetExportLauncher.launch("LensLink-preset-$stamp.zip")
+                presetExportLauncher.launch("lianjing-preset-$stamp.zip")
             }
         )
     } else if (showFeedback) {
@@ -688,7 +695,7 @@ fun DoukSettingsScreen(state: DoukState) {
             onBack = { showFeedback = false },
             onSaveDiagnostics = {
                 val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
-                diagnosticsExportLauncher.launch("LensLink-diagnostics-$stamp.zip")
+                diagnosticsExportLauncher.launch("lianjing-diagnostics-$stamp.zip")
             },
             onSendWithLogs = {
                 scope.launch {
@@ -696,7 +703,7 @@ fun DoukSettingsScreen(state: DoukState) {
                         DoukDiagnostics.email(
                             context,
                             FEEDBACK_MAIL,
-                            "连镜 LensLink 反馈（$APP_VERSION）",
+                            "连镜 反馈（$APP_VERSION）",
                             feedbackBody()
                         ).fold(
                             { "已生成诊断包并拉起邮件客户端，请确认收件人后发送" },
@@ -1083,6 +1090,13 @@ fun DoukSettingsScreen(state: DoukState) {
                 Spacer(modifier = Modifier.height(30.dp))
             }
             "resources" -> SettingsSubPage(title = "资源", onBack = back) {
+                // 不再内置 LUT：资源页只读取用户自己导入的文件。
+                LaunchedEffect(Unit) {
+                    lutCount = DoukPrefs.importedResources(context).size
+                    lutBytes = DoukPrefs.dirSize(DoukPrefs.lutDir(context))
+                    filterFiles = DoukPrefs.importedResources(context).map { it.name }
+                    categoryTick += 1
+                }
                 val files = DoukPrefs.importedResources(context)
                 val tick = categoryTick
                 Text(
@@ -2054,14 +2068,14 @@ fun DoukSettingsScreen(state: DoukState) {
                         Image(
                             // adaptive-icon 是 XML，Compose 的 painterResource 读不了，这里用导出的位图版
                             painter = painterResource(id = R.drawable.douk_app_icon),
-                            contentDescription = "连镜 LensLink",
+                            contentDescription = "连镜",
                             modifier = Modifier.size(52.dp),
                             contentScale = ContentScale.Crop
                         )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("连镜 LensLink", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = DoukColors.textPrimary)
+                        Text("连镜", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = DoukColors.textPrimary)
                         Spacer(modifier = Modifier.height(3.dp))
                         Text("版本 $APP_VERSION", fontSize = 11.sp, color = DoukColors.textSecondary)
                     }
@@ -2085,6 +2099,15 @@ fun DoukSettingsScreen(state: DoukState) {
 private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
+    ChangelogEntry(
+        "0.2.6",
+        listOf(
+            "· 移除内置的 5 个第三方 LUT，改为用户自行导入，应用不再随包分发任何 LUT。",
+            "· 导出水印去掉 NIKON 字样，复古铭牌模板改用「连镜」。",
+            "· 应用名统一为「连镜」，安装包改用拼音命名。",
+            "· 补齐第三方组件声明，并在 README 与应用内增加非官方、无关联声明。"
+        )
+    ),
     ChangelogEntry(
         "0.1.0",
         listOf(
@@ -2202,7 +2225,7 @@ private fun changelogFor(current: String): List<String> {
 
 private val TERMS_LINES = listOf(
     "一、关于本应用",
-    "「连镜 LensLink」是一款用于连接尼康相机的安卓应用，提供图片回传、参数控制、实时取景与定位写入等功能。本应用为个人开发项目，免费提供，不含任何付费功能或广告。安装并使用本应用，即表示你已阅读、理解并同意本条款的全部内容。如果你不同意其中任何一条，请停止使用并卸载本应用。",
+    "「连镜」是一款非官方的第三方应用，用于连接尼康相机，提供图片回传、参数控制、实时取景与定位写入等功能。本应用为个人开发项目，免费提供，不含任何付费功能或广告。安装并使用本应用，即表示你已阅读、理解并同意本条款的全部内容。如果你不同意其中任何一条，请停止使用并卸载本应用。",
     "",
     "二、相机连接与设备要求",
     "1. 本应用通过 PTP/IP（15740 端口）与相机通信，也可以通过 USB PTP 或蓝牙与相机交互。相机端必须处于「连接至智能设备」或「连接至计算机」等对应模式，连接才可能建立。",
@@ -2231,7 +2254,7 @@ private val TERMS_LINES = listOf(
     "4. 因用户违反当地法律法规使用本应用而产生的后果，由用户自行承担。",
     "",
     "七、知识产权",
-    "应用名称「连镜 / LensLink」、图标与界面设计归作者所有。请不要改名换标后作为自己的作品分发，也不要把本应用二次打包上架到应用商店。",
+    "应用图标与界面设计归作者所有。请不要把本应用二次打包后上架到应用商店。",
     "",
     "八、服务变更与终止",
     "作者可能在不另行通知的情况下调整功能、修复问题或停止维护本项目。由于本应用不依赖任何在线服务，你已安装的版本不会因服务下线而立即失效。",
@@ -2316,7 +2339,7 @@ private fun feedbackBody(): String = buildString {
 private fun sendFeedback(context: Context) {
     val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")).apply {
         putExtra(Intent.EXTRA_EMAIL, arrayOf(FEEDBACK_MAIL))
-        putExtra(Intent.EXTRA_SUBJECT, "连镜 LensLink 反馈（$APP_VERSION）")
+        putExtra(Intent.EXTRA_SUBJECT, "连镜 反馈（$APP_VERSION）")
         putExtra(Intent.EXTRA_TEXT, feedbackBody())
     }
     runCatching { context.startActivity(intent) }.onFailure {
@@ -2987,13 +3010,13 @@ private fun AboutPanel(
                 ) {
                     Image(
                         painter = painterResource(id = R.drawable.douk_app_icon),
-                        contentDescription = "连镜 LensLink",
+                        contentDescription = "连镜",
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop
                     )
                 }
                 Spacer(modifier = Modifier.height(DoukSpace.sm))
-                Text("连镜 LensLink", style = DoukType.h2, color = DoukColors.textPrimary)
+                Text("连镜", style = DoukType.h2, color = DoukColors.textPrimary)
                 Spacer(modifier = Modifier.height(3.dp))
                 Text("版本 $APP_VERSION", style = DoukType.caption, color = DoukColors.textSecondary)
             }

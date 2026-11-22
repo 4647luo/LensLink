@@ -1,6 +1,7 @@
 package com.lutcamera.lutcamerapro.ui.theme
 
 import android.app.Activity
+import android.os.Build
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -60,8 +61,16 @@ fun LutcameraproTheme(
         SideEffect {
             val window = (view.context as? Activity)?.window
             if (window != null) {
-                window.statusBarColor = colorScheme.background.toArgb()
-                window.navigationBarColor = colorScheme.background.toArgb()
+                // 系统栏不铺实色：页面底层是 F6FAFF→E8EFF9→F8F1EA 的渐变，
+                // 状态栏一旦涂成背景纯色，顶部就会多出一条比页面更灰的横带，
+                // 看着像是「应用内容和状态栏不是一家」。这里保持透明，
+                // edge-to-edge 下由根布局的渐变一路铺到屏幕顶端。
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    window.isStatusBarContrastEnforced = false
+                    window.isNavigationBarContrastEnforced = false
+                }
                 val insetsController = WindowCompat.getInsetsController(window, view)
                 insetsController.isAppearanceLightStatusBars = !isDark
                 insetsController.isAppearanceLightNavigationBars = !isDark

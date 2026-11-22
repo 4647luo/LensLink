@@ -563,7 +563,7 @@ private fun IntervalShootDialog(
         ) {
             Text("间隔拍摄", style = DoukType.h2, color = DoukColors.textPrimary)
             Text(
-                "应用按设定间隔自动按快门；相机会按当前释放模式拍摄。",
+                "点开始后先等一个间隔再拍第一张，之后按设定间隔连拍；相机会按当前释放模式拍摄。",
                 style = DoukType.label,
                 color = DoukColors.textTertiary
             )

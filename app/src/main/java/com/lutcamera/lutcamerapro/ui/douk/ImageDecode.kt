@@ -160,6 +160,8 @@ object ImageDecode {
     /** 这张图到底有没有 HDR 信息：BT.2020 PQ/HLG 色域，或带 gainmap 的 Ultra HDR。 */
     fun probeHdr(file: File): Boolean = runCatching {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@runCatching false
+        // 先做便宜的字节扫描：XMP 里有 hdrgm / GContainer 就一定带增益图，省掉两次解码
+        if (hasHdrMarker(file)) return@runCatching true
         // 路径 1：BitmapFactory —— Android 14 的 Ultra HDR 走这里才会挂 gainmap
         val opts = android.graphics.BitmapFactory.Options().apply {
             inSampleSize = 8
@@ -258,9 +260,23 @@ object ImageDecode {
         g
     }.getOrDefault(false)
 
-    /** JPEG 里的 Ultra HDR 标记：XMP 的 hdrgm 命名空间，认这个就说明带 gainmap。 */
+    /** JPEG/HEIF 里的 HDR 标记：Ultra HDR 的 hdrgm、Google 容器的 GContainer、苹果 HDRGainMap… */
+    private val HDR_MARKERS = arrayOf(
+        "hdrgm",
+        "gcontainer",
+        "gainmap",
+        "gain map",
+        "hdrgainmap",
+        "iso:std:iso:ts:21496",
+        "21496-1",
+        "urn:com:apple:photo:2020:hdrgainmap",
+        "mpf:"
+    )
+
     fun hasHdrMarker(file: File): Boolean = runCatching {
-        val head = ByteArray(262144)
+        // 以前只扫前 256KB 且只认 "hdrgm"，有些机型把 XMP 放在更后面，
+        // 或者用 GContainer / 苹果 gainmap 命名，就被判成 SDR。这里放宽到 1MB + 多个标记。
+        val head = ByteArray(1024 * 1024)
         var n = 0
         file.inputStream().use { input ->
             while (n < head.size) {
@@ -269,17 +285,56 @@ object ImageDecode {
                 n += r
             }
         }
-        val needle = "hdrgm".toByteArray(Charsets.US_ASCII)
         var found = false
-        var i = 0
-        while (i <= n - needle.size) {
-            var k = 0
-            while (k < needle.size && head[i + k] == needle[k]) k++
-            if (k == needle.size) { found = true; break }
-            i++
+        for (needle in HDR_MARKERS) {
+            if (indexOfAsciiIgnoreCase(head, n, needle)) { found = true; break }
         }
         found
     }.getOrDefault(false)
+
+    /** 在字节数组里找一段 ASCII，大小写不敏感（XMP 里命名空间大小写并不统一）。 */
+    private fun indexOfAsciiIgnoreCase(data: ByteArray, length: Int, needle: String): Boolean {
+        val n = needle.length
+        if (n == 0 || length < n) return false
+        val first = needle[0].lowercaseChar().code
+        var i = 0
+        while (i <= length - n) {
+            val c = data[i].toInt().toChar().lowercaseChar()
+            if (c.code == first) {
+                var k = 1
+                while (k < n) {
+                    val a = data[i + k].toInt().toChar().lowercaseChar()
+                    val b = needle[k].lowercaseChar()
+                    if (a != b) break
+                    k++
+                }
+                if (k == n) return true
+            }
+            i++
+        }
+        return false
+    }
+
+    /**
+     * 手机相册里的图：content:// 先落一份到 cache，后面的 gainmap / PQ 解析全部复用文件版实现。
+     * 命名按 MediaStore id，命中缓存就不再重复拷贝。
+     */
+    fun materialize(context: Context, uri: Uri, key: String): File? = runCatching {
+        val dir = File(context.cacheDir, "hdr").apply { mkdirs() }
+        val target = File(dir, "hdr-$key.bin")
+        if (target.length() > 0L) return@runCatching target
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            target.outputStream().use { out -> input.copyTo(out, 1024 * 1024) }
+        }
+        if (target.length() > 0L) target else null
+    }.getOrNull()
+
+    /** 清掉一天以前的 HDR 缓存，避免相册里的图越看越多把缓存撑满。 */
+    fun trimCache(context: Context) = runCatching {
+        val dir = File(context.cacheDir, "hdr")
+        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+        dir.listFiles()?.forEach { f -> if (f.lastModified() < cutoff) runCatching { f.delete() } }
+    }
 
     /**
      * 按 HDR 解码：目标色域直接要 BT.2020 / PQ，解出来是 RGBA_F16。
@@ -306,11 +361,36 @@ object ImageDecode {
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             decoder.isMutableRequired = false
         }
-        val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(file), listener)
+        val bmp = runCatching { ImageDecoder.decodeBitmap(ImageDecoder.createSource(file), listener) }
+            .getOrNull() ?: decodeHdrViaFactory(file, maxSide)
         if (bmp == null) return@runCatching null
         val isHdr = bmp.config == android.graphics.Bitmap.Config.RGBA_F16 ||
             isHdrColorSpace(bmp.colorSpace)
         if (isHdr) bmp else null
+    }.getOrNull()
+
+    /**
+     * ImageDecoder 拒绝的 PQ/HLG 图（部分 HEIF、改名后的 JPEG）再用 BitmapFactory 直解：
+     * 目标 RGBA_F16 + BT.2020 PQ，能出 16bit 就交给 HDR 上屏。
+     */
+    private fun decodeHdrViaFactory(file: File, maxSide: Int): android.graphics.Bitmap? = runCatching {
+        if (Build.VERSION.SDK_INT < 26) return@runCatching null
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0) return@runCatching null
+        var sample = 1
+        val longSide = maxOf(bounds.outWidth, bounds.outHeight)
+        while (longSide / (sample * 2) > maxSide) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = android.graphics.Bitmap.Config.RGBA_F16
+            inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.BT2020_PQ)
+        }
+        val b = android.graphics.BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@runCatching null
+        if (b.config == android.graphics.Bitmap.Config.RGBA_F16 || isHdrColorSpace(b.colorSpace)) b else {
+            b.recycle()
+            null
+        }
     }.getOrNull()
 
     fun decodeUri(context: Context, uri: Uri, maxSide: Int): ImageBitmap? = runCatching {

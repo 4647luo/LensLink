@@ -64,6 +64,8 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Smartphone
+import androidx.compose.material.icons.rounded.Videocam
+import androidx.compose.material.icons.rounded.Label
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -195,6 +197,13 @@ internal data class GalleryItem(
         }
 }
 
+/**
+ * 缩略图格式角标的总开关。
+ * 放在文件级 Compose state 里：图库「更多」里一拨，网格里所有格子立刻一起变，
+ * 不用把参数从 GalleryScreen 一层层传到 ThumbCell。
+ */
+private val galleryFormatBadge by lazy { mutableStateOf(DoukPrefs.galleryShowFormatBadge) }
+
 /** 图库筛选：类型（图片/视频）、具体格式、横竖构图，三个维度各自独立。 */
 internal data class GalleryFilter(
     val kind: String = "全部",
@@ -296,6 +305,9 @@ fun GalleryScreen(
     var showFilter by remember { mutableStateOf(false) }
     var showMoreMenu by remember { mutableStateOf(false) }
     var showOriginal by remember { mutableStateOf(DoukPrefs.galleryShowOriginal) }
+    // 缩略图左下角的格式角标（JPG/RAW/MOV…）可以关掉，纯看图时更干净。
+    // 用全局 state 而不是把参数一层层传到 ThumbCell，网格里每一格都能立刻跟着变。
+    val showFormatBadge = galleryFormatBadge.value
     var showSourceMenu by remember { mutableStateOf(false) }
     var previewItem by remember { mutableStateOf<GalleryItem?>(null) }
     var galleryView by remember { mutableStateOf(GalleryView.PHOTOS) }
@@ -707,11 +719,20 @@ fun GalleryScreen(
     }
 
     previewItem?.let { item ->
+        // 前后各一张缩略图一起递给查看器：左右滑时它们跟着手指位移，换图不再是硬切
+        val list = currentItems
+        val idx = list.indexOfFirst { it.stableKey == item.stableKey }
+        val prevOf = if (idx > 0) list[idx - 1] else null
+        val nextOf = if (idx >= 0 && idx + 1 < list.size) list[idx + 1] else null
         PhotoViewerScreen(
             item = item,
             bitmap = thumbs[item.stableKey],
             state = state,
             showOriginal = showOriginal,
+            prevItem = prevOf,
+            nextItem = nextOf,
+            prevBitmap = prevOf?.let { thumbs[it.stableKey] },
+            nextBitmap = nextOf?.let { thumbs[it.stableKey] },
             // 左右滑动换图：在当前来源、当前筛选结果里按顺序取下一张，到头就停
             onSwipe = { dir ->
                 val list = currentItems
@@ -784,6 +805,17 @@ fun GalleryScreen(
                     onClick = {
                         showOriginal = !showOriginal
                         DoukPrefs.galleryShowOriginal = showOriginal
+                    }
+                )
+                GalleryMenuRow(
+                    icon = Icons.Rounded.Label,
+                    label = "显示图片格式",
+                    active = showFormatBadge,
+                    trailingCheck = true,
+                    onClick = {
+                        val v = !galleryFormatBadge.value
+                        galleryFormatBadge.value = v
+                        DoukPrefs.galleryShowFormatBadge = v
                     }
                 )
             }
@@ -1521,6 +1553,12 @@ private fun ThumbCell(
             GalleryDecodeGate.withPermit { loader() }?.let { thumbs[item.stableKey] = it }
         }
     }
+    // Live 图角标：探测只读文件头 128KB，结果会被 LivePhoto 缓存，滚动复用不会重复读
+    val context = LocalContext.current
+    var isLive by remember(item.stableKey) { mutableStateOf(LivePhoto.cached(item.stableKey) == true) }
+    LaunchedEffect(item.stableKey) {
+        if (!isLive && !item.isVideo) isLive = LivePhoto.probe(context, item)
+    }
     val bitmap = thumbs[item.stableKey]
     var cellCoords by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
     // 手势协程要长期活着，回调必须是「最新值」而不是创建时那一份
@@ -1593,15 +1631,48 @@ private fun ThumbCell(
         }
 
         // 格式角标统一放左下角：JPG / RAW / JPG+RAW / MOV / MP4…（视频也要显示）
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(4.dp)
-                .clip(RoundedCornerShape(4.dp))
-                .background(Color.Black.copy(alpha = 0.55f))
-                .padding(horizontal = 4.dp, vertical = 1.dp)
-        ) {
-            Text(item.badgeLabel, fontSize = 8.sp, color = Color.White, maxLines = 1)
+        // 「更多 → 显示图片格式」关掉后整块不再画，网格就是纯图。
+        if (galleryFormatBadge.value) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(4.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            ) {
+                Text(item.badgeLabel, fontSize = 8.sp, color = Color.White, maxLines = 1)
+            }
+        }
+
+        // Live 角标：右上角橙色圆点 + 摄像机图标（以前是 "LIVE" 文字，图标更省地方）
+        if (isLive && !item.isVideo) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(4.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(4.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFE08A2E))
+                    )
+                    Icon(
+                        Icons.Rounded.Videocam,
+                        contentDescription = "Live 图",
+                        tint = Color.White,
+                        modifier = Modifier.size(10.dp)
+                    )
+                }
+            }
         }
 
         if (selected) {

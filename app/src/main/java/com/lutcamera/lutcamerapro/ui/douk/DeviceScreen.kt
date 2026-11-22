@@ -1189,7 +1189,7 @@ private fun agoText(deltaMs: Long): String {
 /** 打开系统地图查看坐标；没有地图应用时给一条可读的 toast，不让点击静默失败 */
 private fun openGpsInMap(context: android.content.Context, lat: Double, lon: Double) {
     val uri = android.net.Uri.parse(
-        "geo:$lat,$lon?q=$lat,$lon(${android.net.Uri.encode("连镜 LensLink 位置")})"
+        "geo:$lat,$lon?q=$lat,$lon(${android.net.Uri.encode("连镜 位置")})"
     )
     runCatching {
         context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))

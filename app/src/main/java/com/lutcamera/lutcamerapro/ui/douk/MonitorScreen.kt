@@ -589,8 +589,12 @@ fun MonitorFullscreen(state: DoukState) {
             // 档位优先跟相机实际状态（机身拨到视频档时自动切过来），不让界面一直停在「拍照」
             val video = state.effectiveMode == CaptureMode.VIDEO
             fun expValue(still: String, movie: String): String {
-                val m = state.valueOf(movie)
-                if (video && m.isNotBlank() && m != "—" && m != "相机未上报") return m
+                // 视频档只读视频那一套：视频参数没上报就显示「—」，
+                // 不再回退到拍照档的快门/光圈/ISO，否则切换档位后页面上会挂着拍照的旧值。
+                if (video) {
+                    val m = state.valueOf(movie)
+                    return if (m.isBlank()) "—" else m
+                }
                 val s = state.valueOf(still)
                 return if (s.isBlank()) "—" else s
             }
@@ -1019,19 +1023,27 @@ fun MonitorFullscreen(state: DoukState) {
                 }
             }
 
-            // LUT 资源选择：只要 LUT 是开着的就显示，不依赖工具面板是否展开
-            // （以前必须「监看工具面板 + LUT 打开」两个条件同时成立，面板一收起列表就消失，
-            //  看着就像 LUT 文件没显示出来）
-            if (lutOn) {
+            // LUT 资源选择：只在「监看工具」展开时显示。
+            // 工具面板一收起（点画面/点关闭），这张卡片跟着消失，不再一直挂在底部；
+            // 已选的 LUT 仍然作用在画面上，下次展开面板还能看到原来的选择。
+            if (lutOn && toolSheetVisible) {
+                // 手机横屏高度只有三百多 dp：卡片不再按「底部让开 360dp」定位，
+                // 改成在可用区域内居中并按屏幕高度收口，列表自己滚动，不会被裁掉。
+                val screenHdp = with(density) { rootH.toDp() }
+                val lutMaxH = (screenHdp - 28.dp).coerceAtMost(420.dp).coerceAtLeast(150.dp)
                 Column(
                     modifier = Modifier
                         .align(if (landscape) Alignment.CenterEnd else Alignment.BottomCenter)
                         .then(
-                            if (landscape) Modifier.padding(end = railRightWidth + 372.dp)
-                            // 工具面板展开时往上让开，收起时贴着底栏上沿
-                            else Modifier.padding(bottom = if (toolSheetVisible) 360.dp else 112.dp)
+                            if (landscape) Modifier.padding(
+                                end = railRightWidth + if (toolSheetVisible) 372.dp else 10.dp,
+                                top = 8.dp,
+                                bottom = 8.dp
+                            )
+                            else Modifier.padding(bottom = if (toolSheetVisible) 300.dp else 112.dp)
                         )
-                        .widthIn(max = if (landscape) 420.dp else 360.dp)
+                        .widthIn(max = if (landscape) 400.dp else 340.dp)
+                        .heightIn(max = lutMaxH)
                         .clip(RoundedCornerShape(22.dp))
                         .background(Color(0xF217181B))
                         .padding(10.dp),
@@ -1053,9 +1065,11 @@ fun MonitorFullscreen(state: DoukState) {
                                     .padding(horizontal = 6.dp, vertical = 6.dp)
                             )
                             // 用户要求：LUT 列表改为从上往下排，不再左右横滑
+                            // 高度由外层卡片剩余空间决定，手机横屏也能完整看到并滚动
                             LazyColumn(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .weight(1f, fill = false)
                                     .heightIn(max = if (landscape) 300.dp else 240.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
@@ -1744,6 +1758,11 @@ private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
     val level = state.valueOf("movieMicLevel")
     val wind = state.valueOf("movieWindNoise")
 
+    // 手机麦克风只作为「现场参考电平」的可选项，默认关闭：
+    // 尼康 PTP/Wi-Fi 取景流里没有音频通道，App 拿不到相机实时音频；
+    // 以前默认开手机麦克风，看起来像在监视相机声音，实际是手机自己拾音，已纠正。
+    var phoneRef by remember { mutableStateOf(false) }
+
     // 每次组合都真查一次权限：用户可能刚在系统设置里授权、或在别的页面点过允许，
     // 以前只在 remember 里查一次，界面会一直停在「未授权」，看着就像电平坏了。
     var granted by remember {
@@ -1768,10 +1787,11 @@ private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
     val askPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { ok -> granted = ok }
-    val micLevel = rememberMicLevel(granted)
+    val micLevel = rememberMicLevel(granted && phoneRef)
     val db = micLevel.db
     val peakDb = micLevel.peak
     val gain = ((db + 60f) / 60f).coerceIn(0f, 1f)
+    val bodyAudio = listOf(mic, level, wind).any { it.isNotBlank() && it != "—" && it != "相机未上报" }
 
     Column(
         modifier = modifier
@@ -1779,69 +1799,77 @@ private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
             .background(Color(0xE6101114))
             .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(18.dp))
             .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp)
+        verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("手机麦克风 · 实测", color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp)
+            Text("相机音频", color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp)
             Spacer(Modifier.weight(1f))
             Box(
                 Modifier
                     .size(6.dp)
                     .clip(CircleShape)
-                    .background(if (granted) Color(0xFF9BFF6A) else Color.White.copy(alpha = 0.3f))
+                    .background(Color.White.copy(alpha = 0.3f))
             )
             Spacer(Modifier.width(5.dp))
-            Text(
-                if (granted) "拾音中" else "未授权",
-                color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp
-            )
+            Text("无实时音频", color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp)
         }
-
-        if (granted) {
-            ChannelMeter("MIC", gain)
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("-40", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                Spacer(Modifier.weight(1f))
-                Text("-20", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                Spacer(Modifier.weight(1f))
-                Text("-12", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                Spacer(Modifier.weight(1f))
-                Text("-6", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                Spacer(Modifier.weight(1f))
-                Text("0 dB", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-            }
-            Text(
-                if (db <= -59f) "环境声很安静（−60 dB 以下）"
-                else "当前 %.0f dB · 峰值 %.0f dB".format(db, peakDb),
-                color = Color.White.copy(alpha = 0.75f), fontSize = 10.sp
-            )
-        } else {
-            Text(
-                "点下面开启，手机麦克风会被用来测音量（不录音、不保存）",
-                color = Color.White.copy(alpha = 0.7f), fontSize = 9.sp, maxLines = 2
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "开启麦克风电平",
-                color = Color(0xFF9BFF6A), fontSize = 11.sp,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(percent = 50))
-                    .background(Color.White.copy(alpha = 0.08f))
-                    .clickable { askPermission.launch(Manifest.permission.RECORD_AUDIO) }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
-            )
-        }
-
-        val bodyAudio = listOf(mic, level, wind).any { it.isNotBlank() && it != "—" && it != "相机未上报" }
+        Text(
+            "尼康取景流只传画面，不带音频数据，所以这里读不到相机的实时电平；" +
+                "录音电平、麦克风灵敏度是相机自己的设置，声音会随录像写进文件。",
+            color = Color.White.copy(alpha = 0.62f), fontSize = 9.sp, maxLines = 3
+        )
         Text(
             if (bodyAudio) "机身：麦克风 ${mic.ifBlank { "—" }} · ${level.ifBlank { "电平 —" }} · 风噪 ${wind.ifBlank { "—" }}"
-            else "机身音频：Wi-Fi 直播只传画面，不传声音（录像会写进文件）",
-            color = Color.White.copy(alpha = 0.5f), fontSize = 9.sp, maxLines = 2
+            else "机身音频设置：相机未上报（把机身切到视频档再看）",
+            color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp, maxLines = 2
         )
+
+        // 明确可选项：要现场参考可以开手机麦克风，但界面会一直写明「手机」。
         Text(
-            "尼康 Wi-Fi 只传取景画面，不传实时音频；相机的声音随录像写进文件，这里用手机麦克风做现场电平参考",
-            color = Color.White.copy(alpha = 0.5f), fontSize = 8.5.sp, maxLines = 3
+            if (phoneRef) "关闭手机参考电平" else "用手机麦克风做参考电平（不是相机声音）",
+            color = if (phoneRef) Color.White.copy(alpha = 0.7f) else Color(0xFF9BFF6A),
+            fontSize = 10.sp,
+            modifier = Modifier
+                .clip(RoundedCornerShape(percent = 50))
+                .background(Color.White.copy(alpha = 0.08f))
+                .clickable {
+                    if (phoneRef) {
+                        phoneRef = false
+                    } else if (granted) {
+                        phoneRef = true
+                    } else {
+                        askPermission.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+                .padding(horizontal = 10.dp, vertical = 5.dp)
         )
+        if (phoneRef) {
+            if (granted) {
+                Text("手机麦克风 · 现场参考", color = Color.White.copy(alpha = 0.62f), fontSize = 9.sp)
+                ChannelMeter("MIC", gain)
+                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("-40", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text("-20", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text("-12", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text("-6", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text("0 dB", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
+                }
+                Text(
+                    if (db <= -59f) "环境声很安静（−60 dB 以下）"
+                    else "当前 %.0f dB · 峰值 %.0f dB".format(db, peakDb),
+                    color = Color.White.copy(alpha = 0.75f), fontSize = 10.sp
+                )
+            } else {
+                Text(
+                    "已选手机参考，但还没拿到录音权限；再点一次上面的按钮授权。",
+                    color = Color.White.copy(alpha = 0.6f), fontSize = 9.sp, maxLines = 2
+                )
+            }
+        }
     }
 }
 

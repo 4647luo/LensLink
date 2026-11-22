@@ -336,6 +336,11 @@ object DoukPrefs {
         get() = flag("gallery_show_original", false)
         set(v) = putFlag("gallery_show_original", v)
 
+    /** 图库：缩略图左下角是否显示 JPG/RAW/MOV 这类格式角标 */
+    var galleryShowFormatBadge: Boolean
+        get() = flag("gallery_show_format_badge", true)
+        set(v) = putFlag("gallery_show_format_badge", v)
+
     /** 图库默认打开的来源：相机内 / 应用内 / 手机内 */
     var galleryDefaultSource: String
         get() = str("gallery_default_source", "相机内")

@@ -57,10 +57,24 @@ object GalleryFileOps {
         File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCameraPro")
     )
 
-    fun locateAppFile(fileName: String): File? =
-        appRoots().filter { it.exists() }.flatMap { root ->
+    /** 文件名 → 文件句柄的短缓存：Live 图角标、缩略图都要反查，别每次都遍历目录 */
+    private val locateCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, File?>>()
+
+    fun locateAppFile(fileName: String): File? {
+        val now = System.currentTimeMillis()
+        locateCache[fileName]?.let { (stamp, file) ->
+            if (now - stamp < 30 * 1000L) return file
+        }
+        val found = appRoots().filter { it.exists() }.flatMap { root ->
             root.walkTopDown().maxDepth(3).filter { it.isFile && it.name == fileName }.toList()
         }.firstOrNull()
+        locateCache[fileName] = now to found
+        return found
+    }
+
+    fun forgetLocate(fileName: String) {
+        locateCache.remove(fileName)
+    }
 
     /**
      * 判重名：去掉扩展名、去掉「 (1)」「 (2)」这类系统重名后缀，统一小写。

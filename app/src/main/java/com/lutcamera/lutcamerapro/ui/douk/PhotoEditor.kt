@@ -989,8 +989,8 @@ private fun MainTabBar(current: String, onPick: (String) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .doukFlatSurface(RoundedCornerShape(18.dp))
-            .padding(vertical = 4.dp),
+            .doukFlatSurface(RoundedCornerShape(15.dp))
+            .padding(vertical = 2.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         tabs.forEach { (name, icon) ->
@@ -998,21 +998,21 @@ private fun MainTabBar(current: String, onPick: (String) -> Unit) {
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(12.dp))
                     .clickable { onPick(name) }
-                    .padding(vertical = 7.dp),
+                    .padding(vertical = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(3.dp)
+                verticalArrangement = Arrangement.spacedBy(1.dp)
             ) {
                 Icon(
                     icon,
                     contentDescription = name,
                     tint = if (active) Color(0xFFE08A2E) else Color(0xFF8A8A8A),
-                    modifier = Modifier.size(21.dp)
+                    modifier = Modifier.size(18.dp)
                 )
                 Text(
                     name,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
                     color = if (active) Color(0xFFE08A2E) else Color(0xFF8A8A8A)
                 )
@@ -1041,9 +1041,9 @@ private fun AdjustSlider(
     val latestLive = rememberUpdatedState(onLive)
     var touching by remember { mutableStateOf(false) }
     val density = LocalDensity.current
-    val thumbRadius = with(density) { 14.dp.toPx() }
+    val thumbRadius = with(density) { 12.dp.toPx() }
     val padPx = thumbRadius + with(density) { 2.dp.toPx() }
-    val trackHeight = with(density) { 20.dp.toPx() }
+    val trackHeight = with(density) { 17.dp.toPx() }
     val bubblePaint = remember {
         android.graphics.Paint().apply {
             isAntiAlias = true
@@ -1189,23 +1189,23 @@ private fun AdjustGroups(active: AdjustItem, state: EditState, onPick: (AdjustIt
             val changed = abs(value) > 0.5f
             Column(
                 modifier = Modifier
-                    .width(56.dp)
-                    .height(64.dp)
-                    .clip(RoundedCornerShape(11.dp))
+                    .width(50.dp)
+                    .height(56.dp)
+                    .clip(RoundedCornerShape(10.dp))
                     .background(if (on) Color(0xFFFBF0E3) else Color(0xFFEDEDED))
                     .then(
-                        if (on) Modifier.border(1.5.dp, Color(0xFFE08A2E), RoundedCornerShape(11.dp))
+                        if (on) Modifier.border(1.5.dp, Color(0xFFE08A2E), RoundedCornerShape(10.dp))
                         else Modifier
                     )
                     .clickable { onPick(item) }
-                    .padding(vertical = 6.dp),
+                    .padding(vertical = 5.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
                 if (on && changed) {
                     Text(
                         formatAdjust(value),
-                        fontSize = 17.sp,
+                        fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF222222),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -1216,10 +1216,10 @@ private fun AdjustGroups(active: AdjustItem, state: EditState, onPick: (AdjustIt
                         item.icon,
                         contentDescription = item.label,
                         tint = if (on) Color(0xFF222222) else Color(0xFF4A4A4A),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(3.dp))
                 Text(
                     item.label,
                     fontSize = 9.sp,

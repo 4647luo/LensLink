@@ -88,7 +88,7 @@ object DoukPreset {
             }
             zip.putNextEntry(ZipEntry("README.txt"))
             val readme = buildString {
-                appendLine("连镜 LensLink 预设包")
+                appendLine("连镜 预设包")
                 appendLine("preset.json：设置项")
                 appendLine("luts/：LUT(.cube) 与滤镜(.xmp) 原文件，导入时自动复制回应用的滤镜目录")
                 appendLine("导出时间：${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())}")
@@ -104,7 +104,7 @@ object DoukPreset {
     private fun buildJson(selection: Set<String>): String {
         val root = JSONObject()
         root.put("schema", SCHEMA)
-        root.put("app", "连镜 LensLink")
+        root.put("app", "连镜")
         root.put("version", BuildConfig.VERSION_NAME)
         root.put("exportedAt", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(Date()))
         val g = JSONObject()

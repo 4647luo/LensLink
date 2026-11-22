@@ -168,9 +168,12 @@ fun DoukRoot() {
     // 运行日志落盘需要 Context；Application 已安装，这里只作为兜底（重复调用无副作用）
     LaunchedEffect(Unit) { DoukLog.install(context) }
 
-    // 内置的 5 个尼康 N-Log 转 Rec709 LUT：首启复制到资源目录，之后资源页/监视直接可选
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) { runCatching { BundledLuts.installIfNeeded(context) } }
+
+    // 机身拨到视频档 / 拨回拍照档时，控制页和监视页一起跟着换参数。
+    // 以前只在控制页监听，用户停在监视页拨机身档位时监视页不会切；提到根节点后两页都跟。
+    LaunchedEffect(state.detectedVideoMode) {
+        val detected = state.detectedVideoMode ?: return@LaunchedEffect
+        state.followDetectedMode(detected)
     }
 
     // 监看面板「接管相机」按钮的亮起状态要和持久化值一致（默认关闭 = 不接管、相机屏幕照常显示）

@@ -50,6 +50,10 @@ internal class HdrImageView @JvmOverloads constructor(
     private var gainBmp: Bitmap? = null
     private var ratioMax = 1f
     private var gainOn = false
+    // 已经在 GL 里的那张底图 / 增益图：换了图必须重新上传，
+    // 以前只在 texId==0 时上传，翻到下一张会继续显示上一张的纹理。
+    private var texBitmap: Bitmap? = null
+    private var texGain: Bitmap? = null
     private var vPos = 0
     private var vTex = 0
     private var uTex = 0
@@ -62,9 +66,12 @@ internal class HdrImageView @JvmOverloads constructor(
     private var uQuarter = 0
     private var quad: FloatBuffer? = null
 
-    /** 是否真的用上了 PQ 交换链（false = SDR 回退） */
+    /** 这一层是否真的用上了 PQ 交换链（false = SDR 回退） */
     var hdrActive: Boolean = false
         private set
+
+    /** EGL 窗口是否按 BT2020_PQ 建成功；只有它为 true 才允许输出 PQ 数值 */
+    private var pqSurface = false
 
     /** 只用来给外部打一次诊断日志，避免重复刷 log */
     var loggedReady = false
@@ -110,7 +117,10 @@ internal class HdrImageView @JvmOverloads constructor(
         surfaceReady = true
         handler.post {
             initGl()
-            applyHdrDataSpace()
+            // 只有 EGL 窗口本身按 PQ 建成功，才敢把数据写成 PQ。
+            // 以前不管 EGL 成没成，SurfaceControl.setDataSpace 一返回就把 hdrActive 置 true，
+            // 结果 8bit/sRGB 交换链里塞的是 PQ 数值，整张图被当成 sRGB 解读 → 一打开就是灰的。
+            if (pqSurface) applyHdrDataSpace()
         }
     }
 
@@ -235,6 +245,9 @@ internal class HdrImageView @JvmOverloads constructor(
             .asFloatBuffer()
             .apply { put(data); position(0) }
         DoukLog.i("HdrImage", "GL_READY", "hdr" to hdrActive.toString())
+        // 有些机型 surfaceCreated 之后才第一次到画面，surfaceChanged 不一定再来一次；
+        // 初始化完主动画一帧，避免停在黑/灰底。
+        renderOnce()
     }
 
     private fun createWindowSurface(display: EGLDisplay, config: EGLConfig, pq: Boolean): EGLSurface =
@@ -245,10 +258,11 @@ internal class HdrImageView @JvmOverloads constructor(
             ) else intArrayOf(EGL14.EGL_NONE)
             val s = EGL14.eglCreateWindowSurface(display, config, holder.surface, a, 0)
             if (pq) {
-                hdrActive = s != EGL14.EGL_NO_SURFACE
+                pqSurface = s != EGL14.EGL_NO_SURFACE
+                hdrActive = pqSurface
                 DoukLog.i(
                     "HdrImage", "PQ_SURFACE",
-                    "ok" to hdrActive.toString(),
+                    "ok" to pqSurface.toString(),
                     "err" to EGL14.eglGetError().toString()
                 )
             }
@@ -296,14 +310,25 @@ internal class HdrImageView @JvmOverloads constructor(
                 vec4 c = texture(uTex, vTexCoord);
                 if (uGainOn > 0.5) {
                     float g = texture(uGain, vTexCoord).r;
+                    // sRGB 8bit → 线性，再按增益乘到 SDR 白（203 nits）之上。
+                    // 增益只作用到中高光：暗部仍按 SDR 亮度走，整张图不会因为
+                    // 平均增益而发灰；高光再冲一段后软压顶，避免整片死白。
+                    vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3(2.2));
+                    float lum = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+                    float w = smoothstep(0.16, 0.85, lum);
+                    float ratio = pow(uRatioMax, g);
+                    float boost = 1.0 + (ratio - 1.0) * (0.25 + 0.75 * w);
                     if (uTonemap > 0.5) {
-                        // SDR 回退：不带增益，直接给底图，避免过曝
-                        fragColor = vec4(c.rgb, 1.0);
+                        // SDR 交换链：不能直接把底图丢出去。Ultra HDR 的底图本身就是
+                        // 一张低对比的 SDR 层，直接显示就是用户看到的「一停就发灰」。
+                        // 这里照 HDR 的增益算完再压回 0..1，画面和拖动时看到的一致。
+                        vec3 lit = lin * boost;
+                        lit = lit / (1.0 + max(lit - 0.92, 0.0) * 0.42);
+                        fragColor = vec4(pow(clamp(lit, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
                     } else {
-                        // sRGB 8bit → 线性，再按增益乘到 SDR 白（203 nits）之上
-                        vec3 lin = pow(clamp(c.rgb, 0.0, 1.0), vec3(2.2));
-                        float ratio = pow(uRatioMax, g);
-                        vec3 nits = lin * ratio * 203.0;
+                        vec3 nits = lin * boost * 203.0;
+                        // 1600 nits 以上柔化，保留高光层次而不是一刀切
+                        nits = nits - max(nits - 1600.0, 0.0) * 0.6;
                         fragColor = vec4(pq(nits), 1.0);
                     }
                 } else if (uTonemap > 0.5) {
@@ -360,6 +385,8 @@ internal class HdrImageView @JvmOverloads constructor(
                 val ids = IntArray(1)
                 GLES20.glGenTextures(1, ids, 0)
                 texId = ids[0]
+            }
+            if (texBitmap !== bmp) {
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -367,6 +394,7 @@ internal class HdrImageView @JvmOverloads constructor(
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
                 runCatching { GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0) }
                     .onFailure { DoukLog.w("HdrImage", "TEX_UPLOAD_FAIL", "err" to it.message) }
+                texBitmap = bmp
             }
             val gain = gainBmp
             if (gain != null && !gain.isRecycled) {
@@ -374,6 +402,8 @@ internal class HdrImageView @JvmOverloads constructor(
                     val ids = IntArray(1)
                     GLES20.glGenTextures(1, ids, 0)
                     gainTex = ids[0]
+                }
+                if (texGain !== gain) {
                     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, gainTex)
                     GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
                     GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -381,6 +411,7 @@ internal class HdrImageView @JvmOverloads constructor(
                     GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
                     runCatching { GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, gain, 0) }
                         .onFailure { DoukLog.w("HdrImage", "GAIN_UPLOAD_FAIL", "err" to it.message) }
+                    texGain = gain
                 }
             }
             // 按图片比例做 letterbox，别把人像拉变形（转 90° 时宽高比取倒数）
@@ -433,6 +464,12 @@ internal class HdrImageView @JvmOverloads constructor(
             runCatching { GLES20.glDeleteTextures(1, intArrayOf(texId), 0) }
             texId = 0
         }
+        if (gainTex != 0) {
+            runCatching { GLES20.glDeleteTextures(1, intArrayOf(gainTex), 0) }
+            gainTex = 0
+        }
+        texBitmap = null
+        texGain = null
         if (program != 0) {
             runCatching { GLES20.glDeleteProgram(program) }
             program = 0

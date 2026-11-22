@@ -587,7 +587,7 @@ wlan1 192.168.125.60  →  相机热点断开后残留的旧 IP
 | --- | --- | --- |
 | 中文名 | 连镜 | `res/values/strings.xml` 的 `app_name` |
 | 英文名 | LensLink | `res/values-en/strings.xml` 的 `app_name` |
-| 设置页「关于」 | 连镜 LensLink / 3.26-nikon-ui-refinement | `DoukSettingsScreen` |
+| 设置页「关于」 | 连镜 / 3.26-nikon-ui-refinement | `DoukSettingsScreen` |
 
 桌面显示随系统语言切换：中文环境显示「连镜」，英文环境显示「LensLink」。
 
@@ -728,7 +728,7 @@ ping 192.168.125.174 → 连续 8 次 100% packet loss
 | 设备 | 自动连接已连接过的设备（开关）、已连接过的设备（列表可连接/删除）、默认连接方式 |
 | 下载 | 自动下载相机照片（开关）+ 照片大小 / 文件格式 / 保存位置；只下载相机里锁定的文件（开关）+ 锁定文件大小 / 格式 / 保存位置 |
 | 通用 | 储存、权限说明、语言、资源·LUT 与滤镜、GPS 数据导入、外观设置、拍摄后即时预览、设备页相机照片 |
-| 关于 | 一个入口卡片（图标 + 连镜 LensLink + 版本），点开进独立界面 |
+| 关于 | 一个入口卡片（图标 + 连镜 + 版本），点开进独立界面 |
 
 控制面板只保留「参数排列顺序」一项。**运行日志入口已按用户要求从设置页移除**，日志仍在
 `filesDir/douk-logs` 持续落盘，只是不在界面里显示。
@@ -2163,7 +2163,7 @@ else emptyList()
 - **储存页改造**：移除「运行日志」「连接诊断记录」两行，只保留「应用内图片」「LUT 与滤镜」「合计」；新增「导出预设」「导入预设」。
 - **预设格式**：`DoukPreset` 定义 `lenslink-preset-v1`，分组为设备连接 / 下载与回传 / 通用 / 外观 / 图库 / 图像编辑 / 滤镜分类。导出页可以逐组勾选或全选，用 SAF `CreateDocument` 写 JSON；导入用 `OpenDocument`，只覆盖文件里出现的组，导入后 `Activity.recreate()` 刷新设置页。
 - **预设隐私**：不打包照片、视频、LUT 文件；蓝牙广播名里的 NUL 填充在导出时清掉，并按「名称+地址」去重；导入只写 SharedPreferences，不复制任何媒体文件。
-- **验证**：`assembleDebug` BUILD SUCCESSFUL（`_tmp/build189e.log`）；真机 87159031 覆盖安装 `versionCode=329 / versionName=3.29-log-preset`，启动与导入后均无 FATAL；储存页截图 `_tmp/b189_storage2.png` 已无日志/诊断两行；预设勾选页 `_tmp/b189_preset2.png`；导出文件 `/sdcard/Pictures/LensLink-preset-20261117-2342.json` 2032 bytes，分组齐全；导入同文件提示「已导入 7 组」，页面自动重建；诊断 ZIP `LensLink-diagnostics-20261117-234520.zip` 21382 bytes，含 13 个 `logs/session-*.log`、`xlog/2026-11-17`、`settings/preset.json`、README、device-info；分享面板 `_tmp/b189_share.png` 正确带 ZIP 附件。最终 APK `连镜-LensLink-build189.apk` 65,775,027 bytes，SHA256 `DBC9E756B9C88562929D988E03EEE7275D29391C5D5834C6E8680CA994649641`。
+- **验证**：`assembleDebug` BUILD SUCCESSFUL（`_tmp/build189e.log`）；真机 87159031 覆盖安装 `versionCode=329 / versionName=3.29-log-preset`，启动与导入后均无 FATAL；储存页截图 `_tmp/b189_storage2.png` 已无日志/诊断两行；预设勾选页 `_tmp/b189_preset2.png`；导出文件 `/sdcard/Pictures/lianjing-preset-20261117-2342.json` 2032 bytes，分组齐全；导入同文件提示「已导入 7 组」，页面自动重建；诊断 ZIP `lianjing-diagnostics-20261117-234520.zip` 21382 bytes，含 13 个 `logs/session-*.log`、`xlog/2026-11-17`、`settings/preset.json`、README、device-info；分享面板 `_tmp/b189_share.png` 正确带 ZIP 附件。最终 APK `连镜-LensLink-build189.apk` 65,775,027 bytes，SHA256 `DBC9E756B9C88562929D988E03EEE7275D29391C5D5834C6E8680CA994649641`。
 - **配套文档**：`docs/反馈与诊断日志.md`，面向用户和后续维护者，说明怎么发 ZIP、ZIP 里有什么、哪些内容不会被采集、拿到 ZIP 后怎么定位崩溃和连接问题。
 
 ## 18.16 build190：GPS 128 根因修复（TIME 心跳 + UTC 时间 + 写槽串行化）

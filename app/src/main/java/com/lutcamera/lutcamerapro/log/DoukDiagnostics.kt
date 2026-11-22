@@ -34,7 +34,7 @@ object DoukDiagnostics {
         // 只保留最近 3 个诊断包，避免缓存无限增长
         dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(3)?.forEach { it.delete() }
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val file = File(dir, "LensLink-diagnostics-$stamp.zip")
+        val file = File(dir, "lianjing-diagnostics-$stamp.zip")
         ZipOutputStream(FileOutputStream(file)).use { zip ->
             addText(zip, "README.txt", readme(context, stamp))
             addText(zip, "device-info.txt", deviceInfo(context))
@@ -117,7 +117,7 @@ object DoukDiagnostics {
     }
 
     private fun readme(context: Context, stamp: String): String = buildString {
-        appendLine("连镜 LensLink 诊断包")
+        appendLine("连镜 诊断包")
         appendLine("生成时间：$stamp")
         appendLine("版本：${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         appendLine()

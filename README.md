@@ -104,7 +104,6 @@
 
 ### 4. 图库与编辑
 
-![图库](docs/guide/images/gallery.jpg)
 
 1. **切换相册**：在「应用内」和「系统相册」之间切换。
 2. **右上角更多**：选择、排序、批量下载等。
@@ -228,9 +227,7 @@ App 不上传照片到任何服务器；GitHub 更新检查只请求公开的 Re
 
 连镜 LensLink 由一个人维护，免费、无广告、无内购。如果它帮你省了时间，可以扫码请作者喝杯咖啡。赞赏完全自愿，不影响任何功能。
 
-<p align="center">
-  <img src="docs/guide/images/sponsor.jpg" width="280" alt="赞赏码">
-</p>
+应用内「设置 → 支持作者」可查看赞赏码。也可在 GitHub 上给项目点一个 Star。
 
 <p align="center">感谢每一位使用和反馈的尼康用户。</p>
 

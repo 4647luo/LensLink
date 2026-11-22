@@ -69,6 +69,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
     }
 
+
     private fun hideGestureNavigationBar() {
         val gestureNavigation = runCatching {
             android.provider.Settings.Secure.getInt(contentResolver, "navigation_mode", 0) == 2

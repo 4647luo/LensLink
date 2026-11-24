@@ -12,6 +12,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.lutcamera.lutcamerapro.ui.douk.DoukRoot
+import com.lutcamera.lutcamerapro.ui.douk.SupportReminder
 import com.lutcamera.lutcamerapro.ui.douk.UpdateCenter
 import com.lutcamera.lutcamerapro.ui.theme.AppThemeManager
 import com.lutcamera.lutcamerapro.ui.theme.LutcameraproTheme
@@ -32,11 +33,17 @@ class MainActivity : ComponentActivity() {
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
         window.navigationBarDividerColor = Color.TRANSPARENT
-        // 三段式导航栏的系统半透明蒙层会破坏底栏颜色的连续性（minSdk 29，系统都支持这两个开关）
+        // MIUI 上仅靠 setDecorFitsSystemWindows 有时仍会把 DecorView 压到 2780，
+        // 底部 100px 归系统导航栏，应用自己的浅色 chrome 永远铺不过去。
+        // 这里补 legacy layout 标志，让根布局真正画到 2880，底部由 DoukRoot 的
+        // 56dp chrome 盖住。
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility =
+            android.view.View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            android.view.View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+            android.view.View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
         window.isNavigationBarContrastEnforced = false
         window.isStatusBarContrastEnforced = false
-        // 小米等 ROM 的手势导航条会强制铺一层 #F2F2F7 的浅色底，应用改 navigationBarColor 也无效。
-        // 只在「手势导航」模式下隐藏系统导航条，页面渐变才能真正铺到最底；三键导航保留系统按钮。
         hideGestureNavigationBar()
         // 初始化黑白主题持久化配置（默认浅色白色苹果风格）
         AppThemeManager.init(this)
@@ -48,9 +55,17 @@ class MainActivity : ComponentActivity() {
                 DoukRoot()
             }
         }
-        // 启动自动检查：设置里可关；24 小时内不重复请求，失败静默，只有新版本才弹窗
+        // 启动顺序：本月还没弹过赞赏提示就先弹一次，关掉后再检查更新；
+        // 本月已弹过则直接检查更新。两个对话框不叠在一起。
         lifecycleScope.launch {
-            UpdateCenter.checkOnLaunch(this@MainActivity)
+            val supportShown = SupportReminder.showIfDue(this@MainActivity) {
+                lifecycleScope.launch {
+                    UpdateCenter.checkOnLaunch(this@MainActivity)
+                }
+            }
+            if (!supportShown) {
+                UpdateCenter.checkOnLaunch(this@MainActivity)
+            }
         }
     }
 

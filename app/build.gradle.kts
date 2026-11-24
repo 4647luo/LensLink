@@ -18,18 +18,32 @@ android {
     namespace = "com.lutcamera.lutcamerapro"
     // 回退到 34，与你的 Gradle 插件 8.5.1 完美匹配
     compileSdk = 34
+    // LibRaw master 用 NDK r28 的 clang 编译；本机 SDK 里固定使用这个版本。
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.lutcamera.lutcamerapro"
         minSdk = 29
         // 回退到 34
         targetSdk = 34
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 110
+        versionName = "1.1.0"
+
+        // 手机端只打包 arm64；LibRaw 静态库按 ABI 单独编译，减少构建时间和包体。
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.31.6"
         }
     }
 
@@ -42,14 +56,22 @@ android {
             storePassword = keystoreProps.getProperty("storePassword")
             keyAlias = keystoreProps.getProperty("keyAlias")
             keyPassword = keystoreProps.getProperty("keyPassword")
-            enableV1Signing = true
+            enableV1Signing = false
             enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
     buildTypes {
+        debug {
+            // 调试包单独 applicationId，可和已安装的 release 共存，方便 RAW 真机探针。
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
-            isMinifyEnabled = false
+            // 48.7MB 里 46.7MB 是 dex；R8 + 资源收缩是包体最直接的一刀。
+            isMinifyEnabled = true
+            isShrinkResources = true
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -102,6 +124,8 @@ dependencies {
     implementation("ch.acra:acra-core:5.11.4")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
+    // 真 RAW 解码：LibRaw 0.23.0 Snapshot202611 以源码编进 APK，
+    // 带 nikonhe.cpp，可解尼康 Z50II 的 HE/HE★ NEF；不再用预编译的 AndroidLibRaw 0.21.2。
     implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("androidx.documentfile:documentfile:1.0.1")
     // 引入完整的 Material 扩展图标库
@@ -126,6 +150,13 @@ dependencies {
 
     // 我们新增的页面导航依赖
     implementation("androidx.navigation:navigation-compose:2.7.7")
+
+    // 图库缩略图与细节查看。
+    // Telephoto 0.13.0 的 zoomable-image-coil 自带 coil-compose 2.6.0，编译版本是
+    // Kotlin 1.9.24 / Compose 1.6.7 / compileSdk 34，和本项目现有构建链同一档；
+    // 再往上的 0.15+ 已经要求 Kotlin 2.1 + compileSdk 35，不跟着升。
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("me.saket.telephoto:zoomable-image-coil:0.13.0")
 
     // 测试相关的库同样使用稳定版或原有的 libs
     testImplementation(libs.junit)

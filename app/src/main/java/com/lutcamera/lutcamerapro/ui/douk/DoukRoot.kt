@@ -16,12 +16,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -358,6 +362,10 @@ fun DoukRoot() {
                         }
                         }
                         }
+                        // 看图/编辑器/详情是盖在 Activity 上的独立 Dialog，
+                        // 底栏本体留在下面只会在 2780–2880 露出投影和圆角边。
+                        // 打开这些覆盖层时整条底栏不参与组合树。
+                        if (!ViewerChrome.open && !EditorChrome.open && !DetailChrome.open) {
                         Column(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
@@ -423,6 +431,7 @@ fun DoukRoot() {
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
+                        }
                     }
                 }
             }
@@ -466,6 +475,47 @@ fun DoukRoot() {
                             else Color.Black.copy(alpha = 0.32f),
                             RoundedCornerShape(percent = 50)
                         )
+                )
+            }
+            // 编辑器窗口整体下移了导航栏高度，顶部 100px 会露出下面页面。
+            // 编辑器打开时把 base 整屏铺成编辑器画布色，顶部的状态栏/空隙
+            // 就和编辑器标题栏无缝接上，不再透出图库日期。
+            if (EditorChrome.open) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0xFFEFEAE2))
+                )
+            }
+            // 看图页打开时，Dialog 窗口在部分 ROM 上无法真正铺进状态栏；
+            // 在根布局最上层补色，盖住透出的图库浅灰，也让日期渐变看起来从屏幕最顶部开始。
+            // 编辑器是浅色界面，用编辑器自己的浅色底盖住，避免白图标压黑底。
+            if (ViewerChrome.open || EditorChrome.open || DetailChrome.open) {
+                val chromeTopColor = when {
+                    DetailChrome.open -> Color.White
+                    EditorChrome.open -> Color(0xFFEFEAE2)
+                    else -> Color.Black
+                }
+                val chromeBottomColor = when {
+                    DetailChrome.open -> Color.White
+                    EditorChrome.open -> Color(0xFFFFFDF9)
+                    else -> Color.Black
+                }
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .height(WindowInsets.statusBars.asPaddingValues().calculateTopPadding())
+                        .background(chromeTopColor)
+                )
+                // 部分 ROM 上 navigationBars inset 会是 0，Dialog 又会停在 2780，
+                // 底部仍露出图库页。这里固定铺够 56dp，视觉上直接和 Dialog 拼齐。
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .background(chromeBottomColor)
                 )
             }
             }

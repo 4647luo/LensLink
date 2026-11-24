@@ -13,6 +13,7 @@ import android.os.Build
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import java.io.File
+import java.io.RandomAccessFile
 import android.util.Size
 
 /**
@@ -91,7 +92,12 @@ object ImageDecode {
     fun decodeThumb(file: File, maxSide: Int = 640): ImageBitmap? {
         if (!file.exists()) return null
         if (isVideoFile(file.name)) return decodeVideoFrame(file, maxSide)
-        if (isRawFile(file.name)) return extractEmbeddedPreview(file, maxSide)
+        if (isRawFile(file.name)) {
+            // 缩略图优先用 RAW 内嵌 JPEG：比每次 dcraw_process 快几十倍；
+            // 少数没有内嵌预览的 DNG 再退回 LibRaw 真解码。
+            extractEmbeddedPreview(file, maxSide)?.let { return it }
+            return RawDecode.decode(file, maxSide, preview = true)?.asImageBitmap()
+        }
         return decodeFile(file, maxSide)
     }
 
@@ -108,28 +114,50 @@ object ImageDecode {
      * 挑尺寸最大的那张解出来——编辑用的就是这张，观感和机身回放一致。
      */
     fun extractEmbeddedPreview(file: File, maxSide: Int = 4096): ImageBitmap? = runCatching {
-        val bytes = file.readBytes()
-        var best: ByteArray? = null
-        var bestLen = 150_000
-        var i = 0
-        while (i < bytes.size - 3) {
-            if (bytes[i] == 0xFF.toByte() && bytes[i + 1] == 0xD8.toByte()) {
-                var j = i + 2
-                while (j < bytes.size - 1) {
-                    if (bytes[j] == 0xFF.toByte() && bytes[j + 1] == 0xD9.toByte()) {
-                        val len = j + 2 - i
-                        if (len > bestLen) {
-                            bestLen = len
-                            best = bytes.copyOfRange(i, j + 2)
-                        }
-                        break
+        val length = file.length()
+        if (length <= 0L || length > 256L * 1024 * 1024) return null
+
+        // 不再 file.readBytes()：50–100MB NEF 整份进 Java 堆，再 copyOfRange 一份，
+        // 解码前就已经把内存吃掉。这里用 1MB 滚动窗口只记“最大 JPEG 的起止偏移”，
+        // 扫完后再按偏移读那一张，堆里最多只有内嵌预览本身。
+        var bestStart = -1L
+        var bestEnd = -1L
+        var bestLen = 150_000L
+        var start = -1L
+        var previous = -1
+        val buffer = ByteArray(1024 * 1024)
+        var offset = 0L
+        RandomAccessFile(file, "r").use { raf ->
+            while (true) {
+                val read = raf.read(buffer)
+                if (read < 0) break
+                for (k in 0 until read) {
+                    val b = buffer[k].toInt() and 0xFF
+                    if (previous == 0xFF && b == 0xD8) {
+                        start = offset + k - 1
                     }
-                    j++
+                    if (previous == 0xFF && b == 0xD9 && start >= 0L) {
+                        val end = offset + k + 1
+                        val candidateLen = end - start
+                        // 只接受合理大小的内嵌预览，避免把整段视频/异常数据当 JPEG。
+                        if (candidateLen in (bestLen + 1)..(64L * 1024 * 1024)) {
+                            bestLen = candidateLen
+                            bestStart = start
+                            bestEnd = end
+                        }
+                        start = -1L
+                    }
+                    previous = b
                 }
-                i = if (best != null && j < bytes.size) j + 2 else i + 2
-            } else i++
+                offset += read
+            }
         }
-        val payload = best ?: return null
+        if (bestStart < 0L || bestEnd <= bestStart) return null
+        val payload = ByteArray((bestEnd - bestStart).toInt())
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(bestStart)
+            raf.readFully(payload)
+        }
         // 先量尺寸，再按长边采样解码，避免把 6000×4000 的预览整张塞进内存
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(payload, 0, payload.size, bounds)
@@ -144,10 +172,21 @@ object ImageDecode {
         bmp.asImageBitmap()
     }.getOrNull()
 
-    /** 大图 / 原图预览：长边最大 maxSide（传屏幕长边即可）。 */
+    /**
+     * 大图 / 原图预览：长边最大 maxSide（传屏幕长边即可）。
+     *
+     * RAW 的普通看图先用相机内嵌 JPEG，保证图库翻页不卡；
+     * 真正需要传感器数据的是编辑器预览和导出，那两处显式走 [RawDecode]。
+     * 若文件没有内嵌预览（部分 DNG），再退回 LibRaw 真解码。
+     */
     fun decodeFile(file: File, maxSide: Int): ImageBitmap? = runCatching {
-        decodeViaImageDecoder(ImageDecoder.createSource(file), maxSide)
-            ?: decodeViaBitmapFactory(file, maxSide)
+        if (isRawFile(file.name)) {
+            extractEmbeddedPreview(file, maxSide)
+                ?: RawDecode.decode(file, maxSide, preview = true)?.asImageBitmap()
+        } else {
+            decodeViaImageDecoder(ImageDecoder.createSource(file), maxSide)
+                ?: decodeViaBitmapFactory(file, maxSide)
+        }
     }.getOrNull()
 
     // ===== 真 HDR（PQ / HLG / Ultra HDR gainmap） =====
@@ -206,6 +245,22 @@ object ImageDecode {
         val epsSdr: Float,
         val epsHdr: Float,
         val displayRatioFull: Float,
+        val minDisplayRatio: Float,
+        /** true 表示 base/gain 已经按 EXIF Orientation 转正，复用 GainMap 时不要再转一次。 */
+        val orientationApplied: Boolean = false
+    )
+
+    /** Ultra HDR JPEG 的 XMP Container 里的一项。 */
+    private data class ContainerItem(val semantic: String, val length: Long)
+
+    /** 从增益图自带 XMP 里读出来的 ISO 21496-1 参数。 */
+    private data class GainMeta(
+        val ratioMax: Float,
+        val ratioMin: Float,
+        val gamma: Float,
+        val epsSdr: Float,
+        val epsHdr: Float,
+        val displayRatioFull: Float,
         val minDisplayRatio: Float
     )
 
@@ -230,6 +285,14 @@ object ImageDecode {
         val gm = runCatching { base.gainmap }.getOrNull()
         val contents = runCatching { gm?.gainmapContents }.getOrNull()
         if (gm == null || contents == null) {
+            // 手机（尤其小米/OPPO/vivo）拍的 Ultra HDR 常常只在 JPEG 尾部塞一份
+            // GainMap JPEG，Bitmap.hasGainmap() 在这类文件上返回 false。
+            // 这时不能再把整张图当 SDR 丢掉，改从 XMP Container 把增益图切出来。
+            val pair = decodeHdrPairFromContainer(file, base)
+            if (pair == null) base.recycle()
+            return@runCatching pair
+        }
+        if (contents.width <= 0 || contents.height <= 0) {
             base.recycle()
             return@runCatching null
         }
@@ -238,9 +301,16 @@ object ImageDecode {
         val src = IntArray(gw * gh)
         contents.getPixels(src, 0, gw, 0, 0, gw, gh)
         val gray = IntArray(gw * gh)
+        // 标准 GainMap 是 ALPHA_8，但部分厂商会解码成 ARGB_8888 灰度图；
+        // 以前一律取 alpha，ARGB 情况下 alpha 恒为 255，整张图会被抬爆。
+        val alphaOnly = contents.config == android.graphics.Bitmap.Config.ALPHA_8
         for (i in src.indices) {
-            // ALPHA_8 的值就在 alpha 通道里
-            val v = (src[i] ushr 24) and 0xFF
+            val v = if (alphaOnly) {
+                (src[i] ushr 24) and 0xFF
+            } else {
+                val p = src[i]
+                (((p shr 16) and 0xFF) + ((p shr 8) and 0xFF) + (p and 0xFF)) / 3
+            }
             gray[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
         }
         val gain = android.graphics.Bitmap.createBitmap(gw, gh, android.graphics.Bitmap.Config.ARGB_8888)
@@ -274,6 +344,159 @@ object ImageDecode {
         HdrPair(base, gain, ratio, ratioMin, gamma, epsSdr, epsHdr, fullRatio, minDisplayRatio)
     }.getOrNull()
 
+    /**
+     * 不走 Bitmap.gainmap，直接从 Ultra HDR / Google Container 的 JPEG 尾部切 GainMap。
+     *
+     * 手机厂商的 Ultra HDR 文件结构是：
+     *   主图 JPEG + 一段 GainMap JPEG（半分辨率灰度图）+（可选）MotionPhoto MP4
+     * XMP 的 Container:Directory 会给出 GainMap 的 Item:Length；增益参数则写在
+     * GainMap 自己的 XMP 里（hdrgm:GainMapMax / Gamma / Offset* / HDRCapacity*）。
+     */
+    private fun decodeHdrPairFromContainer(file: File, base: android.graphics.Bitmap): HdrPair? =
+        runCatching {
+            val gainBytes = extractGainmapJpeg(file) ?: return@runCatching null
+            val meta = parseGainmapMeta(gainBytes) ?: return@runCatching null
+            val gainRaw = android.graphics.BitmapFactory.decodeByteArray(
+                gainBytes, 0, gainBytes.size,
+                android.graphics.BitmapFactory.Options().apply {
+                    inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+                }
+            ) ?: return@runCatching null
+            val gainArgb = if (gainRaw.config == android.graphics.Bitmap.Config.ARGB_8888) {
+                gainRaw
+            } else {
+                gainRaw.copy(android.graphics.Bitmap.Config.ARGB_8888, false) ?: gainRaw
+            }
+            val orientation = GalleryFileOps.exifOrientationOf(file)
+            val baseOut = GalleryFileOps.applyExifOrientation(base, orientation)
+            val gainOut = GalleryFileOps.applyExifOrientation(gainArgb, orientation)
+            val gainFinal = if (gainOut.config == android.graphics.Bitmap.Config.ARGB_8888) {
+                gainOut
+            } else {
+                gainOut.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                    ?: return@runCatching null
+            }
+            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                "HdrDecode", "CONTAINER",
+                "base" to "${baseOut.width}x${baseOut.height}",
+                "gain" to "${gainFinal.width}x${gainFinal.height}",
+                "max" to meta.ratioMax.toString(),
+                "min" to meta.ratioMin.toString(),
+                "gamma" to meta.gamma.toString(),
+                "full" to meta.displayRatioFull.toString(),
+                "minD" to meta.minDisplayRatio.toString()
+            )
+            HdrPair(
+                baseOut, gainFinal,
+                meta.ratioMax, meta.ratioMin, meta.gamma,
+                meta.epsSdr, meta.epsHdr, meta.displayRatioFull, meta.minDisplayRatio,
+                orientationApplied = true
+            )
+        }.getOrNull()
+
+    private fun extractGainmapJpeg(file: File): ByteArray? = runCatching {
+        val xmp = readXmpHead(file) ?: return@runCatching null
+        val items = parseContainerItems(xmp)
+        val gain = items.firstOrNull {
+            it.semantic.equals("gainmap", true) && it.length > 0
+        } ?: items.firstOrNull { it.length > 0 } ?: return@runCatching null
+        // Container 里 Primary 通常不写 Length；只把 GainMap / MotionPhoto 这些尾部项的长度相加，
+        // 就能拿到第一个尾部 JPEG 的起点，不会把主图里的 SOI 误当成增益图。
+        val trailing = items.filter {
+            !it.semantic.equals("primary", true) && it.length > 0
+        }.sumOf { it.length }
+        val start = file.length() - trailing
+        if (start < 0) return@runCatching null
+        RandomAccessFile(file, "r").use { raf ->
+            var pos = start
+            val probe = ByteArray(minOf(2048L, file.length() - pos).toInt())
+            raf.seek(pos)
+            raf.readFully(probe)
+            val off = jpegSoiOffset(probe)
+            if (off < 0) return@runCatching null
+            pos += off
+            val len = minOf(gain.length, file.length() - pos).toInt()
+            if (len <= 0) return@runCatching null
+            val bytes = ByteArray(len)
+            raf.seek(pos)
+            raf.readFully(bytes)
+            bytes
+        }
+    }.getOrNull()
+
+    private fun readXmpHead(file: File): String? = runCatching {
+        val max = minOf(file.length(), 2L * 1024 * 1024).toInt()
+        val buf = ByteArray(max)
+        var n = 0
+        file.inputStream().use { input ->
+            while (n < max) {
+                val r = input.read(buf, n, max - n)
+                if (r <= 0) break
+                n += r
+            }
+        }
+        findXmp(String(buf, 0, n, Charsets.UTF_8))
+    }.getOrNull()
+
+    private fun findXmp(text: String): String? {
+        val a = text.indexOf("<x:xmpmeta", ignoreCase = true)
+        val b = text.indexOf("</x:xmpmeta>", a + 1, ignoreCase = true)
+        if (a < 0 || b <= a) return null
+        return text.substring(a, b + "</x:xmpmeta>".length)
+    }
+
+    private fun parseContainerItems(xmp: String): List<ContainerItem> {
+        val out = ArrayList<ContainerItem>()
+        for (tag in CONTAINER_ITEM.findAll(xmp)) {
+            val semantic = xmpAttr(tag.value, "Item:Semantic") ?: ""
+            val length = xmpAttr(tag.value, "Item:Length")?.toLongOrNull() ?: 0L
+            if (semantic.isNotEmpty() || length > 0) out += ContainerItem(semantic, length)
+        }
+        return out
+    }
+
+    private fun xmpAttr(tag: String, name: String): String? =
+        runCatching {
+            Regex("""${Regex.escape(name)}\s*=\s*"([^"]*)"""")
+                .find(tag)?.groupValues?.get(1)
+        }.getOrNull()
+
+    private fun jpegSoiOffset(data: ByteArray): Int {
+        if (data.size < 3) return -1
+        for (i in 0 until data.size - 2) {
+            if (data[i] == 0xFF.toByte() && data[i + 1] == 0xD8.toByte() &&
+                data[i + 2] == 0xFF.toByte()
+            ) return i
+        }
+        return -1
+    }
+
+    private fun parseGainmapMeta(gain: ByteArray): GainMeta? = runCatching {
+        val xmp = findXmp(String(gain, Charsets.UTF_8)) ?: return@runCatching null
+        fun value(name: String): Float? =
+            Regex("""hdrgm:${Regex.escape(name)}\s*=\s*"([^"]*)"""")
+                .find(xmp)?.groupValues?.get(1)?.toFloatOrNull()
+        val maxLog = value("GainMapMax") ?: return@runCatching null
+        val minLog = value("GainMapMin") ?: 0f
+        val gamma = value("Gamma") ?: 1f
+        val offsetSdr = value("OffsetSDR") ?: 0f
+        val offsetHdr = value("OffsetHDR") ?: 0f
+        val capMin = value("HDRCapacityMin") ?: minLog
+        val capMax = value("HDRCapacityMax") ?: maxLog
+        fun boost(v: Float) = Math.pow(2.0, v.toDouble()).toFloat()
+        val ratioMax = boost(maxLog).coerceIn(1f, 16f)
+        val ratioMin = boost(minLog).coerceIn(0.01f, ratioMax)
+        GainMeta(
+            ratioMax = ratioMax,
+            ratioMin = ratioMin,
+            gamma = gamma.coerceIn(0.05f, 8f),
+            epsSdr = offsetSdr.coerceIn(0f, 1f),
+            epsHdr = offsetHdr.coerceIn(0f, 1f),
+            displayRatioFull = boost(capMax).coerceAtLeast(ratioMin),
+            minDisplayRatio = boost(capMin).coerceAtLeast(0.01f)
+        )
+    }.getOrNull()
+
     /** 探针：这张图是不是 Ultra HDR（带 gainmap）。 */
     fun hasGainmap(file: File): Boolean = runCatching {
         if (Build.VERSION.SDK_INT < 34) return@runCatching false
@@ -290,6 +513,10 @@ object ImageDecode {
     }.getOrDefault(false)
 
     /** JPEG/HEIF 里的 HDR 标记：Ultra HDR 的 hdrgm、Google 容器的 GContainer、苹果 HDRGainMap… */
+    private val CONTAINER_ITEM = Regex(
+        """<Container:Item\b[^>]*>""",
+        setOf(RegexOption.IGNORE_CASE)
+    )
     private val HDR_MARKERS = arrayOf(
         "hdrgm",
         "gcontainer",
@@ -349,20 +576,49 @@ object ImageDecode {
      */
     fun materialize(context: Context, uri: Uri, key: String): File? = runCatching {
         val dir = File(context.cacheDir, "hdr").apply { mkdirs() }
-        val target = File(dir, "hdr-$key.bin")
+        val safeKey = key.replace(Regex("[^A-Za-z0-9._-]"), "_").take(96)
+        val target = File(dir, "hdr-$safeKey.bin")
         if (target.length() > 0L) return@runCatching target
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            target.outputStream().use { out -> input.copyTo(out, 1024 * 1024) }
+        val temporary = File(dir, "hdr-$safeKey.bin.part")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                temporary.outputStream().use { out ->
+                    com.lutcamera.lutcamerapro.util.BoundedIo.copyWithLimit(
+                        input, out, MAX_HDR_CACHE_BYTES
+                    )
+                }
+            }
+            if (temporary.length() > 0L) {
+                if (target.exists()) target.delete()
+                if (!temporary.renameTo(target)) {
+                    temporary.copyTo(target, overwrite = true)
+                    temporary.delete()
+                }
+            }
+        } finally {
+            temporary.delete()
         }
+        trimCache(context)
         if (target.length() > 0L) target else null
     }.getOrNull()
 
-    /** 清掉一天以前的 HDR 缓存，避免相册里的图越看越多把缓存撑满。 */
+    /** 清掉旧 HDR 缓存，并保证整个 hdr 目录不超过 512MB。 */
     fun trimCache(context: Context) = runCatching {
         val dir = File(context.cacheDir, "hdr")
+        if (!dir.isDirectory) return@runCatching
         val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
-        dir.listFiles()?.forEach { f -> if (f.lastModified() < cutoff) runCatching { f.delete() } }
+        val files = dir.listFiles()?.filter { it.isFile } ?: return@runCatching
+        files.filter { it.lastModified() < cutoff }.forEach { runCatching { it.delete() } }
+        var remaining = files.filter { it.exists() }.sortedBy { it.lastModified() }.toMutableList()
+        var total = remaining.sumOf { it.length() }
+        while (total > MAX_HDR_CACHE_BYTES && remaining.isNotEmpty()) {
+            val oldest = remaining.removeFirst()
+            total -= oldest.length()
+            runCatching { oldest.delete() }
+        }
     }
+
+    private const val MAX_HDR_CACHE_BYTES = 512L * 1024 * 1024
 
     /**
      * 按 HDR 解码：目标色域直接要 BT.2020 / PQ，解出来是 RGBA_F16。
@@ -382,9 +638,12 @@ object ImageDecode {
                     )
                 }
             }
-            // PQ 目标色域会让系统把 Ultra HDR 的 gainmap 一起合成进来
-            runCatching {
-                decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.BT2020_PQ))
+            // PQ 目标色域会让系统把 Ultra HDR 的 gainmap 一起合成进来。
+            // BT2020_PQ 常量本身是 API 34 才有的，Android 10–13 必须显式跳过。
+            if (Build.VERSION.SDK_INT >= 34) {
+                runCatching {
+                    decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.BT2020_PQ))
+                }
             }
             decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             decoder.isMutableRequired = false
@@ -412,7 +671,10 @@ object ImageDecode {
         val opts = android.graphics.BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = android.graphics.Bitmap.Config.RGBA_F16
-            inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.BT2020_PQ)
+        }
+        // BT2020_PQ 的 ColorSpace 常量需要 API 34；低版本只解 RGBA_F16，不指定 PQ 目标。
+        if (Build.VERSION.SDK_INT >= 34) {
+            opts.inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.BT2020_PQ)
         }
         val b = android.graphics.BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@runCatching null
         if (b.config == android.graphics.Bitmap.Config.RGBA_F16 || isHdrColorSpace(b.colorSpace)) b else {
@@ -422,11 +684,19 @@ object ImageDecode {
     }.getOrNull()
 
     fun decodeUri(context: Context, uri: Uri, maxSide: Int): ImageBitmap? = runCatching {
-        decodeViaImageDecoder(ImageDecoder.createSource(context.contentResolver, uri), maxSide)
-            ?: context.contentResolver.loadThumbnail(uri, Size(maxSide, maxSide), null)?.asImageBitmap()
+        // 手机相册里的 HDR 图不能直接把 ImageDecoder 的 HDR 位图交给 Compose：
+        // Skia 不会替它做 tone map，结果就是整张灰掉。这里强制解到 SDR sRGB。
+        decodeViaImageDecoder(ImageDecoder.createSource(context.contentResolver, uri), maxSide, true)
+            ?: context.contentResolver.loadThumbnail(uri, Size(maxSide, maxSide), null)
+                ?.let { toSdrArgb8888(it) }
+                ?.asImageBitmap()
     }.getOrNull()
 
-    private fun decodeViaImageDecoder(source: ImageDecoder.Source, maxSide: Int): ImageBitmap? {
+    private fun decodeViaImageDecoder(
+        source: ImageDecoder.Source,
+        maxSide: Int,
+        forceSdr: Boolean = false
+    ): ImageBitmap? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         return runCatching {
             var decoded: Bitmap? = null
@@ -441,20 +711,47 @@ object ImageDecode {
                         (h * scale).toInt().coerceAtLeast(1)
                     )
                 }
-                // 广色域优先：目标色域给 P3，解码器支持就按 P3 出，不支持自动退回原色域。
+                // 普通预览优先广色域；手机相册缩略图强制 sRGB，避免 HDR 位图直接进 Compose 发灰。
                 runCatching {
-                    decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.DISPLAY_P3))
+                    decoder.setTargetColorSpace(
+                        ColorSpace.get(
+                            if (forceSdr) ColorSpace.Named.SRGB
+                            else ColorSpace.Named.DISPLAY_P3
+                        )
+                    )
                 }
                 // 走硬件解码（ALLOCATOR_DEFAULT）：大图、HEIF、AVIF 都能原尺寸上屏，
                 // 以前强制 SOFTWARE 在 4K 图上又慢又只能出 8bit ARGB，放大看就糊。
                 // 硬件位图不可改，所以 isMutableRequired 关掉；gainmap 需要时再 copy 一份软件图。
-                decoder.allocator = ImageDecoder.ALLOCATOR_DEFAULT
+                decoder.allocator = if (forceSdr) {
+                    ImageDecoder.ALLOCATOR_SOFTWARE
+                } else {
+                    ImageDecoder.ALLOCATOR_DEFAULT
+                }
                 decoder.memorySizePolicy = ImageDecoder.MEMORY_POLICY_LOW_RAM
                 decoder.isMutableRequired = false
             }
             decoded = ImageDecoder.decodeBitmap(source, listener)
-            decoded?.asImageBitmap()
+            val bmp = decoded ?: return null
+            // 即使没强制 SDR，也兜底把 F16 / PQ 位图转成普通的 8bit 图；
+            // 真正的 HDR 上屏另有 decodeHdrPair / decodeHdrBitmap，不走这条普通预览。
+            toSdrArgb8888(bmp).asImageBitmap()
         }.getOrNull()
+    }
+
+    /** 把 HDR / 16bit 位图压回 8bit sRGB；已经是普通 SDR 位图就原样返回，不额外拷贝。 */
+    private fun toSdrArgb8888(bmp: Bitmap): Bitmap {
+        if (bmp.config == Bitmap.Config.ARGB_8888 && !isHdrColorSpace(bmp.colorSpace)) return bmp
+        val out = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+        out.setHasAlpha(bmp.hasAlpha())
+        runCatching {
+            Canvas(out).drawBitmap(bmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+        }.onFailure {
+            if (out !== bmp) out.recycle()
+            return bmp
+        }
+        if (out !== bmp) bmp.recycle()
+        return out
     }
 
     /**

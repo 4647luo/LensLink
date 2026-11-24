@@ -1,6 +1,8 @@
 package com.lutcamera.lutcamerapro.ui.douk
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.ContextWrapper
@@ -113,7 +115,7 @@ private const val FEEDBACK_MAIL = "lianjingup@outlook.com"
  * 把「支持作者」页的赞赏码原图写入系统相册。
  * 图片来自 drawable-nodpi 的完整原图（1280×1280），这里不做任何裁切或缩放。
  */
-private fun saveSupportQrToGallery(context: Context, bitmap: Bitmap): Boolean {
+internal fun saveSupportQrToGallery(context: Context, bitmap: Bitmap): Boolean {
     val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
     val name = "lianjing-support-$stamp.jpg"
     val resolver = context.contentResolver
@@ -286,6 +288,8 @@ fun DoukSettingsScreen(state: DoukState) {
     /** 下载二级页：null = 设置主页；"auto" = 自动下载；"locked" = 下载保护文件 */
     var downloadPage by remember { mutableStateOf<String?>(null) }
     var saveFormat by remember { mutableStateOf(DoukPrefs.saveFormat) }
+    // FTP 回传鉴权：相机 FTP 配置里用户名固定 nikon，密码填这串口令。
+    var ftpToken by remember { mutableStateOf(DoukPrefs.ftpToken) }
     // 图库默认打开来源：相机内 / 应用内 / 手机内
     var galleryDefault by remember { mutableStateOf(DoukPrefs.galleryDefaultSource) }
     var galleryPreload by remember { mutableStateOf(DoukPrefs.galleryCameraPreload) }
@@ -446,7 +450,6 @@ fun DoukSettingsScreen(state: DoukState) {
                 var progress by remember { mutableIntStateOf(0) }
                 // 下载细节：百分比 / 已下载 / 总量 / 速度，走 GitHub 时进度肉眼可见
                 var progressDetail by remember { mutableStateOf("") }
-                var autoCheck by remember { mutableStateOf(DoukPrefs.checkUpdateOnLaunch) }
 
                 val runCheck: () -> Unit = {
                     if (!checking) {
@@ -464,18 +467,9 @@ fun DoukSettingsScreen(state: DoukState) {
                 }
 
                 SettingCard {
-                    SettingSwitchRow(
-                        "打开应用时检查更新",
-                        "启动 App 后自动检查一次；24 小时内不重复请求，失败不打扰",
-                        autoCheck
-                    ) { enabled ->
-                        autoCheck = enabled
-                        DoukPrefs.checkUpdateOnLaunch = enabled
-                    }
-                    SettingDivider()
                     SettingRow(
                         if (checking) "正在检查…" else "立即检查",
-                        "从 GitHub 读取最新 Release",
+                        "每次打开 App 都会自动检查；也可以现在从 GitHub 读取最新 Release",
                         enabled = !checking
                     ) { runCheck() }
                     SettingDivider()
@@ -501,13 +495,12 @@ fun DoukSettingsScreen(state: DoukState) {
                         val info = r.info
                         buildList {
                             add("当前版本：$APP_VERSION")
-                            add("更新源：${info.source}")
                             if (info.isNewer) {
                                 add("发现新版本：${info.version}")
                                 if (info.apkSize > 0) add("安装包：${"%.1f".format(info.apkSize / 1048576.0)} MB")
                                 if (info.publishedAt.isNotBlank()) add("发布日期：${info.publishedAt}")
                                 if (info.apkUrl.isNullOrBlank()) {
-                                    add("该更新源没有提供 APK 直链，无法应用内下载。")
+                                    add("GitHub Release 没有提供 APK 直链，无法应用内下载。")
                                 }
                                 add("")
                                 if (info.notes.isNotBlank()) {
@@ -519,13 +512,13 @@ fun DoukSettingsScreen(state: DoukState) {
                                 add("远端版本：${info.version}")
                                 if (info.publishedAt.isNotBlank()) add("发布日期：${info.publishedAt}")
                                 add("")
-                                add("当前版本与更新源一致，无需更新。")
+                                add("当前已是最新版本，无需更新。")
                             }
                         }
                     }
                     is UpdateCenter.Result.NoRelease -> listOf(
                         "当前版本：$APP_VERSION",
-                        "更新源还没有发布版本。",
+                        "GitHub 上还没有发布版本。",
                         r.message
                     )
                     is UpdateCenter.Result.Failure -> listOf(
@@ -547,7 +540,7 @@ fun DoukSettingsScreen(state: DoukState) {
                                 scope.launch {
                                     downloading = true
                                     progress = 0
-                                    progressDetail = ""
+                                    progressDetail = "正在连接 GitHub…"
                                     val downloadResult = runCatching {
                                         UpdateCenter.download(context, info) { p ->
                                             progress = p.percent.coerceAtLeast(0)
@@ -565,11 +558,11 @@ fun DoukSettingsScreen(state: DoukState) {
                                             ).show()
                                         }
                                     }.onFailure {
-                                        Toast.makeText(
-                                            context,
-                                            "下载失败：${it.message}",
-                                            Toast.LENGTH_LONG
-                                        ).show()
+                                        if (it is kotlinx.coroutines.CancellationException) {
+                                            Toast.makeText(context, "已取消下载", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            UpdateCenter.showBaiduFallback(context, it.message ?: "网络中断")
+                                        }
                                     }
                                 }
                             }
@@ -1002,8 +995,8 @@ fun DoukSettingsScreen(state: DoukState) {
                     }
                     SettingDivider()
                     SettingRow("预览分辨率", "滑动时的计算长边；保存仍用原图", "${preview}px") {
-                        pick = ValuePick("预览分辨率", listOf("720", "1080", "1440"), preview) { v ->
-                            preview = v; DoukPrefs.editorPreview = v.toIntOrNull() ?: 1080
+                        pick = ValuePick("预览分辨率", listOf("720", "1080", "1440", "2048", "3072", "4096"), preview) { v ->
+                            preview = v; DoukPrefs.editorPreview = v.toIntOrNull() ?: 3072
                         }
                     }
                     SettingDivider()
@@ -1914,6 +1907,16 @@ fun DoukSettingsScreen(state: DoukState) {
                         DoukPrefs.saveFormat
                     ) { v -> saveFormat = v; DoukPrefs.saveFormat = v }
                 }
+                SettingDivider()
+                SettingRow(
+                    title = "FTP 上传口令",
+                    subtitle = "相机 FTP 用户名填 nikon，密码填这串口令；点一下复制",
+                    value = ftpToken
+                ) {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("连镜 FTP 口令", ftpToken))
+                    Toast.makeText(context, "FTP 口令已复制", Toast.LENGTH_SHORT).show()
+                }
             }
 
             // ========== 图库 ==========
@@ -2107,6 +2110,7 @@ private val CHANGELOG_ENTRIES = listOf(
             "· 预设格式升级为 lianjing-preset-v1，旧版 lenslink-preset-v1 预设仍可直接导入。",
             "· 看图页修复底部黑边、状态栏透底和 HDR 翻页闪帧；HDR 高光做了肩部压缩，减少过曝。",
             "· 内置 LUT 已全部移除，只使用用户自行导入的 LUT。",
+            "· 增加 RAW 原始数据解码（LibRaw 0.23），支持尼康 Z50II 高效率★ NEF。",
             "· 补齐非官方声明与第三方组件说明。"
         )
     ),
@@ -2265,7 +2269,7 @@ private val TERMS_LINES = listOf(
     "4. 因用户违反当地法律法规使用本应用而产生的后果，由用户自行承担。",
     "",
     "七、知识产权与商标",
-    "应用代码按 Apache-2.0 许可开源；「连镜」名称与应用图标仅用于标识本项目，不得用于暗示官方认可或授权。尼康、Nikon、NIKKOR 等商标归尼康株式会社或其权利人所有，本应用仅在说明兼容性时提及，与尼康株式会社没有任何隶属、授权、赞助或背书关系。界面中的相机照片由用户自行设置，不代表尼康官方素材。",
+    "应用代码按 Apache-2.0 许可开源；「连镜」名称与应用图标仅用于标识本项目，不得用于暗示官方认可或授权。RAW 解码使用 LibRaw 0.23.0 Snapshot202611，按 CDDL-1.0 许可随包编译。尼康、Nikon、NIKKOR 等商标归尼康株式会社或其权利人所有，本应用仅在说明兼容性时提及，与尼康株式会社没有任何隶属、授权、赞助或背书关系。界面中的相机照片由用户自行设置，不代表尼康官方素材。",
     "",
     "八、服务变更与终止",
     "作者可能在不另行通知的情况下调整功能、修复问题或停止维护本项目。由于本应用不依赖任何在线服务，你已安装的版本不会因服务下线而立即失效。",

@@ -315,7 +315,7 @@ fun DeviceScreen(
             text = {
                 Column {
                     ManualLine("1. 相机与手机先建立连接：Wi-Fi AP 直连、Wi-Fi STA 或 USB PTP 三选一。")
-                    ManualLine("2. 相机菜单 → 连接至智能设备（Wi-Fi）；二代机可选「连接至计算机」走 USB PTP。")
+                    ManualLine("2. 相机菜单 → 连接至智能设备（Wi-Fi）；部分机型另有「连接至计算机」，可选它走 USB PTP。")
                     ManualLine("3. 回到设备页点「添加设备」，选择连接方式后搜索并配对。")
                     ManualLine("4. 连接成功后进入控制页监看实时取景、调整曝光与对焦参数。")
                     ManualLine("5. 蓝牙可做 GPS 推送或 ML‑L7 快门/录像遥控，两者共用一条链路；蓝牙不承担图传。")

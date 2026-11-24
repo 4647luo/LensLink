@@ -3,6 +3,9 @@ package com.lutcamera.lutcamerapro
 import android.app.Application
 import android.content.Context
 import android.util.Log
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import coil.memory.MemoryCache
 import com.elvishew.xlog.LogConfiguration
 import com.elvishew.xlog.LogLevel
 import com.elvishew.xlog.XLog
@@ -29,7 +32,27 @@ import java.io.File
  *
  * 所有目录都在应用私有空间，发出去之前由用户主动导出/分享。
  */
-class DoukApplication : Application() {
+class DoukApplication : Application(), ImageLoaderFactory {
+
+    /**
+     * Coil 的进程级 ImageLoader，只服务图库缩略图和「细节查看」。
+     *
+     * 这里不用磁盘缓存：连镜的图本来就在本机文件系统里，把原图再抄一份进
+     * cache 目录纯属重复占空间。内存缓存按堆的 15% 封顶，比图库那个手写
+     * 48 张的 Map 更适合扛长列表来回滚。
+     */
+    override fun newImageLoader(): ImageLoader =
+        ImageLoader.Builder(this)
+            .memoryCache {
+                MemoryCache.Builder(this)
+                    .maxSizePercent(0.15)
+                    .build()
+            }
+            // 本地文件没有 HTTP 头，关掉缓存头校验省一次无意义的比较
+            .respectCacheHeaders(false)
+            // 缩略图不做淡入：图库滑动时淡入会闪一片格子
+            .crossfade(false)
+            .build()
 
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
@@ -61,8 +84,48 @@ class DoukApplication : Application() {
         initFileLogger()
         DoukLog.install(this)
         DoukPrefs.init(this)
+        com.lutcamera.lutcamerapro.network.FtpPushReceiver.init(this)
+        com.lutcamera.lutcamerapro.ui.douk.TransferCenter.init(this)
         plantTimber()
+        // HDR 缓存以前只写不清；启动时先按 512MB / 24h 配额收一次。
+        runCatching { com.lutcamera.lutcamerapro.ui.douk.ImageDecode.trimCache(this) }
+        prewarmLutLibrary()
         Timber.i("连镜 %s 启动", BuildConfig.VERSION_NAME)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // 只清理可再生的 HDR 临时文件；正在看的文件由查看页自己持有，不会因为删 cache 变白。
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            runCatching { com.lutcamera.lutcamerapro.ui.douk.ImageDecode.trimCache(this) }
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        runCatching { com.lutcamera.lutcamerapro.ui.douk.ImageDecode.trimCache(this) }
+        // 系统真的没内存了，Coil 的缩略图缓存是可再生的，先丢它再丢 HDR 缓存
+        runCatching { coil.Coil.imageLoader(this).memoryCache?.clear() }
+    }
+
+    /**
+     * 启动后空闲时把导入的 LUT 解析一遍。监视页/编辑器第一次打开时就不用再等
+     * 几十个 .cube/.3dl/.np3 全量解析；真正打开时只做一次目录 stat，直接命中缓存。
+     * 放到后台低优先级线程并延迟 2 秒，避免和首屏、相机连接抢 CPU。
+     */
+    private fun prewarmLutLibrary() {
+        Thread {
+            runCatching {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                Thread.sleep(2_000)
+                val started = android.os.SystemClock.elapsedRealtime()
+                val result = com.lutcamera.lutcamerapro.ui.douk.FilterLibrary.load(applicationContext)
+                Log.i(
+                    "DoukApplication",
+                    "LUT prewarm: ${result.entries.size} entries in ${android.os.SystemClock.elapsedRealtime() - started}ms"
+                )
+            }.onFailure { Log.w("DoukApplication", "LUT prewarm failed", it) }
+        }.start()
     }
 
     /** xLog 只落文件，不重复打 logcat；按天分文件，单文件 2MB，保留 7 天。 */

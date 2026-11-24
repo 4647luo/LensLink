@@ -4,11 +4,11 @@ import android.content.Context
 import com.lutcamera.lutcamerapro.BuildConfig
 import com.lutcamera.lutcamerapro.ui.douk.DoukPrefs
 import com.lutcamera.lutcamerapro.ui.douk.KnownDevice
+import com.lutcamera.lutcamerapro.util.BoundedIo
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -128,27 +128,58 @@ object DoukPreset {
      * IO 阻塞，调用方应在 Dispatchers.IO 执行。
      */
     fun import(context: Context, input: InputStream): Result<Pair<Int, List<String>>> = runCatching {
-        val bytes = input.readBytes()
-        val isZip = bytes.size >= 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()
+        val buffered = BufferedInputStream(input)
+        buffered.mark(4)
+        val header = ByteArray(4)
+        val headerRead = buffered.read(header)
+        buffered.reset()
+        val isZip = headerRead >= 4 && header[0] == 'P'.code.toByte() && header[1] == 'K'.code.toByte()
         if (!isZip) {
-            applyJson(JSONObject(bytes.toString(Charsets.UTF_8)))
+            applyJson(JSONObject(BoundedIo.readUtf8WithLimit(buffered, MAX_PRESET_JSON_BYTES)))
         } else {
             var presetText: String? = null
             val lutDir = DoukPrefs.lutDir(context)
             var lutCount = 0
-            ZipInputStream(ByteArrayInputStream(bytes)).use { zip ->
+            var entryCount = 0
+            var totalUncompressed = 0L
+            ZipInputStream(buffered).use { zip ->
                 while (true) {
                     val entry = zip.nextEntry ?: break
+                    entryCount++
+                    require(entryCount <= MAX_PRESET_ENTRIES) { "预设包条目过多" }
                     val name = entry.name
                     when {
-                        name == "preset.json" -> presetText = zip.readBytes().toString(Charsets.UTF_8)
+                        name == "preset.json" -> {
+                            presetText = BoundedIo.readUtf8WithLimit(zip, MAX_PRESET_JSON_BYTES)
+                        }
                         name.startsWith("luts/") && !entry.isDirectory -> {
                             // 只取文件名，挡掉 ../ 之类的路径穿越
                             val fileName = File(name).name
-                            if (fileName.isNotBlank()) {
-                                val target = File(lutDir, fileName)
-                                target.outputStream().use { out -> zip.copyTo(out) }
+                            require(fileName.isNotBlank() && fileName != "." && fileName != "..") {
+                                "预设包包含非法 LUT 文件名"
+                            }
+                            require(entry.size <= MAX_PRESET_ENTRY_BYTES) { "LUT 条目超过 32MB" }
+                            val target = File(lutDir, fileName)
+                            val temporary = File(lutDir, "$fileName.part")
+                            try {
+                                target.parentFile?.mkdirs()
+                                val copied = temporary.outputStream().use { out ->
+                                    BoundedIo.copyWithLimit(zip, out, MAX_PRESET_ENTRY_BYTES)
+                                }
+                                totalUncompressed += copied
+                                require(totalUncompressed <= BoundedIo.MAX_PRESET_TOTAL_BYTES) {
+                                    "预设包解压后超过 128MB"
+                                }
+                                // 压缩比超过 100 的条目基本只能是 ZIP 炸弹；正常 LUT 文本远低于此。
+                                if (entry.compressedSize > 0 && copied / entry.compressedSize > 100) {
+                                    error("LUT 条目压缩比异常")
+                                }
+                                if (!temporary.renameTo(target)) {
+                                    temporary.copyTo(target, overwrite = true)
+                                }
                                 lutCount++
+                            } finally {
+                                temporary.delete()
                             }
                         }
                     }
@@ -159,6 +190,10 @@ object DoukPreset {
             applyJson(JSONObject(text), importedLutCount = lutCount)
         }
     }
+
+    private const val MAX_PRESET_JSON_BYTES = 8L * 1024 * 1024
+    private const val MAX_PRESET_ENTRIES = 256
+    private const val MAX_PRESET_ENTRY_BYTES = BoundedIo.MAX_PRESET_ENTRY_BYTES
 
     private fun applyJson(
         root: JSONObject,

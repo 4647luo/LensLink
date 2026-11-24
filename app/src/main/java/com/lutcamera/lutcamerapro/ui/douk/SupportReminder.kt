@@ -21,34 +21,45 @@ import com.lutcamera.lutcamerapro.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
- * 每月第一次打开 App 时弹一次「用得怎么样」+ 赞赏码。
+ * 安装满一个月后弹一次「用得怎么样」+ 赞赏码。
  *
- * 只按自然月记录，同一个月内不再重复打扰。
+ * 规则：只在首次安装满 30 天之后提示，且同一安装只提示一次；
+ * 覆盖升级（firstInstallTime 不变）不会再弹，避免每次更新都打扰。
  * 弹窗是自绘圆角卡片，底部保留「取消 / 保存图片」两个按钮；点空白处或返回键也是取消。
  */
 object SupportReminder {
-    private const val MONTH_PATTERN = "yyyy-MM"
+    private const val MIN_INSTALL_AGE_MS = 30L * 24 * 60 * 60 * 1000
 
     /**
-     * 如果本月还没弹过，就展示赞赏提示。
+     * 如果安装已满一个月且本次安装还没提示过，就展示赞赏提示。
      * @return true 表示弹窗已经展示；调用方应等 onDismiss 后再做下一件事，避免两个对话框叠在一起。
      */
     fun showIfDue(activity: Activity, onDismiss: () -> Unit): Boolean {
         if (activity.isFinishing || activity.isDestroyed) return false
-        val month = SimpleDateFormat(MONTH_PATTERN, Locale.US).format(Date())
-        if (DoukPrefs.lastSupportPromptMonth == month) return false
+
+        val firstInstall = runCatching {
+            activity.packageManager.getPackageInfo(activity.packageName, 0).firstInstallTime
+        }.getOrDefault(0L)
+        if (firstInstall <= 0L) return false
+        if (System.currentTimeMillis() - firstInstall < MIN_INSTALL_AGE_MS) return false
+
+        val shownFor = DoukPrefs.supportPromptInstall
+        if (shownFor == firstInstall.toString()) return false
+
+        // 老版本按「每月一次」弹过：升级到本版后直接视为已提示，不再弹。
+        if (shownFor.isBlank() && DoukPrefs.lastSupportPromptMonth.isNotBlank()) {
+            DoukPrefs.supportPromptInstall = firstInstall.toString()
+            return false
+        }
 
         val qr = runCatching {
             BitmapFactory.decodeResource(activity.resources, R.drawable.douk_support_qr)
         }.getOrNull() ?: return false
 
-        // 先记月份再弹：即使进程随后被杀，本月也不会重复弹。
-        DoukPrefs.lastSupportPromptMonth = month
+        // 先记已提示再弹：即使进程随后被杀，也不会重复弹。
+        DoukPrefs.supportPromptInstall = firstInstall.toString()
 
         val density = activity.resources.displayMetrics.density
         val pad = (24 * density).toInt()

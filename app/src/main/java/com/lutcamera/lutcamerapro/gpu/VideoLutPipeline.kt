@@ -6,6 +6,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import com.lutcamera.lutcamerapro.util.ExportOutputVerifier
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLExt
@@ -319,13 +320,20 @@ internal object VideoLutExporter {
      * 之前直接 addTrack 会失败，导出的片子就成了无声。这里按原样判断：
      * 已经是 AAC 的就直接搬采样，其它 PCM 先转 16-bit 再编成 AAC。
      */
-    private fun prepareAudio(extractor: MediaExtractor, track: Int, file: File): PreparedAudio? {
+    private fun prepareAudio(
+        extractor: MediaExtractor,
+        track: Int,
+        file: File,
+        startUs: Long = 0L,
+        endUs: Long = Long.MAX_VALUE
+    ): PreparedAudio? {
         val format = extractor.getTrackFormat(track)
         val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
-        DoukLog.i("VideoLut", "AUDIO_PREP", "mime" to mime)
+        DoukLog.i("VideoLut", "AUDIO_PREP", "mime" to mime, "startUs" to startUs, "endUs" to endUs)
         val samples = ArrayList<Pair<MediaCodec.BufferInfo, ByteArray>>()
         if (mime == "audio/mp4a-latm") {
             extractor.selectTrack(track)
+            if (startUs > 0) extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
             val maxInput = runCatching { format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) }
                 .getOrDefault(256 * 1024).coerceIn(64 * 1024, 1024 * 1024)
             val buffer = ByteBuffer.allocateDirect(maxInput)
@@ -333,10 +341,20 @@ internal object VideoLutExporter {
                 buffer.clear()
                 val size = extractor.readSampleData(buffer, 0)
                 if (size <= 0) break
-                val bytes = ByteArray(size)
-                buffer.position(0)
-                buffer.get(bytes)
-                samples.add(sampleInfo(size, extractor.sampleTime, extractor.sampleFlags) to bytes)
+                val time = extractor.sampleTime
+                if (time >= endUs) break
+                if (time >= startUs) {
+                    val bytes = ByteArray(size)
+                    buffer.position(0)
+                    buffer.get(bytes)
+                    samples.add(
+                        sampleInfo(
+                            size,
+                            time - startUs,
+                            extractor.sampleFlags
+                        ) to bytes
+                    )
+                }
                 extractor.advance()
             }
             runCatching { extractor.unselectTrack(track) }
@@ -354,21 +372,30 @@ internal object VideoLutExporter {
                 "rate" to sampleRate, "ch" to channels, "pcm" to pcmEncoding, "mime" to mime
             )
             extractor.selectTrack(track)
+            if (startUs > 0) extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
             val maxRaw = runCatching { format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) }
                 .getOrDefault(64 * 1024).coerceIn(16 * 1024, 1024 * 1024)
             val raw = ByteBuffer.allocateDirect(maxRaw).order(ByteOrder.nativeOrder())
             val next = {
-                raw.clear()
-                val size = extractor.readSampleData(raw, 0)
-                if (size <= 0) {
-                    runCatching { extractor.unselectTrack(track) }
-                    DoukLog.i("VideoLut", "AUDIO_READ_END", "size" to size)
-                    null
-                } else {
+                var result: ByteArray? = null
+                while (result == null) {
+                    raw.clear()
+                    val size = extractor.readSampleData(raw, 0)
+                    if (size <= 0) {
+                        runCatching { extractor.unselectTrack(track) }
+                        DoukLog.i("VideoLut", "AUDIO_READ_END", "size" to size)
+                        break
+                    }
+                    val time = extractor.sampleTime
+                    if (time >= endUs) {
+                        runCatching { extractor.unselectTrack(track) }
+                        break
+                    }
                     val bytes = pcmTo16(raw, size, pcmEncoding, channels)
                     extractor.advance()
-                    bytes
+                    if (time >= startUs) result = bytes
                 }
+                result
             }
             return encodeAac(sampleRate, channels, next)
         }
@@ -381,9 +408,35 @@ internal object VideoLutExporter {
             "rate" to reader.sampleRate, "bits" to reader.sampleBits,
             "dur" to reader.durationMs
         )
+        // MOV 的 PCM 读取器只能从头流式读，按字节数跳过开头、截断结尾；选区外的音频不要带进 Live 图。
+        val bytesPerSec = reader.sampleRate.toLong() * reader.channels.coerceIn(1, 2) * 2L
+        val skipBytes = if (startUs > 0) (startUs / 1_000_000.0 * bytesPerSec).toLong() else 0L
+        val maxBytes = if (endUs != Long.MAX_VALUE) {
+            ((endUs - startUs) / 1_000_000.0 * bytesPerSec).toLong()
+        } else Long.MAX_VALUE
         val it16 = reader.stream16().iterator()
+        var skipped = 0L
+        var emitted = 0L
         return encodeAac(reader.sampleRate, reader.channels.coerceIn(1, 2)) {
-            if (it16.hasNext()) it16.next() else null
+            var out: ByteArray? = null
+            while (out == null) {
+                if (emitted >= maxBytes || !it16.hasNext()) break
+                val chunk = it16.next()
+                var offset = 0
+                if (skipped < skipBytes) {
+                    val need = (skipBytes - skipped).coerceAtMost(chunk.size.toLong()).toInt()
+                    skipped += need
+                    offset += need
+                }
+                if (offset < chunk.size) {
+                    val remain = (maxBytes - emitted).coerceAtMost((chunk.size - offset).toLong()).toInt()
+                    if (remain > 0) {
+                        out = chunk.copyOfRange(offset, offset + remain)
+                        emitted += remain
+                    }
+                }
+            }
+            out
         }
     }
 
@@ -545,7 +598,11 @@ internal object VideoLutExporter {
         val codec: String = "auto",   // auto / avc / hevc
         val quality: String = "high", // high / standard
         /** 码率倍数：0.8 省体积 / 1.0 默认 / 1.5 高码率（灰片大面积渐变时更干净） */
-        val bitrateScale: Float = 1.0f
+        val bitrateScale: Float = 1.0f,
+        /** 只导出一段：起点毫秒。默认 0（整段） */
+        val startMs: Long = 0L,
+        /** 只导出一段：终点毫秒。默认 0（到结尾） */
+        val endMs: Long = 0L
     )
 
     @Synchronized
@@ -594,6 +651,16 @@ internal object VideoLutExporter {
             .let { if (it in 1..120) it else 30 }
         val durationUs = runCatching { videoFormat.getLong(MediaFormat.KEY_DURATION) }.getOrDefault(0L)
         val rotation = runCatching { videoFormat.getInteger("rotation-degrees") }.getOrDefault(0)
+        // 「选一段转 Live 图」：只解这一段，时间戳全部从 0 开始，避免生成的 MP4 前几秒黑屏。
+        val segmentStartUs = (options.startMs.coerceAtLeast(0L) * 1_000L)
+            .coerceAtMost(if (durationUs > 0) durationUs else Long.MAX_VALUE)
+        val requestedEndUs = if (options.endMs > options.startMs) options.endMs * 1_000L else Long.MAX_VALUE
+        val segmentEndUs = if (durationUs > 0) {
+            requestedEndUs.coerceIn(segmentStartUs, durationUs)
+        } else requestedEndUs
+        val segmentDurationUs = if (segmentEndUs > segmentStartUs && segmentEndUs != Long.MAX_VALUE) {
+            segmentEndUs - segmentStartUs
+        } else if (durationUs > segmentStartUs) durationUs - segmentStartUs else 0L
 
         // 原片是 H.265 就默认继续用 H.265：同样码率下比 H.264 明显干净，
         // 灰片这种大面积渐变更不容易糊成块。
@@ -737,7 +804,13 @@ internal object VideoLutExporter {
 
             // 音轨必须先处理好：muxer.start() 之后再 addTrack 会直接抛异常
             val preparedAudio = if (audioTrack >= 0) {
-                runCatching { prepareAudio(extractor, audioTrack, input) }
+                runCatching {
+                    prepareAudio(
+                        extractor, audioTrack, input,
+                        startUs = segmentStartUs,
+                        endUs = segmentEndUs
+                    )
+                }
                     .onFailure { DoukLog.w("VideoLut", "AUDIO_FAIL", "err" to it.message) }
                     .getOrNull()
             } else null
@@ -754,7 +827,11 @@ internal object VideoLutExporter {
             var outputDone = false
             var encoderDone = false
             var renderedFrames = 0L
-            val totalFrames = if (durationUs > 0) (durationUs / 1_000_000.0 * fps).toLong() else 0L
+            val totalFrames = if (segmentDurationUs > 0) {
+                (segmentDurationUs / 1_000_000.0 * fps).toLong()
+            } else if (durationUs > 0) {
+                (durationUs / 1_000_000.0 * fps).toLong()
+            } else 0L
             var lastPercent = -1
 
             fun drainEncoder(endOfStream: Boolean) {
@@ -790,22 +867,33 @@ internal object VideoLutExporter {
             }
 
             extractor.selectTrack(videoTrack)
+            if (segmentStartUs > 0) {
+                extractor.seekTo(segmentStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            }
             while (!outputDone) {
                 if (!inputDone) {
                     val inIndex = decoder.dequeueInputBuffer(TIMEOUT_US)
                     if (inIndex >= 0) {
                         val buffer = decoder.getInputBuffer(inIndex)!!
-                        val size = extractor.readSampleData(buffer, 0)
-                        if (size < 0) {
+                        val sampleTime = extractor.sampleTime
+                        if (sampleTime < 0 || sampleTime > segmentEndUs) {
                             decoder.queueInputBuffer(
                                 inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                             )
                             inputDone = true
                         } else {
-                            decoder.queueInputBuffer(
-                                inIndex, 0, size, extractor.sampleTime, 0
-                            )
-                            extractor.advance()
+                            val size = extractor.readSampleData(buffer, 0)
+                            if (size < 0) {
+                                decoder.queueInputBuffer(
+                                    inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                inputDone = true
+                            } else {
+                                decoder.queueInputBuffer(
+                                    inIndex, 0, size, sampleTime, 0
+                                )
+                                extractor.advance()
+                            }
                         }
                     }
                 }
@@ -816,21 +904,29 @@ internal object VideoLutExporter {
                         decoder.releaseOutputBuffer(outIndex, false)
                         outputDone = true
                     } else {
-                        decoder.releaseOutputBuffer(outIndex, true)
-                        if (renderCore.awaitFrame(60)) {
-                            renderCore.draw(info.presentationTimeUs * 1000, intensity)
-                            EGLExt.eglPresentationTimeANDROID(
-                                eglDisplay, eglSurface, info.presentationTimeUs * 1000
-                            )
-                            if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) {
-                                throw IllegalStateException("视频帧写回编码器失败")
-                            }
-                            renderedFrames++
-                            if (totalFrames > 0) {
-                                val percent = ((renderedFrames * 100) / totalFrames).toInt().coerceIn(0, 99)
-                                if (percent != lastPercent) {
-                                    lastPercent = percent
-                                    onProgress(percent)
+                        val frameUs = info.presentationTimeUs
+                        // seek 到前一个关键帧后，关键帧到选区起点之间的帧直接丢弃；
+                        // 选区终点之后的帧也丢弃，这样生成的 MP4 长度和用户选的一致。
+                        if (frameUs < segmentStartUs || (segmentEndUs != Long.MAX_VALUE && frameUs >= segmentEndUs)) {
+                            decoder.releaseOutputBuffer(outIndex, false)
+                        } else {
+                            decoder.releaseOutputBuffer(outIndex, true)
+                            if (renderCore.awaitFrame(60)) {
+                                val relUs = (frameUs - segmentStartUs).coerceAtLeast(0L)
+                                renderCore.draw(relUs * 1000, intensity)
+                                EGLExt.eglPresentationTimeANDROID(
+                                    eglDisplay, eglSurface, relUs * 1000
+                                )
+                                if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) {
+                                    throw IllegalStateException("视频帧写回编码器失败")
+                                }
+                                renderedFrames++
+                                if (totalFrames > 0) {
+                                    val percent = ((renderedFrames * 100) / totalFrames).toInt().coerceIn(0, 99)
+                                    if (percent != lastPercent) {
+                                        lastPercent = percent
+                                        onProgress(percent)
+                                    }
                                 }
                             }
                         }
@@ -882,6 +978,11 @@ internal object VideoLutExporter {
             runCatching { muxer?.release() }
             runCatching { extractor.release() }
         }
+        // muxer 已在 finally 里 stop，文件此时才是完整的；解析失败就删掉半成品，不把假成功交给上层。
+        ExportOutputVerifier.verifyVideo(output).onFailure {
+            output.delete()
+            throw it
+        }.getOrThrow()
         output
     }
 }

@@ -13,6 +13,7 @@ import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.lut.XmpData
 import com.lutcamera.lutcamerapro.model.BorderState
 import com.lutcamera.lutcamerapro.ui.screens.connect.wired.SaveMode
+import com.lutcamera.lutcamerapro.util.BoundedIo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -20,6 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import kotlin.coroutines.coroutineContext
@@ -56,13 +58,17 @@ object ImageAutoProcessor {
             )
             fun own(bitmap: Bitmap): Bitmap = bitmap.also { ownedBitmaps.add(it) }
             try {
-                val imageBytes = imageStream.readBytes()
+                // 相机 JPEG 正常只有 5–30MB；上限只挡匿名 FTP / 异常文件，不把 200MB 全读进来。
+                val imageBytes = BoundedIo.readBytesWithLimit(imageStream, BoundedIo.MAX_FTP_BYTES)
                 require(PhotoExportPolicy.isSupportedJpeg(imageBytes, sourceFileName)) {
                     "当前成片处理仅支持完整 JPG，RAW/HEIF 请使用原始文件下载"
                 }
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, bounds)
                 require(bounds.outWidth > 0 && bounds.outHeight > 0) { "无法解码相机照片" }
+                require(PhotoExportPolicy.isPlausibleInput(bounds.outWidth, bounds.outHeight)) {
+                    "照片尺寸异常（${bounds.outWidth}×${bounds.outHeight}）"
+                }
                 val originalExif = try {
                     ExifInterface(ByteArrayInputStream(imageBytes))
                 } catch (e: IOException) {

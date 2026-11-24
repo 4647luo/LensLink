@@ -319,6 +319,15 @@ object CameraLanProbe {
 
     private data class Subnet(val ip: String, val iface: String)
 
+    /**
+     * 本机与 [target] 同 /24 网段的 Wi-Fi 地址（相机热点几乎都是 /24）。
+     *
+     * 鸿蒙/部分 ROM 上 `Network.socketFactory` 不保证把源地址钉死，socket 仍可能
+     * 从别的网卡（VPN、第二个 Wi-Fi、蜂窝虚拟接口）发包。这种情况需要把本机地址
+     * 显式 bind 到 socket 上，否则相机永远收不到 PTP/IP 握手。
+     */
+    fun localIpForSubnet(target: String): String? = CameraRouteResolver.localAddressFor(target)
+
     /** 本机当前 Wi-Fi 网段列表，供界面提示用。 */
     fun localNetworkSummary(): String {
         val subs = localSubnets()

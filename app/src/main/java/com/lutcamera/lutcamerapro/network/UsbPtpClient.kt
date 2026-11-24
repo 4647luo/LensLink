@@ -342,9 +342,14 @@ class UsbPtpClient {
     }
 
     /**
-     * USB 切换视频录制     */
-    fun toggleMovieRecord(startRecord: Boolean) {
-        if (!_isConnected.value) return
+     * USB 切换视频录制；onResult 回传相机是否真的接受了这条命令。
+     * 以前调用方一发送就把按钮置成录制态，机身拒绝时看起来就是「点了没反应」。
+     */
+    fun toggleMovieRecord(startRecord: Boolean, onResult: (Boolean) -> Unit = {}) {
+        if (!_isConnected.value) {
+            onResult(false)
+            return
+        }
         scope.launch(Dispatchers.IO) {
             try {
                 if (startRecord) {
@@ -354,9 +359,22 @@ class UsbPtpClient {
                     withContext(Dispatchers.Main) { listener?.onLog("USB stop movie") }
                     sendPtpCommand(0x920B.toShort())
                 }
-                readPtpResponse()
+                val response = readPtpResponse()
+                val code = if (response.size >= 8) {
+                    ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN).getShort(6).toInt() and 0xFFFF
+                } else {
+                    0x2000
+                }
+                val ok = code == 0x2001
+                withContext(Dispatchers.Main) {
+                    listener?.onLog(
+                        if (ok) "USB 视频录制命令已接受" else "USB 视频录制命令被拒绝（0x%04X）".format(code)
+                    )
+                    onResult(ok)
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "USB movie recording error", e)
+                withContext(Dispatchers.Main) { onResult(false) }
             }
         }
     }

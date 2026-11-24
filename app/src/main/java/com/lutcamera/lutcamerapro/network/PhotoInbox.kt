@@ -30,6 +30,7 @@ class PhotoInbox(private val directory: File) {
     fun stage(fileName: String, bytes: ByteArray): Entry {
         requireSafeName(fileName)
         require(bytes.isNotEmpty()) { "Photo data is empty" }
+        require(bytes.size <= MAX_PHOTO_BYTES) { "Photo is larger than ${MAX_PHOTO_BYTES / 1024 / 1024}MB" }
         ensureDirectory()
         val id = UUID.randomUUID().toString()
         val file = photoFile(id)
@@ -42,6 +43,38 @@ class PhotoInbox(private val directory: File) {
             atomicReplace(temporary, file)
         } finally {
             // Only our unpublished, UUID-named temporary file is eligible for cleanup.
+            temporary.delete()
+        }
+        val entry = Entry(id, fileName, file)
+        writeMetadata(entry, completed = false)
+        return entry
+    }
+
+    /**
+     * FTP 回传直接落盘后的移交：不再把 200MB 字节数组复制一遍，
+     * 只用流把临时文件搬进 inbox，成功原子改名后删掉源临时文件。
+     */
+    @Synchronized
+    fun stage(fileName: String, source: File): Entry {
+        requireSafeName(fileName)
+        require(source.isFile) { "Photo source is missing" }
+        require(source.length() in 1..MAX_PHOTO_BYTES) {
+            "Photo is larger than ${MAX_PHOTO_BYTES / 1024 / 1024}MB"
+        }
+        ensureDirectory()
+        val id = UUID.randomUUID().toString()
+        val file = photoFile(id)
+        val temporary = File(root, "$id.jpg.part")
+        try {
+            source.inputStream().use { input ->
+                FileOutputStream(temporary).use { output ->
+                    com.lutcamera.lutcamerapro.util.BoundedIo.copyWithLimit(input, output, MAX_PHOTO_BYTES)
+                    output.fd.sync()
+                }
+            }
+            atomicReplace(temporary, file)
+            source.delete()
+        } finally {
             temporary.delete()
         }
         val entry = Entry(id, fileName, file)
@@ -198,6 +231,7 @@ class PhotoInbox(private val directory: File) {
     }
 
     private companion object {
+        const val MAX_PHOTO_BYTES = 200L * 1024 * 1024
         val ID_PATTERN = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
     }
 }

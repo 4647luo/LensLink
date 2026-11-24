@@ -59,7 +59,9 @@ internal object PtpIpWire {
     /** One complete transaction; the caller must serialize access and close on framing/IO errors. */
     fun transaction(input: InputStream, output: OutputStream, id: Int, opcode: Int,
                     params: IntArray = intArrayOf(), outgoing: ByteArray? = null,
-                    maxData: Int = MAX_DATA, trace: (String, ByteArray) -> Unit = { _, _ -> }, beforeRead: () -> Unit = {}): Result {
+                    maxData: Int = MAX_DATA, trace: (String, ByteArray) -> Unit = { _, _ -> },
+                    onDataProgress: (copied: Long, total: Long) -> Unit = { _, _ -> },
+                    beforeRead: () -> Unit = {}): Result {
         fun send(bytes: ByteArray) {
             trace("TX_ATTEMPT", bytes)
             output.write(bytes)
@@ -106,6 +108,7 @@ internal object PtpIpWire {
                         throw IOException("PTP/IP data exceeds declared length")
                     data.write(p, 12, p.size - 12)
                     ended = type(p) == 12
+                    onDataProgress(data.size().toLong(), expected ?: 0L)
                 }
                 13 -> { send(packet(14)); output.flush() }
                 else -> throw IOException("Unexpected PTP/IP packet type ${type(p)}")

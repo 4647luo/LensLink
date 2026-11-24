@@ -138,6 +138,13 @@ class NikonPtpClient {
     // 相机只给「待配对」最小能力集时置 true：这不是连接失败，而是还没完成机身配对
     private val _pairingRequired = MutableStateFlow(false)
     val pairingRequired = _pairingRequired.asStateFlow()
+    /**
+     * 相机处于「连接至计算机」模式：机身把控制权交给了电脑端（Camera Control Pro / NX Tether）。
+     * 这种会话能读到图库，但控制类命令会被拒，而且电脑端会抢事件通道。
+     * 与「待配对」区分开，否则会误导用户去点配对。
+     */
+    private val _hostBusy = MutableStateFlow(false)
+    val hostBusy = _hostBusy.asStateFlow()
     @Volatile var lastResponseCode = 0
         private set
     /** 最近一次属性写入是否经过回读校验（true=机身当前值确实变了） */
@@ -189,8 +196,9 @@ class NikonPtpClient {
             UUID.randomUUID().also { preferences?.edit()?.putString("hostGuid", it.toString())?.apply() }
         }
         _metrics.value = LiveMetrics()
-        // 新一次连接先清掉上一轮的待配对标记
+        // 新一次连接先清掉上一轮的待配对 / 电脑占用标记
         _pairingRequired.value = false
+        _hostBusy.value = false
         // 身份 GUID 决定相机「已配对设备」里记几条：重装/清数据会换新身份，旧记录会一直留在相机上
         DoukLog.i("NikonPtp", "IDENTITY", "hostGuid" to hostGuid.toString(), "mode" to mode, "target" to cameraIp)
         watchJob = scope.launch {
@@ -201,26 +209,39 @@ class NikonPtpClient {
                 require(cameraIp.matches(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) &&
                     cameraIp.split('.').all { it.toInt() in 0..255 }) { "请输入相机的 IPv4 地址" }
                 val address = InetAddress.getByName(cameraIp)
-                val cm = context?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                // 按目标 IP 所在子网选 Wi‑Fi 网络，而不是只挑「非默认路由」。
-                // 相机热点本身往往就是默认网络，旧逻辑会把它排除，随后落到家用 Wi‑Fi/移动数据上，
-                // 表现为「明明连着相机却一直转圈」。
-                val wifi = context?.let { CameraLanProbe.networkForIp(it, cameraIp)?.network }
-                if (mode == ConnectionMode.CAMERA_AP && wifi != null &&
-                    cm?.getNetworkCapabilities(wifi)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) {
+                // 选路交给 CameraRouteResolver：现成网络优先，再 requestNetwork 兜底，
+                // 最后把 source 地址钉到相机网段（鸿蒙上 per-network socket 不保证生效）。
+                val route = context?.let { CameraRouteResolver.resolve(it, cameraIp) }
+                    ?: CameraRouteResolver.Route(
+                        network = null,
+                        pinnedLocalIp = null,
+                        source = CameraRouteResolver.Route.Source.DEFAULT,
+                        validated = false,
+                        localNets = CameraLanProbe.localNetworkSummary()
+                    )
+                if (mode == ConnectionMode.CAMERA_AP && route.validated) {
                     listener?.onLog("当前 Wi-Fi 能访问互联网，可能是家用路由器。相机热点模式请先连接机身显示的 Wi-Fi，再连接 192.168.1.1。")
-                    trace?.note("AP_NETWORK_WARNING wifi=$wifi is validated; target=$cameraIp may be a router")
+                    trace?.note("AP_NETWORK_WARNING ${route.describe()} target=$cameraIp may be a router")
                 }
-                val c = Connection(wifi?.socketFactory?.createSocket() ?: Socket(),
-                    wifi?.socketFactory?.createSocket() ?: Socket(), trace)
+                val commandSocket = route.network?.socketFactory?.createSocket() ?: Socket()
+                val eventSocket = route.network?.socketFactory?.createSocket() ?: Socket()
+                route.pinnedLocalIp?.let { ip ->
+                    runCatching { commandSocket.bind(InetSocketAddress(ip, 0)) }
+                    runCatching { eventSocket.bind(InetSocketAddress(ip, 0)) }
+                }
+                DoukLog.i("NikonPtp", "NET_ROUTE", "target" to cameraIp, "route" to route.describe())
+                if (route.source == CameraRouteResolver.Route.Source.REQUESTED_NETWORK) {
+                    DoukLog.i("NikonPtp", "NET_REQUESTED", "target" to cameraIp, "granted" to true)
+                }
+                val c = Connection(commandSocket, eventSocket, trace)
                 own = c
                 synchronized(lifecycle) {
                     if (generation != token) { c.close(); throw CancellationException() }
                     connection = c
                     _connectionStage.value = "正在连接 $cameraIp:$PTP_PORT"
                 }
-                listener?.onLog("连接方式 $mode，目标 $cameraIp；${if (wifi != null) "使用 Wi-Fi 路由" else "使用系统本地路由"}")
-                trace?.note("${c.label} ROUTE selectedNetwork=$wifi mode=$mode target=$address:$PTP_PORT")
+                listener?.onLog("连接方式 $mode，目标 $cameraIp；${if (route.bound) "使用 Wi-Fi 路由" else "使用系统本地路由"}")
+                trace?.note("${c.label} ROUTE ${route.describe()} mode=$mode target=$address:$PTP_PORT")
                 c.command.tcpNoDelay = true
                 c.command.soTimeout = 12000
                 c.command.connect(InetSocketAddress(address, PTP_PORT), 8000)
@@ -285,9 +306,10 @@ class NikonPtpClient {
                 // 尼康 Z 系列（二代/三代机）连上后必须先发 ChangeApplicationMode(0x9435, p1=1)
                 // 才会把相机从受限保护态切到"应用控制"模式。不发这条，相机只公布
                 // 0x952b/0x935a 这类最小命令集，看起来像「待配对」，其实是没被授权。
+                var unlockCode = -1
                 if (c.restricted) {
                     val unlock = runCatching { operation(0x9435, intArrayOf(1), expected = c) }.getOrNull()
-                    val unlockCode = unlock?.response?.code ?: -1
+                    unlockCode = unlock?.response?.code ?: -1
                     DoukLog.i("NikonPtp", "APP_MODE", "op" to "0x9435", "code" to "0x%04X".format(unlockCode))
                     trace?.note("${c.label} APP_MODE code=0x${"%04X".format(unlockCode)}")
                     if (unlockCode == 0x2001) {
@@ -307,11 +329,31 @@ class NikonPtpClient {
                     }
                 }
                 if (c.restricted) {
+                    // 切换到应用控制模式被拒，且相机回的是「忙」类错误码：说明机身正在
+                    // 「连接至计算机」模式，控制权已经在电脑端（Camera Control Pro / NX Tether）。
+                    // 这不是待配对，让用户去点配对只会白折腾。
+                    if (unlockCode == 0x2019 || unlockCode == 0xA004 || unlockCode == 0x200F || unlockCode == 0x2016) {
+                        _hostBusy.value = true
+                        DoukLog.w("NikonPtp", "HOST_BUSY", "model" to device.model,
+                            "unlockCode" to "0x%04X".format(unlockCode),
+                            "commands" to device.operations.size)
+                        withContext(Dispatchers.Main) {
+                            synchronized(lifecycle) {
+                                if (generation != token) throw CancellationException()
+                                _connectionStage.value = "相机被计算机占用：控制不可用"
+                            }
+                        }
+                        listener?.onLog("相机在「连接至计算机」模式，控制权在电脑端，机身会拒绝连镜的操作。要控制相机请在相机上改成「连接至智能设备」。")
+                        // 这种会话不取景、不列图库，但仍要喂白名单保活，
+                        // 否则相机在等电脑时会把 Wi‑Fi 睡过去，用户看到的就是「时不时断开」。
+                        launch { keepAliveLoop(c) }
+                        return@launch
+                    }
                     // 相机只给 0x952b(请求配对) / 0x935a(提交确认) 这一小组命令时，说明它在等配对，
                     // 不是连接失败。这里绝不能抛异常关会话，否则永远没机会把配对做下去。
                     _pairingRequired.value = true
                     DoukLog.i("NikonPtp", "PAIRING_REQUIRED", "model" to device.model,
-                        "commands" to device.operations.size, "props" to device.properties.size)
+                        "commands" to device.operations.size, "props" to device.properties.size, "unlockCode" to "0x%04X".format(unlockCode))
                     withContext(Dispatchers.Main) {
                         synchronized(lifecycle) {
                             if (generation != token) throw CancellationException()
@@ -319,6 +361,8 @@ class NikonPtpClient {
                         }
                     }
                     listener?.onLog("相机处于待配对状态（仅 ${device.operations.size} 个命令）。点「开始配对」即可继续。")
+                    // 配对窗口里也要保活，否则等用户去点机身验证码时连接先断了。
+                    launch { keepAliveLoop(c) }
                     return@launch
                 }
                 withContext(Dispatchers.Main) {
@@ -342,11 +386,20 @@ class NikonPtpClient {
                 withContext(Dispatchers.Main) {
                     synchronized(lifecycle) {
                         if (generation == token) {
-                            val friendly = if (e is java.net.SocketTimeoutException)
-                                "相机端口可达但 PTP/IP 握手无响应：请先在相机上断开 SnapBridge/旧设备，重新进入「连接至智能设备」后再试"
-                            else (e.message ?: "连接失败")
+                            val onCameraNet = context?.let { CameraLanProbe.localIpForSubnet(cameraIp) }
+                            val friendly = when {
+                                e is java.net.SocketTimeoutException ->
+                                    "相机端口可达但 PTP/IP 握手无响应：请先在相机上断开 SnapBridge/旧设备，重新进入「连接至智能设备」后再试"
+                                e is java.net.ConnectException && onCameraNet == null ->
+                                    "手机不在相机网段（本机 ${CameraLanProbe.localNetworkSummary()}，相机 $cameraIp）。请确认已连上相机显示的 Wi-Fi 热点，并关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试；若相机 Wi-Fi 已自动关闭，请在相机上重新进入「连接至智能设备 → Wi-Fi 连接」"
+                                e is java.net.ConnectException ->
+                                    "已在相机网段（本机 $onCameraNet），但 $cameraIp:$PTP_PORT 不通。相机可能在等待超时后自行关闭了 Wi-Fi，请在相机上重新进入 Wi-Fi 连接画面后再试"
+                                else -> e.message ?: "连接失败"
+                            }
                             DoukLog.e("NikonPtp", "CONNECT_FAIL", "stage" to _connectionStage.value,
-                                "error" to (e.message ?: e::class.java.simpleName), "type" to e::class.java.simpleName)
+                                "error" to (e.message ?: e::class.java.simpleName), "type" to e::class.java.simpleName,
+                                "onCameraNet" to (onCameraNet ?: "-"),
+                                "localNets" to CameraLanProbe.localNetworkSummary())
                             _connectionStage.value = "连接失败：$friendly"
                             _isConnected.value = false
                             connection = null
@@ -365,6 +418,7 @@ class NikonPtpClient {
             _isConnected.value = false
             _isLiveViewActive.value = false
             _pairingRequired.value = false
+            _hostBusy.value = false
             connection?.close() // Close synchronously so an old job cannot close a newer connection.
             connection = null
             watchJob?.cancel(); watchJob = null
@@ -395,15 +449,20 @@ class NikonPtpClient {
     }
 
     private suspend fun operation(code: Int, params: IntArray = intArrayOf(), data: ByteArray? = null,
-        expected: Connection? = connection): PtpIpWire.Result {
+        expected: Connection? = connection,
+        onDataProgress: ((Long, Long) -> Unit)? = null): PtpIpWire.Result {
         val c = expected ?: throw IOException("尚未连接相机")
         return c.mutex.withLock {
             // Once sent, drain the entire transaction even if the caller is cancelled.
             withContext(Dispatchers.IO + NonCancellable) {
                 if (connection !== c) throw IOException("连接已更换")
                 if (c.restricted && code !in setOf(0x1001, 0x1002, 0x1003, 0x952b, 0x935a, 0x9435)) {
-                    c.trace?.note("${c.label} OP_BLOCKED restricted profile opcode=0x${code.toString(16)}")
-                    throw IOException("相机当前仅公布有限命令；已暂停控制操作，等待配对流程验证")
+                    c.trace?.note("${c.label} OP_BLOCKED restricted profile opcode=0x${code.toString(16)} hostBusy=${_hostBusy.value}")
+                    // 两种受限要分开说：电脑占用时让用户去点配对是错的归因。
+                    throw IOException(
+                        if (_hostBusy.value) "相机在「连接至计算机」模式，控制权在电脑端，这项操作被机身拒绝"
+                        else "相机当前仅公布有限命令；已暂停控制操作，等待配对流程验证"
+                    )
                 }
                 try {
                     val sampled = code != 0x9203 || c.transaction % 30 == 0
@@ -416,7 +475,7 @@ class NikonPtpClient {
                         if (code == 0x9203) 16 * 1024 * 1024 else PtpIpWire.MAX_DATA, trace = { direction, bytes ->
                             if (sampled || direction.startsWith("RX_PARTIAL") || direction == "RX_INVALID_HEADER")
                                 c.record("command")(direction, bytes)
-                        }) {
+                        }, onDataProgress = { copied, total -> onDataProgress?.invoke(copied, total) }) {
                         c.command.soTimeout = PtpIpWire.remainingMillis(deadline)
                     }
                     val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
@@ -427,11 +486,14 @@ class NikonPtpClient {
                     result
                 } catch (e: IOException) {
                     c.trace?.note("${c.label} OP_ERROR opcode=0x${code.toString(16)}\n${e.stackTraceToString()}")
-                    // 单次读超时（相机正在写卡/取景）不立刻拆会话；连续 3 次才按真实掉线处理。
+                    // 单次读超时（相机正在写卡/取景）不立刻拆会话；连续超时才按真实掉线处理。
+                    // 受限会话（待配对 / 电脑占用）机身响应更慢，门限放宽到 5 次，
+                    // 否则电脑端一抢总线就会表现为「时不时断开」。
                     val timedOut = e is SocketTimeoutException ||
                         (e.message?.contains("timed out", true) == true) ||
                         (e.message?.contains("超时") == true)
-                    if (timedOut && ++ioTimeoutStreak < 3) {
+                    val streakLimit = if (c.restricted) 5 else 3
+                    if (timedOut && ++ioTimeoutStreak < streakLimit) {
                         c.trace?.note("${c.label} OP_TIMEOUT_SOFT streak=$ioTimeoutStreak opcode=0x${code.toString(16)}")
                         throw IOException("相机响应超时（会话保留，可重试）：${e.message}")
                     }
@@ -442,8 +504,12 @@ class NikonPtpClient {
         }
     }
 
-    private suspend fun sendOperation(opCode: Short, params: IntArray = intArrayOf()): ByteArray? {
-        val result = operation(opCode.toInt() and 0xffff, params)
+    private suspend fun sendOperation(
+        opCode: Short,
+        params: IntArray = intArrayOf(),
+        onDataProgress: ((Long, Long) -> Unit)? = null
+    ): ByteArray? {
+        val result = operation(opCode.toInt() and 0xffff, params, onDataProgress = onDataProgress)
         if (result.response.code != 0x2001) throw CameraResponse(result.response.code)
         return result.data
     }
@@ -525,8 +591,17 @@ class NikonPtpClient {
 
     private suspend fun pollPhotoEvents(c: Connection) {
         while (connection === c) {
-            delay(2000)
             val enabled = autoTransferJpeg
+            // 关掉自动回传后没必要每 2 秒发一次 0x90C7：相机 Wi‑Fi 和机身都会被无谓唤醒。
+            // 取景时降到 3 秒（画面本身在保活），纯待机且不回传时 8 秒一次即可，
+            // 重新打开自动回传最多 8 秒内接上，不会漏掉刚拍的照片。
+            delay(
+                when {
+                    !enabled -> 8_000L
+                    _isLiveViewActive.value -> 3_000L
+                    else -> 2_000L
+                }
+            )
             // 读机身图库时先别抢命令通道：尼康在枚举对象期间收到 0x90C7 会直接取消事务（0x201F）
             if (storageBusy) continue
             if (c.pollEvents && !c.restricted) {
@@ -564,19 +639,22 @@ class NikonPtpClient {
     private suspend fun keepAliveLoop(c: Connection) {
         var softFailures = 0
         while (connection === c && !c.command.isClosed) {
-            // 取景流本身每帧都在传，不需要再发心跳；空闲时把间隔放到 60 秒以上，
-            // 否则每 15 秒一次 GetDeviceInfo 会让相机 Wi‑Fi 灯一直闪、白耗电。
-            val interval = if (_isLiveViewActive.value) {
-                4_000L
-            } else {
-                keepAliveIntervalMs.coerceIn(20_000L, 180_000L)
+            // 取景流每帧都在传，本身就是保活；旧实现还会每 4 秒醒来发一次空操作，
+            // 对相机和 Wi‑Fi 都是纯浪费。取景期间直接睡 30 秒，只负责观察会话是否还活着。
+            if (_isLiveViewActive.value) {
+                delay(30_000)
+                continue
             }
+            // 空闲时把间隔放到 60 秒以上，否则频繁 GetDeviceInfo 会让相机 Wi‑Fi 灯一直闪、白耗电。
+            val interval = keepAliveIntervalMs.coerceIn(20_000L, 180_000L)
             delay(interval)
             if (connection !== c) return
             if (_isLiveViewActive.value) continue
-            // 0x90C7 轮询本身就在保活；受限会话只允许白名单命令，别添乱；
-            // 读图库/传图期间不要插命令，避免 0x201F。
-            if (c.pollEvents || c.restricted || storageBusy) continue
+            // 0x90C7 轮询本身就在保活；读图库/传图期间不要插命令，避免 0x201F。
+            // 受限会话（待配对 / 电脑占用）也要保活：只发白名单里的 0x1001，
+            // 否则相机在没人喂数据时会休眠关 Wi‑Fi，表现为「时不时断开」。
+            if (c.pollEvents || storageBusy) continue
+            val failLimit = if (c.restricted) 5 else 3
             try {
                 val result = operation(0x1001, expected = c)
                 val code = result.response.code
@@ -589,7 +667,7 @@ class NikonPtpClient {
                 if (code != 0x2001) {
                     softFailures++
                     c.trace?.note("${c.label} KEEPALIVE_SOFT_FAIL code=0x${code.toString(16)} streak=$softFailures")
-                    if (softFailures >= 3) {
+                    if (softFailures >= failLimit) {
                         transportFailed(c, "保活失败：0x${code.toString(16)}")
                         return
                     }
@@ -606,7 +684,7 @@ class NikonPtpClient {
                 // operation() 已经负责连续超时的计数；这里只做一轮延迟重试，不重复拆会话。
                 softFailures++
                 c.trace?.note("${c.label} KEEPALIVE_EXCEPTION streak=$softFailures ${e.message}")
-                if (softFailures >= 3) {
+                if (softFailures >= failLimit) {
                     transportFailed(c, "保活超时：${e.message}")
                     return
                 }
@@ -1771,7 +1849,10 @@ class NikonPtpClient {
     /**
      * 📸 [真实功能] 从机身拉取全尺寸原图字节流 (GetObject)
      */
-    suspend fun downloadCameraPhoto(handle: Int): ByteArray? = withContext(Dispatchers.IO) {
+    suspend fun downloadCameraPhoto(
+        handle: Int,
+        onProgress: ((copied: Long, total: Long) -> Unit)? = null
+    ): ByteArray? = withContext(Dispatchers.IO) {
         val storageConnection = connection ?: return@withContext null
         val socket = storageConnection.command
         if (socket.isClosed || !_isConnected.value) return@withContext null
@@ -1783,9 +1864,27 @@ class NikonPtpClient {
             }
 
             activeListener?.onLog("📥 正在通过 PTP 高速通道拉取原图 (Handle: $handle)...")
-            
+
+            // PTP 每个数据包通常 1MB 以上；按 180ms / 256KB 节流，避免传输时
+            // 每包都去改 Compose 状态，同时保证界面上的速度是实时更新的。
+            var lastCopied = -1L
+            var lastAt = 0L
+            val progress: ((Long, Long) -> Unit)? = onProgress?.let { sink ->
+                { copied, total ->
+                    val now = System.nanoTime()
+                    if (copied != lastCopied &&
+                        (lastAt == 0L || now - lastAt >= 180_000_000L || copied - lastCopied >= 256L * 1024L ||
+                            (total > 0L && copied >= total))
+                    ) {
+                        lastCopied = copied
+                        lastAt = now
+                        sink(copied, total)
+                    }
+                }
+            }
+
             // 1. 发送 GetObject (0x1009)
-                val photoBytes = sendOperation(0x1009.toShort(), intArrayOf(handle))
+                val photoBytes = sendOperation(0x1009.toShort(), intArrayOf(handle), progress)
 
 
 

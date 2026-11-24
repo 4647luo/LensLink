@@ -25,6 +25,7 @@ object GitHubUpdateChecker {
         val pageUrl: String,
         val apkUrl: String?,
         val apkSize: Long,
+        val apkSha256: String?,
         val publishedAt: String,
         val isNewer: Boolean,
     )
@@ -49,12 +50,16 @@ object GitHubUpdateChecker {
             val assets = json.optJSONArray("assets")
             var apkUrl: String? = null
             var apkSize = 0L
+            var apkSha256: String? = null
             if (assets != null) {
                 for (i in 0 until assets.length()) {
                     val asset = assets.optJSONObject(i) ?: continue
                     if (asset.optString("name").lowercase().endsWith(".apk")) {
                         apkUrl = asset.optString("browser_download_url").ifBlank { null }
                         apkSize = asset.optLong("size")
+                        // GitHub 新版 release asset 会带 digest（sha256:...）；没有就留空，由 App 端只校验签名+版本。
+                        apkSha256 = asset.optString("digest").substringAfter(':', "")
+                            .takeIf { it.length == 64 }
                         break
                     }
                 }
@@ -67,6 +72,7 @@ object GitHubUpdateChecker {
                     pageUrl = pageUrl,
                     apkUrl = apkUrl,
                     apkSize = apkSize,
+                    apkSha256 = apkSha256,
                     publishedAt = json.optString("published_at").take(10),
                     isNewer = isVersionNewer(tag, currentVersion),
                 )

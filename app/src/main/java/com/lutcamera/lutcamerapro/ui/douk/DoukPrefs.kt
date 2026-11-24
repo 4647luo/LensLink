@@ -54,10 +54,15 @@ object DoukPrefs {
         get() = str("monitor_left_actions", "iso,shutter,aperture,ev")
         set(v) = putStr("monitor_left_actions", v)
 
-    /** 监视画面右栏按钮（快门固定居中，其余动作竖排） */
+    /** 监视画面右栏按钮（快门固定居中，其余动作竖排）；音频入口已按需求移除，默认换成 LUT。 */
     var monitorRightActions: String
-        get() = str("monitor_right_actions", "grid,hist,wave,audio")
+        get() = str("monitor_right_actions", "lut,grid,hist,wave")
         set(v) = putStr("monitor_right_actions", v)
+
+    /** 视频色调模式：SDR / N-Log / HLG，只影响监看还原与文件标注，不下发机身私有属性。 */
+    var monitorToneMode: String
+        get() = str("monitor_tone_mode", "SDR")
+        set(v) = putStr("monitor_tone_mode", v)
 
     /** 设备页是否显示「添加设备」按钮（关掉后走顶部 + 号或搜索） */
     var showAddDeviceButton: Boolean
@@ -165,10 +170,10 @@ object DoukPrefs {
     var editorQuality: Int
         get() = str("editor_quality", "95").toIntOrNull()?.coerceIn(60, 100) ?: 95
         set(v) = putStr("editor_quality", v.coerceIn(60, 100).toString())
-    /** 编辑预览长边：720 / 1080 / 1440 */
+    /** 编辑预览长边：720 / 1080 / 1440 / 2048 / 3072 / 4096；默认 3072，兼顾细节与滑动响应。 */
     var editorPreview: Int
-        get() = str("editor_preview", "1080").toIntOrNull()?.coerceIn(480, 2048) ?: 1080
-        set(v) = putStr("editor_preview", v.coerceIn(480, 2048).toString())
+        get() = str("editor_preview_v2", "3072").toIntOrNull()?.coerceIn(480, 4096) ?: 3072
+        set(v) = putStr("editor_preview_v2", v.coerceIn(480, 4096).toString())
     /** 编辑页显示九宫格辅助线 */
     var editorGrid: Boolean
         get() = flag("editor_grid", false)
@@ -181,6 +186,30 @@ object DoukPrefs {
     var downloadVideoFormat: String
         get() = str("download_video_format", "MOV")
         set(v) = putStr("download_video_format", v)
+
+    /**
+     * FTP 回传口令。相机 FTP 配置里的用户名可填 nikon，密码填这串 8 位口令。
+     * 首次读取时生成并持久化；不要再用「任何 PASS 都放行」的匿名模式。
+     */
+    var ftpToken: String
+        get() {
+            val existing = str("ftp_token", "")
+            if (existing.isNotBlank()) return existing
+            val generated = generateFtpToken()
+            putStr("ftp_token", generated)
+            return generated
+        }
+        set(v) = putStr("ftp_token", v.filter { it.isLetterOrDigit() }.take(32))
+
+    fun regenerateFtpToken(): String = generateFtpToken().also { ftpToken = it }
+
+    private fun generateFtpToken(): String {
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val random = java.security.SecureRandom()
+        return buildString {
+            repeat(8) { append(alphabet[random.nextInt(alphabet.length)]) }
+        }
+    }
 
     /** 只下载相机里已锁定的照片 */
     var lockedOnly: Boolean
@@ -367,21 +396,15 @@ object DoukPrefs {
         set(v) = putInt("gallery_page_size", v)
 
     // ===== 更新 =====
-    /** 启动 App 时自动检查一次更新 */
-    var checkUpdateOnLaunch: Boolean
-        get() = flag("check_update_on_launch", true)
-        set(v) = putFlag("check_update_on_launch", v)
+    /** 用户选择「该版本不提示」后记住的版本号；出现更新版本时仍会再提示。 */
+    var ignoredUpdateVersion: String
+        get() = str("ignored_update_version", "")
+        set(v) = putStr("ignored_update_version", v)
 
-    /** 上次启动自动检查时间，用于避免每次启动都请求 */
-    var lastAutoUpdateCheckAt: Long
-        get() {
-            ensure()
-            return sp.getLong("last_auto_update_check_at", 0L)
-        }
-        set(v) {
-            ensure()
-            sp.edit().putLong("last_auto_update_check_at", v).apply()
-        }
+    /** 上一次弹出月度赞赏提示的月份（yyyy-MM）；每个月只弹一次。 */
+    var lastSupportPromptMonth: String
+        get() = str("last_support_prompt_month", "")
+        set(v) = putStr("last_support_prompt_month", v)
 
 
     // ===== 控制页参数排序 / 显示 =====
@@ -418,8 +441,15 @@ object DoukPrefs {
     // ===== 资源 =====
     fun lutDir(context: Context): File = File(context.filesDir, "lut").apply { mkdirs() }
 
+    /**
+     * 递归扫描资源目录：部分文件管理器导入 .cube 时会保留子文件夹，
+     * 之前只 listFiles 顶层，子目录里的 LUT 在监视页就会“识别不到”。
+     */
     fun importedResources(context: Context): List<File> =
-        lutDir(context).listFiles()?.sortedBy { it.name.lowercase() } ?: emptyList()
+        lutDir(context).walkTopDown()
+            .filter { it.isFile && !it.name.startsWith(".") }
+            .sortedBy { it.relativeTo(lutDir(context)).path.lowercase() }
+            .toList()
 
     /**
      * 资源类型：LUT（.cube/.3dl/.look）还是滤镜（尼康 Picture Control .NP3/.NCP/.NP2）。

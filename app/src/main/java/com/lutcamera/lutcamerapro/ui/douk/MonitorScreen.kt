@@ -3,18 +3,9 @@
 package com.lutcamera.lutcamerapro.ui.douk
 
 import android.app.Activity
-import android.Manifest
 import android.content.pm.ActivityInfo
-import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
-import androidx.compose.runtime.mutableFloatStateOf
 import com.lutcamera.lutcamerapro.log.DoukLog
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -67,6 +58,7 @@ import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ColorLens
 import androidx.compose.material.icons.rounded.CropFree
 import androidx.compose.material.icons.rounded.Exposure
 import androidx.compose.material.icons.rounded.Face
@@ -84,6 +76,7 @@ import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.WbSunny
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -117,6 +110,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -214,7 +208,6 @@ fun MonitorFullscreen(state: DoukState) {
     var lutOn by remember { mutableStateOf(false) }
     var histOn by remember { mutableStateOf(false) }
     var waveOn by remember { mutableStateOf(false) }
-    var audioOn by remember { mutableStateOf(false) }
     var gridOn by remember { mutableStateOf(false) }
     var lutId by remember { mutableStateOf<String?>(null) }
     var lutEntries by remember { mutableStateOf<List<FilterEntry>>(emptyList()) }
@@ -235,7 +228,6 @@ fun MonitorFullscreen(state: DoukState) {
     // 叠加层位置（px）：长按拖动后停在用户放下的位置，只有开启/关闭，不随点画面消失
     var histOffset by remember { mutableStateOf<Offset?>(null) }
     var waveOffset by remember { mutableStateOf<Offset?>(null) }
-    var audioOffset by remember { mutableStateOf<Offset?>(null) }
     // 左右栏自定义按钮
     var leftActions by remember {
         mutableStateOf(parseRailActions(DoukPrefs.monitorLeftActions, DEFAULT_LEFT_ACTIONS))
@@ -244,6 +236,7 @@ fun MonitorFullscreen(state: DoukState) {
         mutableStateOf(parseRailActions(DoukPrefs.monitorRightActions, DEFAULT_RIGHT_ACTIONS))
     }
     var railConfigOpen by remember { mutableStateOf(false) }
+    var qualityCardOpen by remember { mutableStateOf(false) }
     var paramToast by remember { mutableStateOf<String?>(null) }
     val uiScope = rememberCoroutineScope()
 
@@ -318,7 +311,13 @@ fun MonitorFullscreen(state: DoukState) {
             val files = withContext(Dispatchers.IO) { DoukPrefs.importedResources(context) }
                 .filter { it.extension.lowercase() in extSet }
             val broken = HashSet<String>()
-            lutEntries = files.map { file ->
+            val builtIns = loaded?.entries
+                ?.filter { it.id.startsWith("builtin:") }
+                ?.takeIf { it.isNotEmpty() }
+                ?: emptyList()
+            // 以前这里只按导入文件重建列表，内置 N-Log / HLG 还原被整个丢掉，
+            // 用户没导入文件时就看到空列表。现在内置项始终排在前面。
+            lutEntries = builtIns + files.map { file ->
                 val id = "res:${file.name}"
                 val ok = id in parsedIds
                 if (!ok) broken += id
@@ -338,6 +337,26 @@ fun MonitorFullscreen(state: DoukState) {
                 "files" to (loaded?.entries?.size ?: 0).toString(),
                 "parsed" to parsedIds.size.toString()
             )
+        }
+    }
+
+    // 拍摄档不显示 / 不保留 LUT；视频档才按色调模式自动挑内置还原 LUT。
+    LaunchedEffect(state.effectiveMode, state.movieToneMode, lutEntries) {
+        if (state.effectiveMode != CaptureMode.VIDEO) {
+            lutOn = false
+            if (qualityCardOpen) qualityCardOpen = false
+            return@LaunchedEffect
+        }
+        val current = lutId
+        if (current == null || current == "builtin:nlog" || current == "builtin:hlg") {
+            val target = when (state.movieToneMode) {
+                "N-Log" -> "builtin:nlog"
+                "HLG" -> "builtin:hlg"
+                else -> null
+            }
+            lutId = target
+            // 选 N-Log / HLG 就默认套上对应还原 LUT；回到 SDR 自动关掉。
+            lutOn = target != null
         }
     }
 
@@ -392,6 +411,14 @@ fun MonitorFullscreen(state: DoukState) {
             val railRightWidth = 104.dp
             val railLeftPx = with(density) { railLeftWidth.roundToPx() }
             val railRightPx = with(density) { railRightWidth.roundToPx() }
+            // 横屏工具卡按实际屏宽铺开：手机/平板右边都不会再空一块，列数随宽度增加到 4–6 列。
+            val screenWdp = with(density) { rootW.toDp() }
+            val deckWidth = if (landscape) {
+                (screenWdp - railLeftWidth - railRightWidth - 16.dp).coerceIn(360.dp, 640.dp)
+            } else 0.dp
+            val deckColumns = if (landscape) {
+                ((deckWidth - 24.dp) / 86.dp).toInt().coerceIn(4, 6)
+            } else 3
             val sourceBmp = frame
             val source = remember(sourceBmp) { sourceBmp?.asImageBitmap() }
             // 取景画面按相机实际输出的方向显示，不再按手机横竖自动旋转；
@@ -502,8 +529,18 @@ fun MonitorFullscreen(state: DoukState) {
                                         else if (dy > 90f) deck = MonitorDeck.CAMERA
                                     }
                                 } else {
-                                    if (deck == MonitorDeck.TOOLS && dy > 70f) deck = MonitorDeck.NONE
-                                    if (deck == MonitorDeck.CAMERA && dy < -70f) deck = MonitorDeck.NONE
+                                    // 左滑出工具 → 右滑收起；右滑出参数 → 左滑收起。
+                                    // 竖向也保留原来的上/下滑对称收起，不再只能往一个方向关。
+                                    val horizontal = kotlin.math.abs(dx) > kotlin.math.abs(dy)
+                                    if (deck == MonitorDeck.TOOLS) {
+                                        if ((horizontal && dx > 70f) || (!horizontal && dy > 70f)) {
+                                            deck = MonitorDeck.NONE
+                                        }
+                                    } else if (deck == MonitorDeck.CAMERA) {
+                                        if ((horizontal && dx < -70f) || (!horizontal && dy < -70f)) {
+                                            deck = MonitorDeck.NONE
+                                        }
+                                    }
                                 }
                                 dx = 0f; dy = 0f
                             }
@@ -559,17 +596,40 @@ fun MonitorFullscreen(state: DoukState) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        // 单击/双击收起保留；同时接收拖动，保证「左滑出工具后右滑能关」，
+                        // 反过来「右滑出参数后左滑能关」。以前这里只处理 tap，横滑事件被吃掉，
+                        // 所以用户看到工具箱拉出来以后滑不回去。
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            DoukLog.i("Mon", "TAP_CLOSE_DECK", "deck" to deck.name)
+                            deck = MonitorDeck.NONE
+                        }
                         .pointerInput(deck) {
-                            detectTapGestures(
-                                onTap = {
-                                    DoukLog.i("Mon", "TAP_CLOSE_DECK", "deck" to deck.name)
-                                    deck = MonitorDeck.NONE
-                                },
-                                onDoubleTap = {
-                                    DoukLog.i("Mon", "DOUBLE_TAP_CLOSE_DECK", "deck" to deck.name)
-                                    deck = MonitorDeck.NONE
+                            var dx = 0f
+                            var dy = 0f
+                            detectDragGestures(
+                                onDragStart = { dx = 0f; dy = 0f },
+                                onDragCancel = { dx = 0f; dy = 0f },
+                                onDragEnd = {
+                                    val horizontal = kotlin.math.abs(dx) > kotlin.math.abs(dy)
+                                    if (deck == MonitorDeck.TOOLS) {
+                                        if ((horizontal && dx > 70f) || (!horizontal && dy > 70f)) {
+                                            deck = MonitorDeck.NONE
+                                        }
+                                    } else if (deck == MonitorDeck.CAMERA) {
+                                        if ((horizontal && dx < -70f) || (!horizontal && dy < -70f)) {
+                                            deck = MonitorDeck.NONE
+                                        }
+                                    }
+                                    dx = 0f; dy = 0f
                                 }
-                            )
+                            ) { change, dragAmount ->
+                                dx += dragAmount.x
+                                dy += dragAmount.y
+                                change.consume()
+                            }
                         }
                 )
             }
@@ -608,8 +668,6 @@ fun MonitorFullscreen(state: DoukState) {
             val histHpx = with(density) { 96.dp.roundToPx() }
             val waveWpx = with(density) { 220.dp.roundToPx() }
             val waveHpx = with(density) { 116.dp.roundToPx() }
-            val audioWpx = with(density) { 210.dp.roundToPx() }
-            val audioHpx = with(density) { 220.dp.roundToPx() }
             val edge = with(density) { 10.dp.roundToPx() }
 
             // 首次进入/横竖切换时把叠加层放到画面内的默认角落，之后用户长按拖到哪就停在哪
@@ -619,10 +677,6 @@ fun MonitorFullscreen(state: DoukState) {
                     (railLeftPx + edge).toFloat(),
                     (edge + histHpx + edge).toFloat()
                 )
-                audioOffset = Offset(
-                    (rootW - railRightPx - audioWpx - edge).coerceAtLeast(edge).toFloat(),
-                    edge.toFloat()
-                )
             }
 
             fun onRailAction(id: String) {
@@ -630,9 +684,14 @@ fun MonitorFullscreen(state: DoukState) {
                     "grid" -> gridOn = !gridOn
                     "hist" -> histOn = !histOn
                     "wave" -> waveOn = !waveOn
-                    "audio" -> audioOn = !audioOn
+                    "lut" -> {
+                        if (state.effectiveMode == CaptureMode.VIDEO) {
+                            lutOn = !lutOn
+                            if (lutOn) deck = MonitorDeck.TOOLS
+                        }
+                    }
                     "focus" -> state.vm.triggerAf()
-                    "quality" -> state.cyclePreviewQuality()
+                    "quality" -> qualityCardOpen = !qualityCardOpen
                     "view" -> { topCard = true; viewCard = true }
                     "rails" -> railConfigOpen = true
                 }
@@ -661,17 +720,26 @@ fun MonitorFullscreen(state: DoukState) {
                         Icon(Icons.Rounded.Close, "退出全屏", tint = Color.White, modifier = Modifier.size(20.dp))
                     }
                     Text("左栏", color = Color.White.copy(alpha = 0.42f), fontSize = 9.sp)
-                    leftActions.forEach { id ->
-                        RailActionItem(
-                            id = id,
-                            state = state,
-                            video = video,
-                            active = railActionActive(id, histOn, waveOn, audioOn, gridOn, perspectiveOn = viewCard),
-                            onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
-                            onAction = ::onRailAction
-                        )
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        leftActions.filter { railVisibleInMode(it, video) }.forEach { id ->
+                            RailActionItem(
+                                id = id,
+                                state = state,
+                                video = video,
+                                active = railActionActive(id, histOn, waveOn, gridOn, perspectiveOn = viewCard, lutOn = lutOn),
+                                onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
+                                onAction = ::onRailAction
+                            )
+                        }
                     }
-                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.height(4.dp))
                     // 左下角档位胶囊：点一下就在拍摄/视频之间切换，工具与参数面板跟着换
                     MonitorModePill(video = video, compact = true, onToggle = {
                         state.selectMode(if (video) CaptureMode.STILL else CaptureMode.VIDEO)
@@ -703,7 +771,12 @@ fun MonitorFullscreen(state: DoukState) {
                                 Color(0xFFFFB15C).copy(alpha = 0.35f),
                                 RoundedCornerShape(12.dp)
                             )
-                            .clickable { deck = MonitorDeck.CAMERA }
+                            .clickable {
+                                // 点「相机控制」只开参数面板，不再弹“左右划显示控制工具箱”之类的提示卡。
+                                paramToast = null
+                                state.lastParamHint = ""
+                                deck = MonitorDeck.CAMERA
+                            }
                             .padding(vertical = 6.dp, horizontal = 2.dp),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
@@ -718,20 +791,32 @@ fun MonitorFullscreen(state: DoukState) {
                         Text("相机控制", color = Color(0xFFFFD9AE), fontSize = 9.sp, maxLines = 1)
                     }
                     Spacer(Modifier.height(6.dp))
-                    rightActions.forEach { id ->
-                        Box(Modifier.fillMaxWidth()) {
-                            RailActionItem(
-                                id = id,
-                                state = state,
-                                video = video,
-                                active = railActionActive(id, histOn, waveOn, audioOn, gridOn, perspectiveOn = viewCard),
-                                onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
-                                onAction = ::onRailAction
-                            )
-                        }
-                        Spacer(Modifier.height(5.dp))
+                    // 所有右栏按钮放进可滚动区域：手机上即使配了七八个参数也不会把快门挤掉，
+                    // 也避免最底部按钮被系统手势条裁掉（这就是“显示不全”的来源）。
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        rightActions
+                            .filter { railVisibleInMode(it, video) }
+                            .forEach { id ->
+                                Box(Modifier.fillMaxWidth()) {
+                                    RailActionItem(
+                                        id = id,
+                                        state = state,
+                                        video = video,
+                                        active = railActionActive(id, histOn, waveOn, gridOn, perspectiveOn = viewCard, lutOn = lutOn),
+                                        onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
+                                        onAction = ::onRailAction
+                                    )
+                                }
+                            }
                     }
-                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.height(4.dp))
                     Box(
                         modifier = Modifier
                             .size(74.dp)
@@ -750,12 +835,12 @@ fun MonitorFullscreen(state: DoukState) {
                                 .clickable { state.shoot() }
                         )
                     }
-                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.height(5.dp))
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(9.dp))
                             .background(Color.White.copy(alpha = 0.08f))
-                            .clickable { state.cyclePreviewQuality() }
+                            .clickable { qualityCardOpen = !qualityCardOpen }
                             .padding(horizontal = 6.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -829,6 +914,13 @@ fun MonitorFullscreen(state: DoukState) {
                     ExposureLine("快门", shutterText, onAnchor = { pickerAnchor = it; pickerKey = if (video) "movieShutter" else "shutter" })
                     ExposureLine("光圈", apertureText, onAnchor = { pickerAnchor = it; pickerKey = if (video) "movieAperture" else "aperture" })
                     ExposureLine("曝光补偿", evText, onAnchor = { pickerAnchor = it; pickerKey = if (video) "movieEv" else "ev" })
+                    Spacer(Modifier.height(8.dp))
+                    Text("拍摄状态", style = DoukType.caption, color = Color.White.copy(alpha = 0.62f))
+                    MonitorStatusLine(if (video) "视频格式" else "拍摄格式", state.captureFormatText)
+                    MonitorStatusLine("分辨率", state.captureResolutionText)
+                    MonitorStatusLine("对焦模式", state.focusModeText)
+                    MonitorStatusLine("测光模式", state.meteringModeText)
+                    if (video) MonitorStatusLine("色调模式", state.movieToneMode)
                     Spacer(Modifier.height(8.dp))
                     Row(
                         modifier = Modifier
@@ -938,19 +1030,67 @@ fun MonitorFullscreen(state: DoukState) {
                 MonitorDeckCard(
                     title = "监看工具",
                     onClose = { deck = MonitorDeck.NONE },
-                    columns = if (landscape) 4 else 3,
-                    landscape = landscape
+                    columns = deckColumns,
+                    landscape = landscape,
+                    deckWidth = if (landscape) deckWidth else null,
+                    footer = {
+                        // LUT 列表直接嵌在工具卡内部，不再额外浮一张 330dp 的卡片盖住右侧工具；
+                        // 手机横屏高度不够时，跟随外层一起滚动，不会显示不全。
+                        if (video && lutOn) {
+                            MonitorLutSection(
+                                loading = lutLoading,
+                                entries = lutEntries,
+                                selectedId = lutId,
+                                brokenIds = lutBrokenIds,
+                                onReload = { lutReload++ },
+                                onSelectNone = {
+                                    lutId = null
+                                    lutOn = false
+                                },
+                                onSelect = { entry ->
+                                    if (entry.id in lutBrokenIds) {
+                                        val hint = "「${entry.label}」解析失败：请确认文件是标准 .cube（含 LUT_3D_SIZE 或 LUT_1D_SIZE，且数值条数完整）。"
+                                        paramToast = hint
+                                        uiScope.launch {
+                                            delay(3600)
+                                            if (paramToast == hint) paramToast = null
+                                        }
+                                    } else {
+                                        lutId = entry.id
+                                        lutOn = true
+                                    }
+                                }
+                            )
+                        }
+                    }
                 ) {
-                    MonitorTool("LUT", Icons.Rounded.PhotoFilter, lutOn) {
-                        lutOn = !lutOn
-                        if (!lutOn) deck = MonitorDeck.TOOLS
+                    if (video) {
+                        MonitorTool("LUT", Icons.Rounded.PhotoFilter, lutOn) {
+                            lutOn = !lutOn
+                            if (!lutOn) deck = MonitorDeck.TOOLS
+                        }
+                        // 相机内「显示原图」：一键关掉 LUT，直接看相机原始画面。
+                        // 以前只藏在 LUT 列表的「无」选项里，入口不够明显。
+                        MonitorTool("原图", Icons.Rounded.Visibility, !lutOn) {
+                            lutOn = false
+                            deck = MonitorDeck.TOOLS
+                        }
+                        // 视频色调模式：不同文件类型只在这几种还原里选，避免和照片工具混在一起。
+                        MonitorTool(
+                            label = "色调 ${state.movieToneMode}",
+                            icon = Icons.Rounded.ColorLens,
+                            active = state.movieToneMode != "SDR",
+                            anchorAware = { pickerAnchor = it; pickerKey = "movieToneMode" }
+                        )
                     }
                     MonitorTool("直方图", Icons.Rounded.BarChart, histOn) { histOn = !histOn }
                     MonitorTool("波形图", Icons.Rounded.ShowChart, waveOn) { waveOn = !waveOn }
-                    MonitorTool("音频", Icons.Rounded.GraphicEq, audioOn) { audioOn = !audioOn }
                     MonitorTool("网格", Icons.Rounded.GridOn, gridOn) { gridOn = !gridOn }
-                    MonitorTool("预览画质", Icons.Rounded.Speed, false) { state.cyclePreviewQuality() }
-                    MonitorTool("侧栏按钮", Icons.Rounded.Tune, false) { railConfigOpen = true }
+                    MonitorTool("预览画质", Icons.Rounded.Speed, false, onClick = {
+                        qualityCardOpen = !qualityCardOpen
+                        if (qualityCardOpen) deck = MonitorDeck.NONE
+                    })
+                    MonitorTool("左右栏设置", Icons.Rounded.Tune, false) { railConfigOpen = true }
                 }
             }
 
@@ -976,8 +1116,9 @@ fun MonitorFullscreen(state: DoukState) {
                 MonitorDeckCard(
                     title = "相机参数",
                     onClose = { deck = MonitorDeck.NONE },
-                    columns = if (landscape) 4 else 3,
-                    landscape = landscape
+                    columns = deckColumns,
+                    landscape = landscape,
+                    deckWidth = if (landscape) deckWidth else null
                 ) {
                     MonitorTool("ISO", Icons.Rounded.Iso, false, anchorAware = { pickerAnchor = it; pickerKey = if (video) "movieIso" else "iso" })
                     MonitorTool("快门", Icons.Rounded.Timer, false, anchorAware = { pickerAnchor = it; pickerKey = if (video) "movieShutter" else "shutter" })
@@ -1023,88 +1164,44 @@ fun MonitorFullscreen(state: DoukState) {
                 }
             }
 
-            // LUT 资源选择：只在「监看工具」展开时显示。
-            // 工具面板一收起（点画面/点关闭），这张卡片跟着消失，不再一直挂在底部；
-            // 已选的 LUT 仍然作用在画面上，下次展开面板还能看到原来的选择。
-            if (lutOn && toolSheetVisible) {
-                // 手机横屏高度只有三百多 dp：卡片不再按「底部让开 360dp」定位，
-                // 改成在可用区域内居中并按屏幕高度收口，列表自己滚动，不会被裁掉。
-                val screenHdp = with(density) { rootH.toDp() }
-                val lutMaxH = (screenHdp - 28.dp).coerceAtMost(420.dp).coerceAtLeast(150.dp)
+            // LUT 列表已经嵌入「监看工具」卡片底部，不再额外浮层遮挡工具栏。
+
+            // 取景画质卡片：点右下角画质按钮或监看工具里的「预览画质」都会打开这张卡，
+            // 不再点一次只循环切一档，用户可以直接看到三档并选中。
+            if (qualityCardOpen) {
                 Column(
                     modifier = Modifier
-                        .align(if (landscape) Alignment.CenterEnd else Alignment.BottomCenter)
-                        .then(
-                            if (landscape) Modifier.padding(
-                                end = railRightWidth + if (toolSheetVisible) 372.dp else 10.dp,
-                                top = 8.dp,
-                                bottom = 8.dp
-                            )
-                            else Modifier.padding(bottom = if (toolSheetVisible) 300.dp else 112.dp)
-                        )
-                        .widthIn(max = if (landscape) 400.dp else 340.dp)
-                        .heightIn(max = lutMaxH)
-                        .clip(RoundedCornerShape(22.dp))
+                        .align(if (landscape) Alignment.CenterEnd else Alignment.BottomEnd)
+                        .padding(end = if (landscape) railRightWidth + 8.dp else 14.dp, bottom = if (landscape) 16.dp else 120.dp)
+                        .widthIn(min = 190.dp, max = 230.dp)
+                        .clip(RoundedCornerShape(18.dp))
                         .background(Color(0xF217181B))
                         .padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    if (lutOn) {
-                        Column {
-                            Text(
-                                when {
-                                    lutLoading -> "正在读取 LUT…"
-                                    lutEntries.isEmpty() -> "没扫描到 LUT 文件：设置 → 资源 里导入 .cube / .3dl / .NP3 即可，不用改标签"
-                                    else -> "LUT（${lutEntries.size} 个）· 点此重新扫描"
-                                },
-                                color = Color.White.copy(alpha = 0.7f),
-                                fontSize = 11.sp,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { lutReload++ }
-                                    .padding(horizontal = 6.dp, vertical = 6.dp)
-                            )
-                            // 用户要求：LUT 列表改为从上往下排，不再左右横滑
-                            // 高度由外层卡片剩余空间决定，手机横屏也能完整看到并滚动
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .weight(1f, fill = false)
-                                    .heightIn(max = if (landscape) 300.dp else 240.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                item(key = "none") {
-                                    LutRow("无（不使用 LUT）", lutId == null) {
-                                        lutId = null
-                                        lutOn = false
-                                    }
+                    Text("取景画质", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp)
+                    listOf("流畅", "标准", "高清").forEach { level ->
+                        val active = state.previewQuality == level
+                        Text(
+                            text = level,
+                            color = if (active) Color(0xFFC9FFA8) else Color.White.copy(alpha = 0.9f),
+                            fontSize = 12.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (active) Color(0xFF2F3F2C) else Color.White.copy(alpha = 0.06f))
+                                .clickable {
+                                    state.applyPreviewQuality(level)
+                                    qualityCardOpen = false
                                 }
-                                items(
-                                    lutEntries,
-                                    key = { it.id },
-                                    contentType = { "lut-row" }
-                                ) { entry ->
-                                    LutRow(entry.label, lutId == entry.id) {
-                                        if (entry.id in lutBrokenIds) {
-                                            val hint = "「${entry.label}」解析失败：需要标准 3D .cube（有 LUT_3D_SIZE，且数值条数 = size³）。1D LUT 暂时不支持。"
-                                            paramToast = hint
-                                            uiScope.launch {
-                                                delay(3600)
-                                                if (paramToast == hint) paramToast = null
-                                            }
-                                        } else {
-                                            lutId = entry.id
-                                            lutOn = true
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
                     }
+                    Text("画质越高越耗电", color = Color.White.copy(alpha = 0.38f), fontSize = 9.sp)
                 }
             }
 
-            // 直方图 / 波形图 / 音频：常驻叠加层，长按拖动，只有「监看工具」里能关
+            // 直方图 / 波形图：常驻叠加层，长按拖动，只有「监看工具」里能关
             if (histOn) histOffset?.let { off ->
                 Box(
                     modifier = Modifier
@@ -1154,27 +1251,6 @@ fun MonitorFullscreen(state: DoukState) {
                             Text("等待波形…", color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
                         }
                     }
-                }
-            }
-            if (audioOn) audioOffset?.let { off ->
-                Box(
-                    modifier = Modifier
-                        .offset { IntOffset(off.x.toInt(), off.y.toInt()) }
-                        .size(210.dp, 220.dp)
-                        .pointerInput(rootW, rootH) {
-                            detectDragGesturesAfterLongPress(
-                                onDrag = { change, drag ->
-                                    change.consume()
-                                    val cur = audioOffset ?: return@detectDragGesturesAfterLongPress
-                                    audioOffset = Offset(
-                                        (cur.x + drag.x).coerceIn(0f, (rootW - audioWpx).coerceAtLeast(0).toFloat()),
-                                        (cur.y + drag.y).coerceIn(0f, (rootH - audioHpx).coerceAtLeast(0).toFloat())
-                                    )
-                                }
-                            )
-                        }
-                ) {
-                    AudioPanel(state, modifier = Modifier.fillMaxSize())
                 }
             }
 
@@ -1298,6 +1374,27 @@ fun MonitorFullscreen(state: DoukState) {
 /* ------------------------------------------------------------------ 控件 */
 
 @Composable
+private fun MonitorStatusLine(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 2.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = Color.White.copy(alpha = 0.55f), fontSize = 10.sp)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            value.ifBlank { "—" },
+            color = Color.White.copy(alpha = 0.88f),
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
 private fun ExposureLine(label: String, value: String, onAnchor: (IntOffset) -> Unit) {
     // 坐标只存普通数组，不进 Compose State；工具铺展开/收起时不会每帧回写重组。
     val pos = remember { IntArray(2) }
@@ -1325,12 +1422,14 @@ private fun MonitorDeckCard(
     onClose: () -> Unit,
     columns: Int,
     landscape: Boolean = false,
+    deckWidth: Dp? = null,
+    footer: (@Composable () -> Unit)? = null,
     content: @Composable () -> Unit
 ) {
     Column(
         modifier = Modifier
             .then(
-                if (landscape) Modifier.fillMaxHeight().width(360.dp)
+                if (landscape) Modifier.fillMaxHeight().width(deckWidth ?: 360.dp)
                 else Modifier.widthIn(max = if (columns >= 4) 380.dp else 300.dp)
             )
             .clip(if (landscape) RoundedCornerShape(26.dp) else RoundedCornerShape(30.dp))
@@ -1361,10 +1460,61 @@ private fun MonitorDeckCard(
             } else Modifier
         ) {
             androidx.compose.foundation.layout.FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 maxItemsInEachRow = columns
             ) { content() }
+            footer?.invoke()
+        }
+    }
+}
+
+@Composable
+private fun MonitorLutSection(
+    loading: Boolean,
+    entries: List<FilterEntry>,
+    selectedId: String?,
+    brokenIds: Set<String>,
+    onReload: () -> Unit,
+    onSelectNone: () -> Unit,
+    onSelect: (FilterEntry) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp)
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(Color.White.copy(alpha = 0.10f))
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            when {
+                loading -> "正在读取 LUT…"
+                entries.isEmpty() -> "LUT 列表准备中… 点此重新扫描"
+                else -> "LUT（${entries.size} 个）· 点此重新扫描"
+            },
+            color = Color.White.copy(alpha = 0.72f),
+            fontSize = 11.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable { onReload() }
+                .padding(horizontal = 6.dp, vertical = 6.dp)
+        )
+        Text(
+            "内置 N-Log / HLG 还原始终可用；导入的 .cube / .3dl 会按文件名显示。",
+            color = Color.White.copy(alpha = 0.42f),
+            fontSize = 9.sp,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+        )
+        Spacer(Modifier.height(6.dp))
+        LutRow("无（不使用 LUT）", selectedId == null, onSelectNone)
+        entries.forEach { entry ->
+            LutRow(entry.label, selectedId == entry.id) { onSelect(entry) }
         }
     }
 }
@@ -1412,22 +1562,23 @@ private fun MonitorTool(
 /* ------------------------------------------------------------------ 左右栏 */
 
 private val DEFAULT_LEFT_ACTIONS = listOf("iso", "shutter", "aperture", "ev")
-private val DEFAULT_RIGHT_ACTIONS = listOf("grid", "hist", "wave", "audio")
+private val DEFAULT_RIGHT_ACTIONS = listOf("lut", "grid", "hist", "wave")
 private val RAIL_ACTION_IDS = listOf(
-    "iso", "shutter", "aperture", "ev", "metering",
-    "grid", "hist", "wave", "audio",
-    "focus", "quality", "view", "rails"
+    "iso", "shutter", "aperture", "ev", "expMode", "metering", "focusMode",
+    "afAreaMode", "wb", "drive", "imageFormat", "resolution", "rawCompression",
+    "activeD", "vr", "imageArea", "isoAuto",
+    "lut", "grid", "hist", "wave", "focus", "quality", "toneMode", "view", "rails"
 )
 
 private fun parseRailActions(raw: String, defaults: List<String>): List<String> {
     val parsed = raw.split(',').map { it.trim() }.filter { it in RAIL_ACTION_IDS }
-    return if (parsed.isEmpty()) defaults else parsed.take(4)
+    return if (parsed.isEmpty()) defaults else parsed.take(8)
 }
 
 private fun toggleRailAction(current: List<String>, id: String): List<String> =
     when {
         id in current -> current - id
-        current.size >= 4 -> current
+        current.size >= 8 -> current
         else -> current + id
     }
 
@@ -1437,7 +1588,30 @@ private fun railExposureKey(id: String, video: Boolean): String? = when (id) {
     "aperture" -> if (video) "movieAperture" else "aperture"
     "ev" -> if (video) "movieEv" else "ev"
     "metering" -> if (video) "movieMetering" else "metering"
+    "focusMode" -> if (video) "movieFocusMode" else "focusMode"
+    "afAreaMode" -> if (video) "movieAfAreaMode" else "afAreaMode"
+    "wb" -> if (video) "movieWb" else "wb"
+    "imageFormat" -> if (video) "movieFileType" else "imageQuality"
+    "resolution" -> if (video) "movieScreenSize" else "imageSize"
+    "toneMode" -> "movieToneMode"
+    "expMode", "drive", "rawCompression", "activeD", "vr", "imageArea", "isoAuto" -> id
     else -> null
+}
+
+/** 这一项在当前拍摄模式里是否出现：LUT/色调只属于视频，纯照片参数不在视频里挤位置。 */
+private fun railVisibleInMode(id: String, video: Boolean): Boolean = when (id) {
+    "lut", "toneMode" -> video
+    "expMode", "drive", "rawCompression", "activeD", "vr", "imageArea", "isoAuto" -> !video
+    else -> true
+}
+
+/** 左/右栏显示的摘要值：格式/分辨率/对焦用整段状态，其它沿用参数 picker 的值。 */
+private fun railDisplayValue(id: String, state: DoukState, video: Boolean): String = when (id) {
+    "imageFormat" -> state.captureFormatText
+    "resolution" -> state.captureResolutionText
+    "focusMode" -> state.focusModeText
+    "metering" -> state.meteringModeText
+    else -> railExposureKey(id, video)?.let { state.valueOf(it) } ?: ""
 }
 
 private fun railActionLabel(id: String): String = when (id) {
@@ -1445,15 +1619,28 @@ private fun railActionLabel(id: String): String = when (id) {
     "shutter" -> "快门"
     "aperture" -> "光圈"
     "ev" -> "曝光补偿"
-    "metering" -> "测光"
+    "expMode" -> "曝光模式"
+    "metering" -> "测光模式"
+    "focusMode" -> "对焦模式"
+    "afAreaMode" -> "AF 区域"
+    "wb" -> "白平衡"
+    "drive" -> "释放模式"
+    "imageFormat" -> "拍摄格式"
+    "resolution" -> "分辨率"
+    "rawCompression" -> "RAW 压缩"
+    "activeD" -> "动态 D"
+    "vr" -> "减震"
+    "imageArea" -> "图像区域"
+    "isoAuto" -> "ISO 自动"
+    "lut" -> "LUT"
     "grid" -> "网格"
     "hist" -> "直方图"
     "wave" -> "波形"
-    "audio" -> "音频"
     "focus" -> "对焦"
     "quality" -> "画质"
+    "toneMode" -> "色调模式"
     "view" -> "视图"
-    "rails" -> "侧栏"
+    "rails" -> "左右栏"
     else -> id
 }
 
@@ -1462,13 +1649,26 @@ private fun railActionIcon(id: String): androidx.compose.ui.graphics.vector.Imag
     "shutter" -> Icons.Rounded.Timer
     "aperture" -> Icons.Rounded.PhotoFilter
     "ev" -> Icons.Rounded.Exposure
+    "expMode" -> Icons.Rounded.Tune
     "metering" -> Icons.Rounded.LightMode
+    "focusMode" -> Icons.Rounded.CenterFocusStrong
+    "afAreaMode" -> Icons.Rounded.CropFree
+    "wb" -> Icons.Rounded.WbSunny
+    "drive" -> Icons.Rounded.Speed
+    "imageFormat" -> Icons.Rounded.Star
+    "resolution" -> Icons.Rounded.CropFree
+    "rawCompression" -> Icons.Rounded.Star
+    "activeD" -> Icons.Rounded.Bolt
+    "vr" -> Icons.Rounded.Speed
+    "imageArea" -> Icons.Rounded.CropFree
+    "isoAuto" -> Icons.Rounded.Tune
+    "lut" -> Icons.Rounded.PhotoFilter
     "grid" -> Icons.Rounded.GridOn
     "hist" -> Icons.Rounded.BarChart
     "wave" -> Icons.Rounded.ShowChart
-    "audio" -> Icons.Rounded.GraphicEq
     "focus" -> Icons.Rounded.CenterFocusStrong
     "quality" -> Icons.Rounded.Speed
+    "toneMode" -> Icons.Rounded.ColorLens
     "view" -> Icons.Rounded.RotateRight
     else -> Icons.Rounded.Tune
 }
@@ -1477,14 +1677,14 @@ private fun railActionActive(
     id: String,
     histOn: Boolean,
     waveOn: Boolean,
-    audioOn: Boolean,
     gridOn: Boolean,
-    perspectiveOn: Boolean
+    perspectiveOn: Boolean,
+    lutOn: Boolean
 ): Boolean = when (id) {
     "hist" -> histOn
     "wave" -> waveOn
-    "audio" -> audioOn
     "grid" -> gridOn
+    "lut" -> lutOn
     "view" -> perspectiveOn
     else -> false
 }
@@ -1528,10 +1728,11 @@ private fun RailActionItem(
         if (exposureKey != null) {
             Text(railActionLabel(id), color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp, maxLines = 1)
             Text(
-                state.valueOf(exposureKey).ifBlank { "—" },
+                railDisplayValue(id, state, video).ifBlank { "—" },
                 color = Color.White,
                 fontSize = 11.sp,
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         } else {
             Icon(
@@ -1560,20 +1761,23 @@ private fun RailConfigPanel(
     ) {
         Column(
             modifier = Modifier
-                .width(520.dp)
+                .widthIn(max = 520.dp)
+                .fillMaxWidth(0.92f)
+                .heightIn(max = 440.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(Color(0xF2161719))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
                 ) {}
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("侧栏按钮", color = Color.White, fontSize = 15.sp)
+                Text("左右栏设置", color = Color.White, fontSize = 15.sp)
                 Spacer(Modifier.weight(1f))
-                Text("每侧最多 4 个", color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
+                Text("每侧最多 8 个，点一下可移到另一侧", color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
                 Spacer(Modifier.width(10.dp))
                 Icon(
                     Icons.Rounded.Close, "关闭",
@@ -1609,7 +1813,8 @@ private fun RailConfigPanel(
                 }
             }
             Text(
-                "曝光类按钮点一下直接改参数；网格/直方图/波形/音频是开关；对焦会触发一次 AF。",
+                "所有参数都能放左栏或右栏；曝光/格式/分辨率/对焦/测光点一下直接改。" +
+                    "网格/直方图/波形/LUT 是开关，对焦会触发一次 AF。",
                 color = Color.White.copy(alpha = 0.45f),
                 fontSize = 10.sp
             )
@@ -1751,250 +1956,6 @@ private fun HistogramPanel(analysis: FrameAnalysis, modifier: Modifier = Modifie
     }
 }
 
-@Composable
-private fun AudioPanel(state: DoukState, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val mic = state.valueOf("movieMic")
-    val level = state.valueOf("movieMicLevel")
-    val wind = state.valueOf("movieWindNoise")
-
-    // 手机麦克风只作为「现场参考电平」的可选项，默认关闭：
-    // 尼康 PTP/Wi-Fi 取景流里没有音频通道，App 拿不到相机实时音频；
-    // 以前默认开手机麦克风，看起来像在监视相机声音，实际是手机自己拾音，已纠正。
-    var phoneRef by remember { mutableStateOf(false) }
-
-    // 每次组合都真查一次权限：用户可能刚在系统设置里授权、或在别的页面点过允许，
-    // 以前只在 remember 里查一次，界面会一直停在「未授权」，看着就像电平坏了。
-    var granted by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED
-        )
-    }
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                    PackageManager.PERMISSION_GRANTED
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
-    val askPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { ok -> granted = ok }
-    val micLevel = rememberMicLevel(granted && phoneRef)
-    val db = micLevel.db
-    val peakDb = micLevel.peak
-    val gain = ((db + 60f) / 60f).coerceIn(0f, 1f)
-    val bodyAudio = listOf(mic, level, wind).any { it.isNotBlank() && it != "—" && it != "相机未上报" }
-
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(18.dp))
-            .background(Color(0xE6101114))
-            .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(18.dp))
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("相机音频", color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp)
-            Spacer(Modifier.weight(1f))
-            Box(
-                Modifier
-                    .size(6.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.3f))
-            )
-            Spacer(Modifier.width(5.dp))
-            Text("无实时音频", color = Color.White.copy(alpha = 0.45f), fontSize = 9.sp)
-        }
-        Text(
-            "尼康取景流只传画面，不带音频数据，所以这里读不到相机的实时电平；" +
-                "录音电平、麦克风灵敏度是相机自己的设置，声音会随录像写进文件。",
-            color = Color.White.copy(alpha = 0.62f), fontSize = 9.sp, maxLines = 3
-        )
-        Text(
-            if (bodyAudio) "机身：麦克风 ${mic.ifBlank { "—" }} · ${level.ifBlank { "电平 —" }} · 风噪 ${wind.ifBlank { "—" }}"
-            else "机身音频设置：相机未上报（把机身切到视频档再看）",
-            color = Color.White.copy(alpha = 0.55f), fontSize = 9.sp, maxLines = 2
-        )
-
-        // 明确可选项：要现场参考可以开手机麦克风，但界面会一直写明「手机」。
-        Text(
-            if (phoneRef) "关闭手机参考电平" else "用手机麦克风做参考电平（不是相机声音）",
-            color = if (phoneRef) Color.White.copy(alpha = 0.7f) else Color(0xFF9BFF6A),
-            fontSize = 10.sp,
-            modifier = Modifier
-                .clip(RoundedCornerShape(percent = 50))
-                .background(Color.White.copy(alpha = 0.08f))
-                .clickable {
-                    if (phoneRef) {
-                        phoneRef = false
-                    } else if (granted) {
-                        phoneRef = true
-                    } else {
-                        askPermission.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                }
-                .padding(horizontal = 10.dp, vertical = 5.dp)
-        )
-        if (phoneRef) {
-            if (granted) {
-                Text("手机麦克风 · 现场参考", color = Color.White.copy(alpha = 0.62f), fontSize = 9.sp)
-                ChannelMeter("MIC", gain)
-                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("-40", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                    Spacer(Modifier.weight(1f))
-                    Text("-20", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                    Spacer(Modifier.weight(1f))
-                    Text("-12", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                    Spacer(Modifier.weight(1f))
-                    Text("-6", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                    Spacer(Modifier.weight(1f))
-                    Text("0 dB", color = Color.White.copy(alpha = 0.35f), fontSize = 8.sp)
-                }
-                Text(
-                    if (db <= -59f) "环境声很安静（−60 dB 以下）"
-                    else "当前 %.0f dB · 峰值 %.0f dB".format(db, peakDb),
-                    color = Color.White.copy(alpha = 0.75f), fontSize = 10.sp
-                )
-            } else {
-                Text(
-                    "已选手机参考，但还没拿到录音权限；再点一次上面的按钮授权。",
-                    color = Color.White.copy(alpha = 0.6f), fontSize = 9.sp, maxLines = 2
-                )
-            }
-        }
-    }
-}
-
-/** 麦克风电平的实时值 + 峰值，两者都是真实的 AudioRecord 采样结果。 */
-private class MicLevel {
-    var db by mutableFloatStateOf(-60f)
-    var peak by mutableFloatStateOf(-60f)
-}
-
-/**
- * 手机麦克风电平（dBFS）：只在面板可见时开 AudioRecord，面板关掉就停，
- * 避免一直占着麦克风（既费电也会和系统录音抢设备）。
- * 只取幅度做电平，不做任何录音落盘。
- */
-@Composable
-private fun rememberMicLevel(granted: Boolean): MicLevel {
-    val level = remember { MicLevel() }
-    val owner = LocalLifecycleOwner.current
-    LaunchedEffect(granted, owner) {
-        if (!granted) {
-            level.db = -60f
-            level.peak = -60f
-            return@LaunchedEffect
-        }
-        var record: AudioRecord? = null
-        try {
-            val minBuf = AudioRecord.getMinBufferSize(
-                48000,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(2048)
-            record = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                48000,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBuf * 2
-            )
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                level.db = -60f
-                return@LaunchedEffect
-            }
-            record.startRecording()
-            val buf = ShortArray(1024)
-            var smooth = -60f
-            var peak = -60f
-            while (isActive) {
-                val n = record.read(buf, 0, buf.size)
-                if (n <= 0) {
-                    delay(60)
-                    continue
-                }
-                var sum = 0.0
-                for (i in 0 until n) {
-                    val v = buf[i] / 32768.0
-                    sum += v * v
-                }
-                val rms = kotlin.math.sqrt(sum / n)
-                val cur = if (rms <= 1.0e-6) -60f
-                else (20.0 * kotlin.math.log10(rms)).toFloat().coerceIn(-60f, 0f)
-                // 快速上升、慢速回落，柱状条不会闪
-                smooth = max(cur, smooth - 4f)
-                // 峰值保持后缓慢回落，方便看刚才那一下到底多大
-                peak = max(cur, peak - 0.8f)
-                level.db = smooth
-                level.peak = peak
-                delay(50)
-            }
-        } catch (_: Throwable) {
-            level.db = -60f
-            level.peak = -60f
-        } finally {
-            runCatching { record?.stop() }
-            runCatching { record?.release() }
-        }
-    }
-    return level
-}
-
-@Composable
-private fun ChannelMeter(label: String, level: Float) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 9.sp, modifier = Modifier.width(24.dp))
-        Canvas(
-            modifier = Modifier
-                .weight(1f)
-                .height(8.dp)
-        ) {
-            val segments = 22
-            val gap = 2f
-            val segW = (size.width - gap * (segments - 1)) / segments
-            val active = (level.coerceIn(0f, 1f) * segments).toInt()
-            for (i in 0 until segments) {
-                // 以前这里把红/黄段无条件画出来，电平一直是满的，看着像「假数据」；
-                // 现在只有真正被点亮的格子才上色，其余保持暗格。
-                val lit = i < active
-                val color = when {
-                    !lit -> Color.White.copy(alpha = 0.10f)
-                    i >= segments - 3 -> Color(0xFFE5484D)
-                    i >= segments - 7 -> Color(0xFFFFC44D)
-                    else -> Color(0xFF9BFF6A)
-                }
-                drawRect(
-                    color = color,
-                    topLeft = Offset(i * (segW + gap), 0f),
-                    size = androidx.compose.ui.geometry.Size(segW, size.height)
-                )
-            }
-        }
-        Text(
-            if (level <= 0f) "-∞" else "${(level * 100).toInt()}",
-            color = Color.White.copy(alpha = 0.6f), fontSize = 9.sp,
-            modifier = Modifier.width(26.dp)
-        )
-    }
-}
-
-@Composable
-private fun AudioLine(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
-        Spacer(Modifier.weight(1f))
-        Text(value.ifBlank { "—" }, color = Color.White, fontSize = 11.sp)
-    }
-}
 
 @Composable
 private fun MonitorPicker(
@@ -2073,6 +2034,8 @@ private fun MonitorPicker(
 }
 
 private fun paramTitle(key: String): String = when (key) {
+    "previewQuality" -> "取景画质"
+    "movieToneMode" -> "视频色调模式"
     "iso", "movieIso" -> "ISO"
     "shutter", "movieShutter" -> "快门"
     "aperture", "movieAperture" -> "光圈"

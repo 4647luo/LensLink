@@ -680,15 +680,76 @@ private fun ConnectionHint(mode: ConnectMode, spec: NikonModelSpec.Spec?) {
     ) {
         Text("提示", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = DoukColors.textPrimary)
         Spacer(modifier = Modifier.height(6.dp))
-        Text(mode.detail, fontSize = 12.sp, color = DoukColors.textSecondary, lineHeight = 18.sp)
-        Spacer(modifier = Modifier.height(6.dp))
+        // 按「当前选中的方式 + 已识别机型」给步骤，避免选 AP 时还写着「加入手机热点」。
         Text(
-            text = "相机端：${NikonModelSpec.wirelessStaNames} 选「连接至智能设备」；" +
-                "${NikonModelSpec.computerNames} 选「连接到计算机（照相机控制）」。",
+            NikonModelSpec.steps(spec, mode),
             fontSize = 12.sp,
             color = DoukColors.textSecondary,
             lineHeight = 18.sp
         )
+
+        Spacer(modifier = Modifier.height(10.dp))
+        CameraGenCard(
+            title = "推荐 Wi-Fi STA 的机型",
+            models = NikonModelSpec.thirdNames,
+            primary = "Wi-Fi STA（推荐）：相机连同一个 Wi-Fi 或手机热点 → 网络菜单 → 连接至智能设备 → Wi-Fi STA",
+            secondary = "Wi-Fi AP：网络菜单 → 连接至智能设备 → Wi-Fi AP → 手机连上相机 Wi-Fi → 回应用匹配",
+            highlight = spec?.gen == NikonModelSpec.Gen.THIRD
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        CameraGenCard(
+            title = "推荐 Wi-Fi AP 的机型",
+            models = NikonModelSpec.secondNames,
+            primary = "Wi-Fi AP（推荐）：设定菜单 → 连接至智能设备 → Wi-Fi 连接 → 手机连上相机 Wi-Fi → 回应用匹配",
+            secondary = "Wi-Fi STA：相机连同一个 Wi-Fi 或手机热点 → 设定菜单 → 连接至 PC（类型选「照相机控制」）（不推荐）",
+            highlight = spec?.gen == NikonModelSpec.Gen.SECOND
+        )
+
+        Spacer(modifier = Modifier.height(10.dp))
+        Text(
+            text = "后续操作：① 让相机停在上面对应的界面　② 回到本页点「搜索相机设备」　" +
+                "③ 搜不到就展开「手动填相机 IP」再试　④ 连上后点「进入控制」",
+            fontSize = 12.sp,
+            color = DoukColors.textSecondary,
+            lineHeight = 18.sp
+        )
+    }
+}
+
+/** 按代际分卡片列出机型与相机端菜单路径，已识别机型所在的那张加粗描边。 */
+@Composable
+private fun CameraGenCard(
+    title: String,
+    models: String,
+    primary: String,
+    secondary: String,
+    highlight: Boolean
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(DoukShapes.cardSmall)
+            .doukCardSurface(DoukShapes.cardSmall)
+            .border(
+                width = if (highlight) 1.5.dp else 1.dp,
+                color = if (highlight) DoukColors.accent else DoukColors.divider,
+                shape = DoukShapes.cardSmall
+            )
+            .padding(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = DoukColors.textPrimary)
+            if (highlight) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("已识别机型", fontSize = 10.sp, color = DoukColors.accent)
+            }
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(models, fontSize = 11.sp, color = DoukColors.textTertiary, lineHeight = 16.sp)
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(primary, fontSize = 12.sp, color = DoukColors.textPrimary, lineHeight = 18.sp)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(secondary, fontSize = 12.sp, color = DoukColors.textSecondary, lineHeight = 18.sp)
     }
 }
 

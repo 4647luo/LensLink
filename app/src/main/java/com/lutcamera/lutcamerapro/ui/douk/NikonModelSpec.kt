@@ -5,10 +5,10 @@ package com.lutcamera.lutcamerapro.ui.douk
  *
  * 四种连接方式并不是每台机器都齐活的，差异来自官方菜单结构本身：
  *
- * - **二代机**（Z7II / Z6II / Z7 / Z6 / Z5 / Z50 / Zfc / Z30）：网络菜单里只有
- *   「连接至智能设备 → Wi-Fi 连接」，相机自己开热点（AP 直连）。**没有 STA 模式**，
+ * - **较早机型**（Z7II / Z6II / Z7 / Z6 / Z5 / Z50 / Zfc / Z30）：网络菜单里只有
+ *   「连接至智能设备 → Wi-Fi 连接」，相机自己开热点（AP 直连）。原生菜单不提供 STA 模式，
  *   也没有「USB 数据连接」菜单（插线默认就是 PTP）。
- * - **三代机**（Z9 / Z8 / Z6III / Z5II / Zf / Z50II / ZR）：菜单扩成
+ * - **较新机型**（Z9 / Z8 / Z6III / Z5II / Zf / Z50II / ZR）：菜单扩成
  *   「配对（Bluetooth） / 选择照片以上传 / Wi-Fi 连接（AP mode） / Wi-Fi 连接（STA mode） /
  *   关机时上传」。STA 让相机加入手机所在的路由器，不用切热点；蓝牙用于定位推送；
  *   USB 则要在「设定菜单 → USB 数据连接」里先选 MTP/PTP，否则只被识别成读卡器。
@@ -32,8 +32,8 @@ object NikonModelSpec {
     ) {
         val generation: String
             get() = when (gen) {
-                Gen.THIRD -> "三代机"
-                Gen.SECOND -> "二代机"
+                Gen.THIRD -> "较新机型"
+                Gen.SECOND -> "较早机型"
                 Gen.DSLR -> "单反"
             }
         val ap: Boolean get() = gen != Gen.DSLR
@@ -51,28 +51,28 @@ object NikonModelSpec {
         Spec("zf", "Z f", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
             note = "相机 C 固件 3.00 起支持 STA"),
         Spec("z502", "Z50II", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
-            note = "DX 三代机，STA 与蓝牙定位齐全"),
+            note = "DX 机型，STA 与蓝牙定位齐全"),
         Spec("zr", "ZR", Gen.THIRD, sta = true, usbMtpMenu = true, bleGps = true,
             note = "视频向机型，网络菜单与 Z6III 同构")
     )
 
     private val second = listOf(
-        Spec("z72", "Z7II", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点；蓝牙仅供 SnapBridge 配对，不能当 GPS 通道用"),
-        Spec("z62", "Z6II", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点；USB 插线即 PTP，没有 USB 数据连接菜单"),
-        Spec("z7", "Z7", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点"),
-        Spec("z6", "Z6", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点"),
-        Spec("z5", "Z5", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点"),
-        Spec("z50", "Z50", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点"),
-        Spec("zfc", "Z fc", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点"),
-        Spec("z30", "Z30", Gen.SECOND, sta = false, usbMtpMenu = false, bleGps = false,
-            note = "只有直连热点")
+        Spec("z72", "Z7II", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 要在「设定菜单 → 连接至 PC」选照相机控制，控制通道受限"),
+        Spec("z62", "Z6II", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；USB 插线即 PTP，没有 USB 数据连接菜单"),
+        Spec("z7", "Z7", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐"),
+        Spec("z6", "Z6", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐"),
+        Spec("z5", "Z5", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐"),
+        Spec("z50", "Z50", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐"),
+        Spec("zfc", "Z fc", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐"),
+        Spec("z30", "Z30", Gen.SECOND, sta = true, usbMtpMenu = false, bleGps = false,
+            note = "优先直连热点；STA 走「连接至 PC」，不推荐")
     )
 
     private val dslr = listOf(
@@ -85,8 +85,11 @@ object NikonModelSpec {
     val catalog: List<Spec> = third + second + dslr
 
     /** 机型清单，用于界面上直接列出型号（不出现「三代机 / 二代机」这类说法）。 */
-    val wirelessStaNames: String = third.joinToString("、") { it.label }
-    val computerNames: String = second.joinToString("、") { it.label }
+    val thirdNames: String = third.joinToString("、") { it.label }
+    val secondNames: String = second.joinToString("、") { it.label }
+    val dslrNames: String = dslr.joinToString("、") { it.label }
+    val wirelessStaNames: String get() = thirdNames
+    val computerNames: String get() = secondNames
 
     /**
      * 尼康部分机型/固件会把型号写成 `Z50II`、`Z 6III` 这类罗马数字，
@@ -147,18 +150,26 @@ object NikonModelSpec {
 
     /** 三种无线/有线方式的机型专属步骤。 */
     fun steps(spec: Spec?, mode: ConnectMode): String = when (mode) {
-        ConnectMode.WIFI_STA -> if (spec?.sta == true)
-            "${spec.label}：MENU → 网络菜单 → 连接至智能设备 → Wi-Fi 连接（STA）→ 建立配置，选手机热点或同一路由器的 SSID 并输密码；" +
-                "相机加入后 IP 由热点分配，点「搜索相机设备」会自动探测 15740 端口。"
-        else if (spec != null)
-            "${spec.label} 的网络菜单没有 STA 选项，连不上路由器/热点。请改用「Wi-Fi AP 直连」。"
-        else
-            "STA 要机身菜单里有 Wi-Fi 连接（STA）这一项：相机 → 网络菜单 → 连接至智能设备 → 加入手机热点。" +
-                "菜单里只有「Wi-Fi 连接」而没有 STA 选项时，改用「Wi-Fi AP 直连」。"
+        ConnectMode.WIFI_STA -> when {
+            spec?.gen == Gen.THIRD ->
+                "${spec.label}：网络菜单 → 连接至智能设备 → Wi-Fi STA，让相机连上同一个 Wi-Fi 或手机热点；" +
+                    "加入后 IP 由路由器/热点分配，点「搜索相机设备」会自动探测 15740 端口。"
+            spec?.gen == Gen.SECOND ->
+                "${spec.label} 优先用「Wi-Fi AP 直连」。想走 STA 要在设定菜单 → 连接至 PC，类型选「照相机控制」，" +
+                    "让相机连同一个 Wi-Fi 或手机热点（不推荐：这个模式下机身对第三方开放的控制指令受限）。"
+            else ->
+                "STA 需要机身菜单里有「Wi-Fi STA」这一项：在网络菜单 → 连接至智能设备 → Wi-Fi STA 里让相机连同一个 Wi-Fi 或热点；" +
+                    "菜单里只有「Wi-Fi 连接」的机型请改用「Wi-Fi AP 直连」。"
+        }
 
-        ConnectMode.WIFI_AP ->
-            "相机 MENU → 网络菜单 → 连接至智能设备 → Wi-Fi 连接 → 建立连接，机身屏幕显示 NIKON_… 名称和 8 位密码；" +
-                "手机连这个热点、输入密码。系统提示「无法访问互联网」时选保持连接，并关掉「WLAN+ / 智能网络切换」，否则会自动切回有网的路由器。"
+        ConnectMode.WIFI_AP -> when {
+            spec?.gen == Gen.SECOND ->
+                "${spec.label}：设定菜单 → 连接至智能设备 → Wi-Fi 连接 → 建立连接，机身屏幕显示 NIKON_… 名称和 8 位密码；" +
+                    "手机连这个热点后回应用点「搜索相机设备」。系统提示「无法访问互联网」时选保持连接。"
+            else ->
+                "相机 MENU → 网络菜单 → 连接至智能设备 → Wi-Fi AP（或「Wi-Fi 连接」）→ 建立连接，机身屏幕显示 NIKON_… 名称和 8 位密码；" +
+                    "手机连这个热点、输入密码。系统提示「无法访问互联网」时选保持连接，并关掉「WLAN+ / 智能网络切换」，否则会自动切回有网的路由器。"
+        }
 
         ConnectMode.USB_PTP -> if (spec?.usbMtpMenu == true)
             "${spec.label}：设定菜单 → USB 数据连接 → 选「连接至计算机（照相机控制）」或 MTP/PTP；" +
@@ -186,7 +197,13 @@ object NikonModelSpec {
 
     /** 一行能力摘要，用在机型卡片上（只讲能力，不提几代机）。 */
     fun summary(spec: Spec): String = buildString {
-        append(if (spec.sta) "支持 STA 局域网" else "仅直连热点")
+        append(
+            when (spec.gen) {
+                Gen.THIRD -> "支持 STA 局域网"
+                Gen.SECOND -> "推荐直连热点（STA 要走「连接至 PC」）"
+                Gen.DSLR -> "无线需 WT 传输器"
+            }
+        )
         append(" · ")
         append(if (spec.bleGps) "蓝牙可推 GPS" else "蓝牙仅 SnapBridge")
         if (spec.usbMtpMenu) {

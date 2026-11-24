@@ -171,21 +171,30 @@ fun ControlScreen(
             // 拍摄/视频旁边的「更多」：就在图标下面展开，不弹整屏对话框
             Box {
                 var showMore by remember { mutableStateOf(false) }
-                IconButton(
-                    onClick = { showMore = true },
+                // 视觉圆钮缩到 24dp，但保留 32dp 点击区；IconButton 自带的最小触摸
+                // 尺寸会把视觉圆撑大，所以这里用 Box + clickable 精确控制。
+                Box(
                     modifier = Modifier
                         .padding(start = 4.dp)
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(DoukColors.surface.copy(alpha = 0.8f))
-                        .border(0.8.dp, DoukColors.outline.copy(alpha = 0.55f), CircleShape)
+                        .size(32.dp)
+                        .clickable { showMore = true },
+                    contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        Icons.Rounded.MoreVert,
-                        contentDescription = "更多",
-                        tint = DoukColors.textPrimary,
-                        modifier = Modifier.size(15.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(CircleShape)
+                            .background(DoukColors.surface.copy(alpha = 0.8f))
+                            .border(0.7.dp, DoukColors.outline.copy(alpha = 0.50f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.MoreVert,
+                            contentDescription = "更多",
+                            tint = DoukColors.textPrimary,
+                            modifier = Modifier.size(13.dp)
+                        )
+                    }
                 }
                 DropdownMenu(
                     expanded = showMore,

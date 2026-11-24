@@ -225,6 +225,9 @@ class DoukState(
     /** 手机端取景画质：流畅 / 标准 / 高清，写进 PTP 解码器 */
     var previewQuality by mutableStateOf(runCatching { DoukPrefs.monitorPreviewQuality }.getOrDefault("标准"))
         private set
+    /** 视频色调模式：SDR / N-Log / HLG。App 侧记录，用于自动挑还原 LUT 与状态展示。 */
+    var movieToneMode by mutableStateOf(runCatching { DoukPrefs.monitorToneMode }.getOrDefault("SDR"))
+        private set
     /** 设备页相机实物照片的版本号：设置页换了图就 +1，让设备页重新读文件 */
     var photoVersion by mutableStateOf(0)
     /** 设备页是否显示「添加设备」按钮，由设置页控制 */
@@ -277,7 +280,22 @@ class DoukState(
                     address = "${it.ip}:${it.port}"
                 )
             }
-            val mdnsIps = mdns.map { it.address.substringBefore(":") }.toSet()
+            // 同一台机有时会同时广播「型号名」和一条空名/通用名，界面就变成两台：
+            // 一台是刚连的型号，另一台叫「Nikon 相机」。有具体型号时把通用名那条隐藏；
+            // 已连接时通用名也不再出现在待连接列表。只有「仅剩通用名」时才保留它兜底。
+            fun genericName(n: String): Boolean {
+                val t = n.trim().lowercase()
+                return t.isBlank() || t == "nikon" || t == "camera" ||
+                    t == "nikon camera" || t == "nikon 相机" || t == "尼康相机"
+            }
+            val namedMdns = mdns.filterNot { genericName(it.name) }
+            val genericMdns = mdns.filter { genericName(it.name) }
+            val visibleMdns = when {
+                namedMdns.isNotEmpty() -> namedMdns
+                vm.isConnected -> emptyList()
+                else -> genericMdns.take(1)
+            }
+            val mdnsIps = visibleMdns.map { it.address.substringBefore(":") }.toSet()
             val lan = lanFound
                 .filterNot { it.ip in mdnsIps }
                 .map { hit ->
@@ -288,7 +306,7 @@ class DoukState(
                         address = "${hit.ip}:${CameraLanProbe.PTP_PORT}"
                     )
                 }
-            return mdns + lan
+            return visibleMdns + lan
         }
 
     // ===== 机身上报信息（设备页） =====
@@ -692,6 +710,8 @@ class DoukState(
     val detectedVideoMode: Boolean?
         get() {
             if (!vm.isConnected) return null
+            // 轮询线程每 3/6 秒会直接探一次视频档独占属性，比等 extraProps 里旧值刷新快得多。
+            vm.videoModeProbe?.let { return it }
             fun reporting(v: String?): Boolean =
                 v != null && v.isNotBlank() && v != "—" && v != "相机未上报" && v != "读取中…"
             val still = listOf("shutter", "aperture", "iso").count { reporting(valueOf(it)) }
@@ -796,6 +816,9 @@ class DoukState(
     }
 
     fun valueOf(key: String): String {
+        // 取景画质和视频色调都是 App 侧设置，不依赖机身连接
+        if (key == "movieToneMode") return movieToneMode
+        if (key == "previewQuality") return previewQuality
         // 没连相机就不给档位假数据，统一显示占位符
         if (!isConnected) return "—"
         return when (key) {
@@ -842,6 +865,8 @@ class DoukState(
     }
 
     fun optionsOf(key: String): List<String> = when (key) {
+        "movieToneMode" -> listOf("SDR", "N-Log", "HLG")
+        "previewQuality" -> listOf("流畅", "标准", "高清")
         "iso" -> vm.availableIsos
         "shutter" -> vm.availableShutterSpeeds
         "aperture" -> vm.availableApertures
@@ -891,6 +916,8 @@ class DoukState(
         }
         lastParamHint = ""
         when (key) {
+            "movieToneMode" -> applyMovieToneMode(value)
+            "previewQuality" -> applyPreviewQuality(value)
             "iso" -> vm.setIso(value)
             "shutter" -> vm.setShutterSpeed(value)
             "aperture" -> vm.setAperture(value)
@@ -931,11 +958,29 @@ class DoukState(
     /** 启动时把监看偏好送进解码器；换画质立刻生效，下一帧起按新档位解码 */
     fun reloadMonitorPrefs() {
         previewQuality = DoukPrefs.monitorPreviewQuality
+        movieToneMode = DoukPrefs.monitorToneMode
         LiveViewQuality.level = when (previewQuality) {
             "流畅" -> LiveViewQuality.FLUENT
             "高清" -> LiveViewQuality.HD
             else -> LiveViewQuality.STANDARD
         }
+    }
+
+    /** 画质卡片里直接选档；不再只能点一次循环一档。 */
+    fun applyPreviewQuality(value: String) {
+        val valid = value.takeIf { it in listOf("流畅", "标准", "高清") } ?: return
+        previewQuality = valid
+        DoukPrefs.monitorPreviewQuality = valid
+        reloadMonitorPrefs()
+        lastHint = "预览画质已切到 $valid"
+    }
+
+    /** 视频色调模式只在 App 内生效：选 N-Log / HLG 后自动套对应还原 LUT。 */
+    fun applyMovieToneMode(value: String) {
+        val valid = value.takeIf { it in listOf("SDR", "N-Log", "HLG") } ?: return
+        movieToneMode = valid
+        DoukPrefs.monitorToneMode = valid
+        lastHint = "视频色调模式：$valid"
     }
 
     /** 在「监看工具」里循环切换取景画质：流畅 → 标准 → 高清 */
@@ -957,6 +1002,8 @@ class DoukState(
      * 相机在 AUTO / 场景档会把快门、光圈锁成「单值、只读」，此时下发只会被 0x200F 拒。
      */
     fun paramLockReason(key: String): String? {
+        // 取景画质和视频色调只改 App 自己，不可能被机身锁住
+        if (key == "previewQuality" || key == "movieToneMode") return null
         // 没连相机时谈不上「不可写」，不挂锁标；否则满屏都是灰行
         if (!isConnected) return null
         return when (key) {
@@ -1108,17 +1155,28 @@ class DoukState(
         autoConnectJob = ioScope.launch {
             var failStreak = 0
             while (isActive) {
-                // 刚掉线时先快速重试三次（机身从休眠醒来往往就差这几秒），
-                // 连续失败再退回设置里的长间隔，避免一直空转耗电。
-                val wait = if (failStreak in 1..3) 4_000L
-                else DoukPrefs.autoReconnectSeconds * 1000L
+                // 开关关着就只低频看一眼开关状态，不扫描、不碰 PTP；用户一打开最多 4 秒内开始连。
+                if (!DoukPrefs.autoConnectKnown) {
+                    failStreak = 0
+                    delay(4_000)
+                    continue
+                }
+                // 刚启动/刚掉线先快速重试：第一次 1.5 秒内就搜一遍，前几次每 4 秒一次；
+                // 持续找不到设备后放慢到 8 秒（仍保持「隔几秒自动搜」），不会一直 4 秒空转耗电。
+                val retryMs = if (failStreak <= 5) 4_000L
+                    else minOf(DoukPrefs.autoReconnectSeconds * 1000L, 8_000L)
+                val wait = if (failStreak == 0) 1_500L else retryMs
                 withTimeoutOrNull(wait) { autoConnectSignal.receive() }
                 try {
-                    autoConnectOnce(context)
+                    autoConnectOnce(
+                        context,
+                        // 快速重试阶段不要再被 20/30 秒冷却挡住，否则「每几秒搜一次」只是空话。
+                        minGapMs = if (failStreak == 0) 0L else retryMs
+                    )
                 } catch (e: Exception) {
                     DoukLog.w("Scan", "AUTO_LOOP_ERROR", "error" to (e.message ?: "unknown"))
                 }
-                failStreak = if (isConnected) 0 else (failStreak + 1).coerceAtMost(6)
+                failStreak = if (isConnected) 0 else (failStreak + 1).coerceAtMost(10)
             }
         }
         // 真掉线时不要等满 30 秒：会话从「已连接」变「未连接」，1.5 秒后立刻补连一次。
@@ -1153,6 +1211,9 @@ class DoukState(
                 }
                 if (connectMode == ConnectMode.USB_PTP) continue
                 val known = DoukPrefs.knownDevices()
+                // 开关关掉时不做后台短扫：手动打开设备页点「搜索」仍然正常扫，
+                // 但没必要每隔 5 秒把 Wi‑Fi 模块和相机都叫醒。
+                if (!DoukPrefs.autoConnectKnown || known.isEmpty()) continue
                 val hits = runCatching {
                     CameraLanProbe.scan(
                         context = context.applicationContext,
@@ -1166,8 +1227,13 @@ class DoukState(
                 }
                 // 历史设备重新出现就顺手连上；用户刚手动断开（autoConnectPaused）时只列出来不连
                 if (autoConnectPaused) continue
-                val hit = hits.firstOrNull { h -> known.any { it.ip == h.ip } } ?: hits.singleOrNull() ?: continue
+                // 只自动连「连接过」的设备；换网段时如果只记录过一台且只探到一台，才允许按唯一设备兜底。
+                val hit = hits.firstOrNull { h -> known.any { it.ip == h.ip } }
+                    ?: hits.singleOrNull()?.takeIf { known.size == 1 }
+                    ?: continue
                 val nowMs = System.currentTimeMillis()
+                // 看门狗只在失败超过三次后的长间隔阶段接手；快速重试阶段由 autoConnectOnce 控制，
+                // 否则看门狗 20 秒冷却会把「每 4 秒重试」直接挡掉。
                 if (nowMs - lastAutoConnectAttemptAt < DoukPrefs.autoReconnectSeconds * 1000L) continue
                 lastAutoConnectAttemptAt = nowMs
                 DoukLog.i("Scan", "WATCHDOG_CONNECT", "ip" to hit.ip, "via" to hit.iface)
@@ -1291,7 +1357,10 @@ class DoukState(
         autoConnectSignal.trySend(Unit)
     }
 
-    private suspend fun autoConnectOnce(context: Context) {
+    private suspend fun autoConnectOnce(
+        context: Context,
+        minGapMs: Long = DoukPrefs.autoReconnectSeconds * 1000L
+    ) {
         if (!DoukPrefs.autoConnectKnown) return
         // 用户主动断开后不要偷偷连回来；重新点连接会解除暂停。
         if (autoConnectPaused) return
@@ -1304,7 +1373,7 @@ class DoukState(
         if (vm.ptpClient.hasConnection) return
         // 刚失败过就别马上再顶一次：Nikon 一次只允许一条会话，连续握手会让两边都断。
         val now = System.currentTimeMillis()
-        if (now - lastAutoConnectAttemptAt < DoukPrefs.autoReconnectSeconds * 1000L) return
+        if (now - lastAutoConnectAttemptAt < minGapMs) return
         lastAutoConnectAttemptAt = now
         val known = DoukPrefs.knownDevices()
         if (known.isEmpty()) return
@@ -1313,9 +1382,10 @@ class DoukState(
             timeoutMs = 300,
             preferred = CameraLanProbe.priorityTargets(context, known.map { it.ip })
         )
-        // 换网段后 IP 会变：只有一台历史设备且只探到一台，也认为就是它
+        // 换网段后 IP 会变：只有一台历史设备且只探到一台，才认为就是它；
+        // 有多台历史设备时绝不猜，避免把别的相机/同名端口当成已连接过的设备。
         val hit = hits.firstOrNull { h -> known.any { it.ip == h.ip } }
-            ?: hits.singleOrNull()
+            ?: if (known.size == 1) hits.singleOrNull() else null
         if (hit == null) {
             DoukLog.i("Scan", "AUTO_LOOP_MISS", "nets" to CameraLanProbe.localNetworkSummary())
             return
@@ -1818,25 +1888,77 @@ class DoukState(
         intervalProgress = "已停止"
     }
 
+    // ===== 拍摄状态摘要：监看页参数卡直接显示，不再只有 ISO/快门/光圈 =====
+    /** 拍摄格式：照片看画质/RAW 压缩，视频看文件类型 + 视频画质。 */
+    val captureFormatText: String
+        get() = if (effectiveMode == CaptureMode.VIDEO) {
+            listOf(valueOf("movieFileType"), valueOf("movieQuality"))
+                .filter { it.isNotBlank() && it != "—" && it != "相机未上报" }
+                .joinToString(" · ")
+                .ifBlank { "—" }
+        } else {
+            listOf(valueOf("imageQuality"), valueOf("rawCompression"))
+                .filter { it.isNotBlank() && it != "—" && it != "相机未上报" }
+                .joinToString(" · ")
+                .ifBlank { "—" }
+        }
+
+    /** 拍摄分辨率：照片看图像尺寸 + 图像区域，视频看画面尺寸。 */
+    val captureResolutionText: String
+        get() = if (effectiveMode == CaptureMode.VIDEO) {
+            valueOf("movieScreenSize").ifBlank { "—" }
+        } else {
+            listOf(valueOf("imageSize"), valueOf("imageArea"))
+                .filter { it.isNotBlank() && it != "—" && it != "相机未上报" }
+                .joinToString(" · ")
+                .ifBlank { "—" }
+        }
+
+    /** 对焦模式：只读展示，不在状态卡里点开，避免和右栏对焦按钮重复。 */
+    val focusModeText: String
+        get() = valueOf(if (effectiveMode == CaptureMode.VIDEO) "movieFocusMode" else "focusMode")
+            .ifBlank { "—" }
+
+    /** 测光模式。 */
+    val meteringModeText: String
+        get() = valueOf(if (effectiveMode == CaptureMode.VIDEO) "movieMetering" else "metering")
+            .ifBlank { "—" }
+
     fun shoot() {
+        val activeMode = effectiveMode
+        if (!isConnected) {
+            lastHint = "相机未连接，无法拍摄"
+            return
+        }
         if (usbConnected) {
-            if (mode == CaptureMode.VIDEO) {
+            if (activeMode == CaptureMode.VIDEO) {
                 val next = !usbRecording
-                usb.ptp.toggleMovieRecord(next)
-                usbRecording = next
+                usb.ptp.toggleMovieRecord(next) { ok ->
+                    usbRecording = if (ok) next else false
+                    lastHint = when {
+                        ok && next -> "USB 视频录制开始"
+                        ok -> "USB 视频录制停止"
+                        else -> "USB 视频录制指令被机身拒绝，请确认相机在视频档"
+                    }
+                }
             } else {
                 usb.ptp.triggerCapture()
                 photoCounter += 1
                 scheduleGalleryRefresh()
+                lastHint = "已发送快门"
             }
             return
         }
-        if (mode == CaptureMode.VIDEO) {
+        if (activeMode == CaptureMode.VIDEO) {
+            // 之前这里读的是界面 mode 而不是 effectiveMode：机顶拨盘已经切到视频档时，
+            // mode 仍可能停留在 STILL，点了录制却发出拍照命令，看起来就是“没反应”。
             vm.toggleMovieRecord(!vm.isRecordingVideo)
+            lastHint = if (vm.isRecordingVideo) "正在停止视频录制…" else "正在开始视频录制…"
         } else {
             vm.triggerShutter()
             photoCounter += 1
             scheduleGalleryRefresh()
+            lastHint = "已发送快门"
         }
     }
 

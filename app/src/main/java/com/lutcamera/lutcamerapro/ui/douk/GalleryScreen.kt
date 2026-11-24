@@ -58,6 +58,7 @@ import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.PhotoAlbum
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.CloudUpload
 import androidx.compose.material.icons.rounded.FilterList
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -77,6 +78,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -122,6 +124,13 @@ import java.io.File
 
 /** 图库缩略图解码上限：快速滚动时同时解码太多 320px 图会突然卡一下 */
 private val GalleryDecodeGate = Semaphore(3)
+
+/**
+ * 网格缩略图只保留最近 48 张、按 cell 尺寸解码（420px）。
+ * 之前按 960px 解码且永不回收，滚动几百张就会把几百 MB 留在内存里。
+ */
+private const val MAX_GALLERY_THUMBS = 48
+private const val GALLERY_THUMB_SIDE = 420
 
 internal enum class GallerySource(val label: String, val hint: String) {
     CAMERA("相机内", "机身存储，经 USB 或 Wi-Fi 读取"),
@@ -309,6 +318,8 @@ fun GalleryScreen(
     // 用全局 state 而不是把参数一层层传到 ThumbCell，网格里每一格都能立刻跟着变。
     val showFormatBadge = galleryFormatBadge.value
     var showSourceMenu by remember { mutableStateOf(false) }
+    var showTransfers by remember { mutableStateOf(false) }
+    val transferRecords by TransferCenter.records.collectAsState()
     var previewItem by remember { mutableStateOf<GalleryItem?>(null) }
     var galleryView by remember { mutableStateOf(GalleryView.PHOTOS) }
     var showViewSwitch by remember { mutableStateOf(false) }
@@ -343,6 +354,8 @@ fun GalleryScreen(
     LaunchedEffect(source) {
         resetSelection()
         albumFilter = null
+        // 切换来源必须清缓存，否则相机 handle 与相册 id 混在一起会串图，也会一直占内存。
+        thumbs.clear()
     }
 
     // 多选态下按返回键只退出选择模式，不离开图库页（和系统相册一致）
@@ -373,6 +386,14 @@ fun GalleryScreen(
                 try {
                     targets.forEach { target ->
                         val handles = listOf(target.key to target.fileName) + target.extraHandles
+                        // 先把整批任务写进持久化队列：中途被杀进程，下次连上相机也能接着传。
+                        if (!target.fromUsb) {
+                            val thumb = thumbs[target.stableKey]
+                            handles.forEach { (handle, _) ->
+                                val transferId = state.vm.enqueueTransfer(handle)
+                                if (transferId != null) TransferCenter.putThumbnail(transferId, thumb)
+                            }
+                        }
                         handles.forEach { (handle, _) ->
                             val success: Boolean = if (target.fromUsb) {
                                 suspendCancellableCoroutine { cont ->
@@ -489,6 +510,41 @@ fun GalleryScreen(
                     )
                 }
                 Spacer(modifier = Modifier.weight(1f))
+                // 传输图片：正在传 / 等待续传的任务常驻入口，角标显示未结束数量
+                val transferActive = transferRecords.count { it.isActive }
+                Box(modifier = Modifier.size(42.dp)) {
+                    IconButton(
+                        onClick = { showTransfers = true },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .doukCardSurface(CircleShape)
+                    ) {
+                        Icon(
+                            Icons.Rounded.CloudUpload,
+                            contentDescription = "传输图片",
+                            tint = if (transferActive > 0) DoukColors.accent else DoukColors.textPrimary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    if (transferActive > 0) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(2.dp)
+                                .size(15.dp)
+                                .background(DoukColors.accent, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (transferActive > 99) "99+" else transferActive.toString(),
+                                color = Color.White,
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.width(6.dp))
                 // 右上角「更多」：按钮本身也是高级材质圆片，弹出的卡片由根 Box 里的浮层渲染
                 IconButton(
                     onClick = { showMoreMenu = true },
@@ -644,6 +700,10 @@ fun GalleryScreen(
                 )
             }
         }
+    }
+
+    if (showTransfers) {
+        TransferSheet(onDismiss = { showTransfers = false })
     }
 
     if (confirmDelete) {
@@ -1116,8 +1176,17 @@ private fun AppGallery(
         onSelect = onSelect,
         onDeselect = onDeselect,
         loadThumb = { item ->
-            withContext(Dispatchers.IO) {
-                GalleryFileOps.locateAppFile(item.fileName)?.let { decodeFileThumb(it) }
+            val file = withContext(Dispatchers.IO) {
+                GalleryFileOps.locateAppFile(item.fileName)
+            }
+            when {
+                file == null -> null
+                // JPG/PNG/HEIC 走 Coil：缓存键带文件版本，滚动离开自动取消；
+                // Coil 偶发解不动（异常配置、损坏文件）再退回原来的 ImageDecode。
+                GalleryThumbs.canUseCoil(item) ->
+                    GalleryThumbs.loadThumb(ctx, file, GALLERY_THUMB_SIDE)
+                        ?: withContext(Dispatchers.IO) { decodeFileThumb(file) }
+                else -> withContext(Dispatchers.IO) { decodeFileThumb(file) }
             }
         }
     )
@@ -1144,17 +1213,22 @@ private fun PhoneGallery(
         Build.VERSION.SDK_INT >= 34 -> arrayOf(
             Manifest.permission.READ_MEDIA_IMAGES,
             Manifest.permission.READ_MEDIA_VIDEO,
-            Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+            Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+            Manifest.permission.ACCESS_MEDIA_LOCATION
         )
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
             Manifest.permission.READ_MEDIA_IMAGES,
-            Manifest.permission.READ_MEDIA_VIDEO
+            Manifest.permission.READ_MEDIA_VIDEO,
+            Manifest.permission.ACCESS_MEDIA_LOCATION
         )
-        else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        else -> arrayOf(
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.ACCESS_MEDIA_LOCATION
+        )
     }
-    fun hasPhotoAccess(): Boolean = permissions.any {
-        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-    }
+    fun hasPhotoAccess(): Boolean = ContextCompat.checkSelfPermission(
+        context, permissions.first()
+    ) == PackageManager.PERMISSION_GRANTED
     var granted by remember { mutableStateOf(false) }
     var askedOnce by remember { mutableStateOf(false) }
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -1334,16 +1408,23 @@ private fun PhoneGallery(
         onDeselect = onDeselect,
         loadThumb = { item ->
             withContext(Dispatchers.IO) {
-                val collection = if (item.isVideo) {
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                if (item.isVideo) {
+                    val uri = ContentUris.withAppendedId(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI, item.key.toLong()
+                    )
+                    runCatching {
+                        context.contentResolver.loadThumbnail(
+                            uri, android.util.Size(320, 320), null
+                        )?.asImageBitmap()
+                    }.getOrNull()
                 } else {
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                    // 手机拍的 Ultra HDR JPEG，系统 loadThumbnail 会返回 HDR 位图，
+                    // Compose 直接画会发灰；统一走 ImageDecode 解成 SDR 缩略图。
+                    val uri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI, item.key.toLong()
+                    )
+                    ImageDecode.decodeUri(context, uri, 320)
                 }
-                val uri = ContentUris.withAppendedId(collection, item.key.toLong())
-                runCatching {
-                    context.contentResolver.loadThumbnail(uri, android.util.Size(320, 320), null)
-                        ?.asImageBitmap()
-                }.getOrNull()
             }
         }
     )
@@ -1550,7 +1631,13 @@ private fun ThumbCell(
 ) {
     LaunchedEffect(item.stableKey) {
         if (!thumbs.containsKey(item.stableKey)) {
-            GalleryDecodeGate.withPermit { loader() }?.let { thumbs[item.stableKey] = it }
+            GalleryDecodeGate.withPermit { loader() }?.let { bitmap ->
+                thumbs[item.stableKey] = bitmap
+                // 只保留最近 48 张。Remove 一个不在当前格子的旧 key，避免把刚加载的图删掉。
+                if (thumbs.size > MAX_GALLERY_THUMBS) {
+                    thumbs.keys.firstOrNull { it != item.stableKey }?.let { thumbs.remove(it) }
+                }
+            }
         }
     }
     // Live 图角标：探测只读文件头 128KB，结果会被 LivePhoto 缓存，滚动复用不会重复读
@@ -1795,11 +1882,12 @@ private fun readImageBounds(file: File): Pair<Int, Int>? = runCatching {
     }
 }.getOrNull()
 
-private fun decodeFileThumb(file: File): ImageBitmap? = ImageDecode.decodeThumb(file, 960) ?: runCatching {
+private fun decodeFileThumb(file: File): ImageBitmap? = ImageDecode.decodeThumb(file, GALLERY_THUMB_SIDE) ?: runCatching {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(file.absolutePath, bounds)
+    val longSide = maxOf(bounds.outWidth, bounds.outHeight)
     var sample = 1
-    while (bounds.outWidth / sample > 640) sample *= 2
+    while (longSide / sample > GALLERY_THUMB_SIDE) sample *= 2
     val options = BitmapFactory.Options().apply { inSampleSize = sample }
     val bmp = BitmapFactory.decodeFile(file.absolutePath, options) ?: return null
     GalleryFileOps.applyExifOrientation(bmp, GalleryFileOps.exifOrientationOf(file)).asImageBitmap()
@@ -1858,7 +1946,7 @@ private fun GalleryFilterPage(
     }
     // 筛选改成整屏二级页（和设置页一致，不用弹窗）
     BackHandler { onDismiss() }
-    Box(modifier = Modifier.fillMaxSize().background(DoukColors.background)) {
+    Box(modifier = Modifier.fillMaxSize().background(DoukColors.backgroundBrush)) {
         Column(
             modifier = Modifier
                 .fillMaxSize()

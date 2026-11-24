@@ -80,6 +80,7 @@ internal class HdrImageView @JvmOverloads constructor(
     private var uPeakNits = 0
     private var uZoom = 0
     private var uPan = 0
+    private var uFit = 0
     private var uQuarter = 0
     private var quad: FloatBuffer? = null
 
@@ -105,6 +106,9 @@ internal class HdrImageView @JvmOverloads constructor(
 
     /** EGL 窗口是否按 BT2020_PQ 建成功；只有它为 true 才允许输出 PQ 数值 */
     private var pqSurface = false
+
+    /** 选到的是 10bit RGBA_1010102 配置；PQ 数据必须走 10bit 交换链才不会断层 */
+    private var tenBitConfig = false
 
     /** 只用来给外部打一次诊断日志，避免重复刷 log */
     var loggedReady = false
@@ -137,6 +141,16 @@ internal class HdrImageView @JvmOverloads constructor(
         bitmap = bmp
         gainBmp = null; gainOn = false
         pqInput = true
+        handler.post { renderOnce() }
+    }
+
+    /** 没有 HDR 时清成黑底，但保留 EGL / Surface，下一次打开 HDR 不用重新初始化。 */
+    fun clear() {
+        if (bitmap == null && gainBmp == null) return
+        bitmap = null
+        gainBmp = null
+        gainOn = false
+        pqInput = false
         handler.post { renderOnce() }
     }
 
@@ -182,7 +196,10 @@ internal class HdrImageView @JvmOverloads constructor(
             // 只有 EGL 窗口本身按 PQ 建成功，才敢把数据写成 PQ。
             // 以前不管 EGL 成没成，SurfaceControl.setDataSpace 一返回就把 hdrActive 置 true，
             // 结果 8bit/sRGB 交换链里塞的是 PQ 数值，整张图被当成 sRGB 解读 → 一打开就是灰的。
-            if (pqSurface) applyHdrDataSpace()
+            // EGL 的 PQ colorspace 属性在这台机器上会被拒绝（EGL_BAD_ATTRIBUTE），
+            // 但 10bit 交换链本身是好的。只要拿到 10bit 配置，就用 SurfaceControl
+            // 直接给这一层标 BT2020_PQ，让 SurfaceFlinger 按 HDR 合成。
+            if (tenBitConfig) applyHdrDataSpace()
         }
     }
 
@@ -200,6 +217,8 @@ internal class HdrImageView @JvmOverloads constructor(
                 .apply()
             hdrActive = true
             DoukLog.i("HdrImage", "DATASPACE_PQ", "ok" to "true")
+            // dataspace 切换后必须再画一帧，否则第一帧仍按旧的 SDR 解释。
+            renderOnce()
         }.onFailure {
             DoukLog.w("HdrImage", "DATASPACE_FAIL", "msg" to (it.message ?: ""))
         }
@@ -246,6 +265,7 @@ internal class HdrImageView @JvmOverloads constructor(
             EGL14.EGL_NONE
         )
         if (!EGL14.eglChooseConfig(display, attrs, 0, configs, 0, 1, num, 0) || num[0] <= 0) {
+            tenBitConfig = false
             attrs = intArrayOf(
                 EGL14.EGL_RED_SIZE, 8,
                 EGL14.EGL_GREEN_SIZE, 8,
@@ -258,6 +278,8 @@ internal class HdrImageView @JvmOverloads constructor(
                 DoukLog.w("HdrImage", "NO_EGL_CONFIG")
                 return
             }
+        } else {
+            tenBitConfig = true
         }
         val config = configs[0] ?: return
         eglContext = EGL14.eglCreateContext(
@@ -303,6 +325,7 @@ internal class HdrImageView @JvmOverloads constructor(
         uPeakNits = GLES20.glGetUniformLocation(program, "uPeakNits")
         uZoom = GLES20.glGetUniformLocation(program, "uZoom")
         uPan = GLES20.glGetUniformLocation(program, "uPan")
+        uFit = GLES20.glGetUniformLocation(program, "uFit")
         uQuarter = GLES20.glGetUniformLocation(program, "uQuarter")
         val data = floatArrayOf(
             -1f, -1f, 0f, 1f,
@@ -346,11 +369,12 @@ internal class HdrImageView @JvmOverloads constructor(
             in vec2 aTex;
             uniform vec2 uZoom;
             uniform vec2 uPan;
+            uniform vec2 uFit;
             uniform float uQuarter;
             out vec2 vTexCoord;
             void main() {
                 vTexCoord = (uQuarter > 0.5) ? aTex.yx : aTex;
-                gl_Position = vec4(aPos * uZoom + uPan, 0.0, 1.0);
+                gl_Position = vec4(aPos * uFit * uZoom + uPan, 0.0, 1.0);
             }
         """.trimIndent()
         val fs = """
@@ -528,8 +552,9 @@ internal class HdrImageView @JvmOverloads constructor(
      * 常见的 420 nits 保守处理。
      */
     private fun displayPeakNits(): Float {
-        val desired = runCatching { context.display?.hdrCapabilities?.desiredMaxLuminance }
-            .getOrNull() ?: 0f
+        val desired = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            runCatching { context.display?.hdrCapabilities?.desiredMaxLuminance }.getOrNull() ?: 0f
+        } else 0f
         if (desired in 100f..2000f) return desired
         return if (hdrActive) 420f else 203f
     }
@@ -577,22 +602,15 @@ internal class HdrImageView @JvmOverloads constructor(
                     texGain = gain
                 }
             }
-            // 按图片比例做 letterbox，别把人像拉变形（转 90° 时宽高比取倒数）
+            // 不再把 glViewport 缩到 letterbox：那样一放大，viewport 本身就把
+            // 画面裁在中间一条，横图在竖屏上尤其明显。改成全屏 viewport，
+            // 用 uFit 在顶点上做等比 letterbox，放大和平移都发生在全屏内。
             val baseRatio = bmp.width.toFloat() / bmp.height
             val imgRatio = if (quarter) 1f / baseRatio else baseRatio
             val viewRatio = w.toFloat() / h
-            var vpW = w
-            var vpH = h
-            var vpX = 0
-            var vpY = 0
-            if (imgRatio > viewRatio) {
-                vpH = (w / imgRatio).toInt()
-                vpY = (h - vpH) / 2
-            } else {
-                vpW = (h * imgRatio).toInt()
-                vpX = (w - vpW) / 2
-            }
-            GLES20.glViewport(vpX, vpY, vpW.coerceAtLeast(1), vpH.coerceAtLeast(1))
+            val fitX = if (imgRatio > viewRatio) 1f else imgRatio / viewRatio
+            val fitY = if (imgRatio > viewRatio) viewRatio / imgRatio else 1f
+            GLES20.glViewport(0, 0, w, h)
             GLES20.glUseProgram(program)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
@@ -614,6 +632,7 @@ internal class HdrImageView @JvmOverloads constructor(
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             }
             GLES20.glUniform2f(uZoom, zoom, zoom)
+            GLES20.glUniform2f(uFit, fitX, fitY)
             // px 平移换成 NDC；panX 往右为正，屏幕上就是往右
             GLES20.glUniform2f(uPan, panX * 2f / w, -panY * 2f / h)
             GLES20.glUniform1f(uQuarter, if (quarter) 1f else 0f)

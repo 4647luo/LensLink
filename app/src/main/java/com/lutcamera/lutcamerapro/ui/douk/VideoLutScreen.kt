@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -117,6 +118,11 @@ internal fun VideoLutScreen(
     var exportCodec by remember { mutableStateOf("自动") }
     var exportQuality by remember { mutableStateOf("高") }
     var exportBitrate by remember { mutableStateOf("高") }
+    // 「选一段 → Live 图」：开始/结束都用毫秒，默认取当前播放位置往后 3 秒
+    var liveSheet by remember { mutableStateOf(false) }
+    var liveStartMs by remember { mutableIntStateOf(0) }
+    var liveEndMs by remember { mutableIntStateOf(0) }
+    var liveExporting by remember { mutableStateOf(false) }
 
     // 文件准备：应用内直接读；手机相册的视频先复制到 cache
     LaunchedEffect(item.stableKey) {
@@ -205,6 +211,84 @@ internal fun VideoLutScreen(
         while (isActive && playing) {
             if (!seeking) runCatching { positionMs = player?.currentPosition ?: 0 }
             delay(300)
+        }
+    }
+
+    fun startLiveExport() {
+        val f = file ?: return
+        if (exporting || liveExporting) return
+        val start = liveStartMs.coerceIn(0, maxOf(0, durationMs - 500))
+        val end = liveEndMs.coerceIn(start + 500, maxOf(start + 500, durationMs))
+        liveExporting = true
+        exporting = true
+        exportPercent = 0
+        message = null
+        runCatching { player?.pause(); playing = false }
+        val options = VideoLutExporter.ExportOptions(
+            // Live 图的视频部分通常跟相册/分享平台按 1080p 处理；保留 1920 比原片 4K 小很多，
+            // 但细看仍比 720p 清楚。封面图另取原视频帧，不跟着压。
+            maxLongSide = 1920,
+            codec = "auto",
+            quality = "high",
+            bitrateScale = 0.95f,
+            startMs = start.toLong(),
+            endMs = end.toLong()
+        )
+        scope.launch {
+            val out = withContext(Dispatchers.IO) {
+                runCatching {
+                    val dir = File(
+                        android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_PICTURES
+                        ),
+                        "连镜"
+                    )
+                    if (!dir.exists()) dir.mkdirs()
+                    val base = f.nameWithoutExtension
+                    var name = "${base}_live.jpg"
+                    var i = 2
+                    while (File(dir, name).exists()) {
+                        name = "${base}_live${i}.jpg"
+                        i++
+                    }
+                    val target = File(dir, name)
+                    val tempMp4 = File(context.cacheDir, "live_${System.currentTimeMillis()}.mp4")
+                    try {
+                        val chosenLut = lutId
+                        VideoLutExporter.export(
+                            input = f,
+                            output = tempMp4,
+                            lut = if (chosenLut == null) null else lutRuntime?.lut(chosenLut),
+                            intensity = intensity,
+                            options = options
+                        ) { p ->
+                            scope.launch { exportPercent = p }
+                        }.getOrThrow()
+                        MotionPhotoWriter.write(tempMp4, target, coverAtUs = 200_000L).getOrThrow()
+                        target
+                    } catch (t: Throwable) {
+                        runCatching { target.delete() }
+                        throw t
+                    } finally {
+                        runCatching { tempMp4.delete() }
+                    }
+                }
+            }
+            liveExporting = false
+            exporting = false
+            out.onSuccess { target ->
+                DoukLog.i(
+                    "MotionPhoto", "LIVE_EXPORTED",
+                    "file" to target.name, "start" to start, "end" to end
+                )
+                android.media.MediaScannerConnection.scanFile(
+                    context, arrayOf(target.absolutePath), arrayOf("image/jpeg"), null
+                )
+                message = "已生成 Live 图：${target.name}（长按可播放）"
+                onExported(target.name)
+            }.onFailure {
+                message = "Live 图生成失败：${it.message ?: "未知错误"}"
+            }
         }
     }
 
@@ -443,6 +527,7 @@ internal fun VideoLutScreen(
                 ) {
                     Text(
                         when {
+                            liveExporting -> "生成 Live 图… $exportPercent%"
                             exporting -> "导出中… $exportPercent%"
                             lutId == null -> "导出视频（原片色彩）"
                             else -> "套 LUT 并导出视频"
@@ -450,6 +535,34 @@ internal fun VideoLutScreen(
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (exporting) Color.White.copy(alpha = 0.8f) else Color.White
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.White.copy(alpha = if (exporting) 0.08f else 0.13f))
+                        .clickable(enabled = !exporting && durationMs > 0) {
+                            val tapped = positionMs.coerceIn(0, maxOf(0, durationMs - 500))
+                            val defaultEnd = minOf(durationMs, tapped + 3_000)
+                                .coerceAtLeast(minOf(durationMs, tapped + 500))
+                            // 从片尾点进来时不要只截到 0.5 秒：向前补足 3 秒，保证默认片段符合建议长度。
+                            val defaultStart = if (durationMs >= 3_000 && defaultEnd - tapped < 3_000) {
+                                (defaultEnd - 3_000).coerceAtLeast(0)
+                            } else tapped
+                            liveStartMs = defaultStart
+                            liveEndMs = defaultEnd
+                            liveSheet = true
+						}
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "选片段 · 转为 Live 图",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White.copy(alpha = if (exporting) 0.45f else 0.9f)
                     )
                 }
             }
@@ -472,7 +585,115 @@ internal fun VideoLutScreen(
                 }
             )
         }
+
+        if (liveSheet) {
+            LiveClipDialog(
+                durationMs = durationMs,
+                startMs = liveStartMs,
+                endMs = liveEndMs,
+                onStartChanged = {
+                    liveStartMs = it
+                    if (liveEndMs < it + 500) {
+                        liveEndMs = minOf(durationMs, it + 500)
+                    }
+                },
+                onEndChanged = { liveEndMs = it },
+                onDismiss = { liveSheet = false },
+                onConfirm = {
+                    liveSheet = false
+                    startLiveExport()
+                }
+            )
+        }
     }
+}
+
+/** 选一段视频转 Live 图：两个滑杆选开始/结束，实时显示时长。 */
+@Composable
+private fun LiveClipDialog(
+    durationMs: Int,
+    startMs: Int,
+    endMs: Int,
+    onStartChanged: (Int) -> Unit,
+    onEndChanged: (Int) -> Unit,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val safeDuration = durationMs.coerceAtLeast(1)
+    val startMin = 0f
+    val startMax = (safeDuration - 500).coerceAtLeast(500).toFloat()
+    val endMin = (startMs + 500).coerceAtMost(safeDuration).toFloat()
+    val endMax = safeDuration.toFloat()
+    val selectedSec = ((endMs - startMs).coerceAtLeast(0) / 1000f)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1B1D1B),
+        titleContentColor = Color.White,
+        textContentColor = Color.White.copy(alpha = 0.8f),
+        title = { Text("转为 Live 图", fontSize = 16.sp, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column {
+                Text(
+                    "选一段画面和声音做成动态照片；建议 3–10 秒，太长文件会很大。",
+                    fontSize = 12.sp,
+                    color = Color.White.copy(alpha = 0.6f)
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("开始", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f),
+                        modifier = Modifier.width(40.dp))
+                    Slider(
+                        value = startMs.toFloat().coerceIn(startMin, startMax),
+                        onValueChange = { onStartChanged(it.toInt()) },
+                        valueRange = startMin..startMax,
+                        modifier = Modifier.weight(1f),
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = DoukColors.accent,
+                            inactiveTrackColor = Color.White.copy(alpha = 0.20f)
+                        )
+                    )
+                    Text(timeText(startMs), fontSize = 11.sp, color = Color.White.copy(alpha = 0.75f))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("结束", fontSize = 12.sp, color = Color.White.copy(alpha = 0.65f),
+                        modifier = Modifier.width(40.dp))
+                    Slider(
+                        value = endMs.toFloat().coerceIn(endMin, endMax),
+                        onValueChange = { onEndChanged(it.toInt().coerceAtLeast(startMs + 500)) },
+                        valueRange = endMin..endMax,
+                        modifier = Modifier.weight(1f),
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = DoukColors.accent,
+                            inactiveTrackColor = Color.White.copy(alpha = 0.20f)
+                        )
+                    )
+                    Text(timeText(endMs), fontSize = 11.sp, color = Color.White.copy(alpha = 0.75f))
+                }
+                Text(
+                    "片段长度：${String.format(java.util.Locale.US, "%.1f", selectedSec)} 秒",
+                    fontSize = 12.sp,
+                    color = DoukColors.accent,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "封面取片段开头约 0.2 秒的一帧；在「连镜」图库或系统相册里长按照片即可播放。",
+                    fontSize = 11.sp,
+                    color = Color.White.copy(alpha = 0.4f)
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = endMs - startMs >= 500) {
+                Text("生成", color = DoukColors.accent, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消", color = Color.White.copy(alpha = 0.7f)) }
+        }
+    )
 }
 
 /** 导出参数：分辨率 / 编码 / 质量，跟常见开源剪辑软件的导出面板一个思路。 */

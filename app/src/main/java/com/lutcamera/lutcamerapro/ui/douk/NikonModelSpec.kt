@@ -84,7 +84,7 @@ object NikonModelSpec {
 
     val catalog: List<Spec> = third + second + dslr
 
-    /** 机型清单，用于界面上直接列出型号（不出现「三代机 / 二代机」这类说法）。 */
+    /** 机型清单，用于界面上直接列出型号（不出现代际说法）。 */
     val thirdNames: String = third.joinToString("、") { it.label }
     val secondNames: String = second.joinToString("、") { it.label }
     val dslrNames: String = dslr.joinToString("、") { it.label }

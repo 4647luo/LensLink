@@ -30,6 +30,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.File
 import com.lutcamera.lutcamerapro.network.PhotoInbox
+import com.lutcamera.lutcamerapro.ui.douk.TransferCenter
 
 enum class WirelessSubMode(val title: String, val desc: String) {
     AP_DIRECT("AP Direct", "Camera AP Mode (192.168.1.1)"),
@@ -135,6 +136,7 @@ class NikonViewModel : ViewModel() {
         autoApplyBorder: Boolean, saveMode: SaveMode, borderState: BorderState?, xmp: XmpData?
     ) {
         appContext = context.applicationContext
+        FtpPushReceiver.init(context.applicationContext)
         photoSettings = PhotoSettings(
             lut, intensity, autoApplyLut, autoApplyBorder, saveMode, borderState, xmp,
             originalRelativePath = com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.let {
@@ -237,6 +239,46 @@ class NikonViewModel : ViewModel() {
             }
         }
     }
+    private suspend fun receivePhoto(fileName: String, file: File) {
+        val settings = withContext(Dispatchers.Main) { photoSettings }
+            ?: throw java.io.IOException("照片处理设置尚未就绪，请返回相机页后重试")
+        val inbox = photoInbox ?: throw java.io.IOException("照片暂存尚未就绪")
+        withContext(Dispatchers.IO + NonCancellable) {
+            try {
+                val entry = inbox.stage(fileName, file)
+                withContext(Dispatchers.Main) {
+                    capturedCount++
+                    queuedPhotoIds.add(entry.id)
+                    failedPhotoIds.remove(entry.id)
+                    failedPhotoCount = failedPhotoIds.size
+                    photosProcessing = queuedPhotoIds.size
+                    photoProcessingStatus = "JPG 已暂存，等待处理：$fileName"
+                    viewModelScope.launch {
+                        try {
+                            photoJobs.send(PhotoJob(entry, settings))
+                        } catch (e: CancellationException) {
+                            withContext(NonCancellable) {
+                                queuedPhotoIds.remove(entry.id)
+                                failedPhotoIds.add(entry.id)
+                                photosProcessing = queuedPhotoIds.size
+                                failedPhotoCount = failedPhotoIds.size
+                            }
+                            throw e
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                val pending = runCatching { inbox.pending() }.getOrDefault(emptyList())
+                withContext(Dispatchers.Main) {
+                    failedPhotoIds.addAll(pending.map { it.id }.filterNot { it in queuedPhotoIds })
+                    failedPhotoCount = failedPhotoIds.size
+                    photoProcessingStatus = "照片暂存未完成：${e.message}"
+                }
+                throw e
+            }
+        }
+    }
+
     private suspend fun processPhoto(job: PhotoJob) {
         val inbox = photoInbox ?: return
         val context = appContext ?: return
@@ -442,6 +484,16 @@ class NikonViewModel : ViewModel() {
         private set
     var scanning by mutableStateOf(false)
         private set
+    /**
+     * 机身当前是不是视频档的快速探针。
+     *
+     * 旧实现只在连上时读一次 30 多个扩展属性，用户把机身拨到视频档后 App 里
+     * 仍是上一轮的「拍摄」参数，于是出现「相机已是视频、App 还显示拍摄档，
+     * 快门/光圈/ISO 对不上」。这里在 2.5 秒参数轮询里顺带读 3-4 个视频档
+     * 独占属性，检测到换档就立刻刷新整套扩展参数；null 表示这一轮判断不出。
+     */
+    var videoModeProbe by mutableStateOf<Boolean?>(null)
+        private set
     val discoveredCameras = mutableStateListOf<NikonDiscovery.Device>()
     private var discoveryJob: Job? = null
 
@@ -619,9 +671,9 @@ class NikonViewModel : ViewModel() {
         refreshNetworkInfo()
         addLogInner("通信引擎就绪，等待连接...")
 
-        // 监听 FTP 回传照片流
-                FtpPushReceiver.onPhotoReceived = { fileName, jpegBytes ->
-            handleReceivedPhoto(fileName, jpegBytes)
+        // 监听 FTP 回传照片流。新版 FTP 直接给临时文件，不再把整张 JPEG 读成 ByteArray。
+        FtpPushReceiver.onPhotoFileReceived = { fileName, file ->
+            handleReceivedPhotoFile(fileName, file)
         }
     }
 
@@ -633,6 +685,22 @@ class NikonViewModel : ViewModel() {
                 if (wirelessMode == WirelessSubMode.AP_DIRECT && cameraIp.isBlank()) {
                     cameraIp = NikonPtpClient.DEFAULT_NIKON_AP_IP
                 }
+            }
+        }
+
+        // 上次被杀进程时留下的传输队列：相机一重新连上，先补文件列表再自动续传。
+        // PTP 的 object handle 只在当次连接有效，重连后必须重新读一遍列表，
+        // 不能拿上一次连接留下的 storageFiles 直接续传，否则 handle 会错位。
+        viewModelScope.launch {
+            ptpClient.isConnected.collect { connected ->
+                if (!connected || !TransferCenter.hasWaiting()) return@collect
+                delay(700)
+                // 上一条下载可能还在收尾；等它释放串行锁后再刷新列表。
+                while (isLoadingStorageFiles || downloadingPhotoHandles.isNotEmpty()) {
+                    if (!ptpClient.isConnected.value) return@collect
+                    delay(250)
+                }
+                loadStoragePhotos(prepareTransfer = true, force = true)
             }
         }
     }
@@ -905,10 +973,13 @@ class NikonViewModel : ViewModel() {
 
     fun disconnect() {
         stopParamPolling()
+        modeRefreshJob?.cancel()
+        modeRefreshJob = null
         pairingCode = null; pairingVersion = null
         val wasConnecting = isConnecting
         isConnecting = false
         isConnected = false
+        videoModeProbe = null
         discoveryJob?.cancel()
         compressionDesc = null
         savedCompression = null
@@ -955,6 +1026,7 @@ class NikonViewModel : ViewModel() {
     // 相机拨盘/机身菜单改动后，App 里显示的参数也要跟着变。
     // 这里只轮询「当前值」，不再每轮拉一遍完整 descriptor，避免把 PTP 和取景拖慢。
     private var paramPollJob: Job? = null
+    private var modeRefreshJob: Job? = null
 
     private fun startParamPolling() {
         if (paramPollJob?.isActive == true) return
@@ -962,7 +1034,9 @@ class NikonViewModel : ViewModel() {
             delay(2000)
             while (isActive && isConnected) {
                 runCatching { pollCameraParamSnapshot() }
-                delay(2500)
+                // 取景时参数会被机身实时改动，3 秒够用；空闲时没有再拉 2.5 秒的必要，
+                // 降到 6 秒后连相机 Wi‑Fi 的命令流量少一半，机身也不容易被反复唤醒。
+                delay(if (ptpClient.isLiveViewActive.value) 3_000L else 6_000L)
             }
         }
     }
@@ -974,14 +1048,23 @@ class NikonViewModel : ViewModel() {
 
     private suspend fun pollCameraParamSnapshot() {
         if (!isConnected || !ptpClient.canControlCamera) return
-        val shutter = readPropBytes(0x500D)?.let(::leU32)
-        val aperture = readPropBytes(0x5007)?.let(::leU16)
-        val iso = readPropBytes(0x500F)?.let(::leU16)
+        val shutterRaw = readPropBytes(0x500D)
+        val apertureRaw = readPropBytes(0x5007)
+        val isoRaw = readPropBytes(0x500F)
+        val shutter = shutterRaw?.let(::leU32)
+        val aperture = apertureRaw?.let(::leU16)
+        val iso = isoRaw?.let(::leU16)
         val ev = readPropBytes(0x5010)?.let(::leS16)
         val metering = readPropBytes(0x500B)?.let(::leU16)
         val mode = readPropBytes(0x500E)?.let { if (it.isNotEmpty()) (it[0].toInt() and 0xFF).toLong() else null }
         val wb = readPropBytes(0x5005)?.let(::leU16)
         val focus = readPropBytes(0xD061)?.let { if (it.isNotEmpty()) (it[0].toInt() and 0xFF).toLong() else null }
+
+        // 机身档位探针：复用上面已经读到的快门/光圈/ISO，先判断拍照三件套还在不在，
+        // 只有「拍照三件套缺失」或「正在视频档」时才去补读视频档独占属性。
+        // 拍照档下不再额外发 7~10 条 GetDevicePropValue，取景 3 秒/空闲 6 秒一轮的流量明显下降。
+        val stillReporting = listOf(shutterRaw, apertureRaw, isoRaw).count { it?.isNotEmpty() == true }
+        val probedVideoMode = probeVideoMode(stillReporting)
 
         withContext(Dispatchers.Main) {
             if (shutter != null && shutter > 0) shutterSpeed = formatShutterRaw(shutter)
@@ -995,6 +1078,57 @@ class NikonViewModel : ViewModel() {
             }
             if (wb != null && wb > 0) whiteBalance = whiteBalanceLabel(wb)
             if (focus != null && focus in 0L..5L) focusModeLabel = nikonFocusModeLabelOf(focus)
+            if (probedVideoMode != null) {
+                val previous = videoModeProbe
+                videoModeProbe = probedVideoMode
+                if (previous != probedVideoMode && (previous != null || probedVideoMode)) {
+                    com.lutcamera.lutcamerapro.log.DoukLog.i(
+                        "Camera", "MODE_PROBE",
+                        "video" to probedVideoMode, "previous" to (previous?.toString() ?: "null")
+                    )
+                    // 换档后机身会停报旧档、改报新档的一整套属性；立刻补读一次，
+                    // 否则界面会短暂停留在旧档快门/光圈上，看起来就是「对不上」。
+                    modeRefreshJob?.cancel()
+                    modeRefreshJob = viewModelScope.launch(Dispatchers.IO) {
+                        runCatching { refreshExtendedProps() }
+                        runCatching { pollCameraParamSnapshot() }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 快速判断机身当前档位。尼康视频档独占的 0xD0AF/D0A0/D0A7/D0A2 只有在视频档
+     * 才会真正上报；拍照档下读不到，或返回空值。标准曝光三件套用来兜底。
+     * 判断结果和 DoukState.detectedVideoMode 的规则保持一致。
+     *
+     * @param stillReporting 本轮已读到的快门/光圈/ISO 里有多少项有值。拍照档通常是 3，
+     * 视频档会停报这组属性。复用已有读取结果，避免每轮把这些属性再读一遍。
+     */
+    private suspend fun probeVideoMode(stillReporting: Int): Boolean? {
+        try {
+            val previous = videoModeProbe
+            // 视频档：只要拍照三件套还在，就保持视频判断，不再额外读视频属性。
+            if (previous == true) {
+                if (stillReporting < 2) return true
+                // 拍照三件套重新出现，可能是刚拨回拍照档；先确认视频独占属性真的没了，
+                // 避免一次读取抖动就把界面从视频切回拍照。
+                val movieOnly = intArrayOf(0xD0AF, 0xD0A0, 0xD0A7, 0xD0A2)
+                    .count { readPropBytes(it)?.isNotEmpty() == true }
+                return movieOnly < 2
+            }
+            // 拍照档：三件套齐了就直接判定，不碰任何视频属性（这是绝大多数轮询的情况）。
+            if (stillReporting >= 2) return false
+            // 拍照三件套缺失：才补读视频独占属性和视频曝光属性，判断是否刚切到视频档。
+            val movieOnly = intArrayOf(0xD0AF, 0xD0A0, 0xD0A7, 0xD0A2)
+                .count { readPropBytes(it)?.isNotEmpty() == true }
+            if (movieOnly >= 2) return true
+            val movie = intArrayOf(0xD1A8, 0xD1A9, 0xD1AA)
+                .count { readPropBytes(it)?.isNotEmpty() == true }
+            return if (movie >= 2) true else null
+        } catch (e: Exception) {
+            return null
         }
     }
 
@@ -1204,10 +1338,15 @@ class NikonViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             val ok = ptpClient.toggleMovieRecordSync(isRecording)
             withContext(Dispatchers.Main) {
-                isRecordingVideo = if (ok) isRecording else !isRecording
+                // 失败时不能把 isRecordingVideo 取反：开始录制失败还置 true，
+                // 下一次点击就会发“停止”，用户看到的现象就是按钮一直没反应。
+                isRecordingVideo = if (ok) isRecording else false
                 if (!ok) {
+                    val code = "0x%04X".format(ptpClient.lastResponseCode)
+                    lastParamMessage = "视频录制指令被机身拒绝（$code）：请确认机身拨盘在视频档，且相机允许 App 控制录像"
                     addLogInner("视频录制指令被机身拒绝（${ptpClient.lastResponseCode}）")
                 } else {
+                    lastParamMessage = if (isRecording) "视频录制已开始" else "视频录制已停止"
                     addLogInner(if (isRecording) "Video start" else "Video stop")
                 }
             }
@@ -1243,6 +1382,23 @@ class NikonViewModel : ViewModel() {
         if (ptpClient.isLiveViewActive.value) ptpClient.stopLiveView()
     }
 
+    private fun handleReceivedPhotoFile(fileName: String, file: File) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                receivePhoto(fileName, file)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    photoProcessingStatus = "接收照片失败：${e.message}"
+                    addLogInner(photoProcessingStatus)
+                }
+            } finally {
+                if (file.exists()) runCatching { file.delete() }
+            }
+        }
+    }
+
     private fun handleReceivedPhoto(fileName: String, jpegBytes: ByteArray) {
         viewModelScope.launch(Dispatchers.IO) {
             try { receivePhoto(fileName, jpegBytes)
@@ -1266,6 +1422,7 @@ class NikonViewModel : ViewModel() {
         private set
     var downloadingPhotoHandles by mutableStateOf<Set<Int>>(emptySet())
         private set
+    private var resumeTransfersJob: Job? = null
     var storageDownloadMessage by mutableStateOf("")
         private set
     var storageHasMore by mutableStateOf(false)
@@ -1308,6 +1465,8 @@ class NikonViewModel : ViewModel() {
                                 if (storageHasMore) ", more available" else ""
                         )
                     }
+                    // 持久化队列里还有等待任务：文件列表已就绪，开始续传。
+                    if (TransferCenter.hasWaiting()) resumePendingTransfers()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -1379,6 +1538,15 @@ class NikonViewModel : ViewModel() {
             android.location.LocationManager.NETWORK_PROVIDER
         ).filter { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) }
         providers.forEach { provider ->
+            val ctx = appContext
+            val granted = ctx != null &&
+                (androidx.core.content.ContextCompat.checkSelfPermission(
+                    ctx, android.Manifest.permission.ACCESS_FINE_LOCATION
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                    androidx.core.content.ContextCompat.checkSelfPermission(
+                        ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+            if (!granted) return@forEach
             runCatching {
                 lm.requestSingleUpdate(provider, listener, android.os.Looper.getMainLooper())
             }
@@ -1423,12 +1591,17 @@ class NikonViewModel : ViewModel() {
             addLog("🔴 未连接相机，无法下载原图")
             return
         }
+        val transferId = TransferCenter.enqueue(file.fileName, file.folder, file.sizeBytes)
+        TransferCenter.start(transferId, file.sizeBytes)
         viewModelScope.launch(Dispatchers.IO) {
             addLogInner("📥 正在下载原图: ${file.fileName}...")
             try {
                 // 调用真实 PTP 高速通道拉取原图流式分页
-                val photoBytes = ptpClient.downloadCameraPhoto(file.handle)
+                val photoBytes = ptpClient.downloadCameraPhoto(file.handle) { copied, total ->
+                    TransferCenter.progress(transferId, copied, total)
+                }
                 if (photoBytes == null || photoBytes.isEmpty()) {
+                    TransferCenter.fail(transferId, "相机未返回图片")
                     withContext(Dispatchers.Main) {
                         addLogInner("Failed to fetch original photo")
                     }
@@ -1453,11 +1626,13 @@ class NikonViewModel : ViewModel() {
                 }
 
                 check(saved) { "照片处理或保存失败，未完成下载" }
+                TransferCenter.complete(transferId)
                 withContext(Dispatchers.Main) {
                     addLogInner("Download and save successful: ${file.fileName}")
                     _uiEvent.send(NikonUiEvent.DownloadCompleted(file.fileName, true))
                 }
             } catch (e: Exception) {
+                TransferCenter.fail(transferId, e.message ?: "下载失败")
                 withContext(Dispatchers.Main) {
                     addLogInner("⚠️ 下载失败: ${file.fileName} (${e.message})")
                     _uiEvent.send(NikonUiEvent.DownloadCompleted(file.fileName, false))
@@ -1782,6 +1957,60 @@ class NikonViewModel : ViewModel() {
         }
     }
 
+    fun enqueueTransfer(handle: Int): String? {
+        val file = storageFiles.firstOrNull { it.handle == handle } ?: return null
+        return TransferCenter.enqueue(file.fileName, file.folder, file.sizeBytes)
+    }
+
+    /**
+     * 应用被杀后留下的队列，在相机重新连上 / 文件列表重新读回来后继续。
+     * handle 每次连接都会变，所以用「目录 + 文件名 + 大小」重新匹配；已落盘的同名文件直接算完成。
+     * PTP 的 GetObject 没有字节偏移续读，单个文件会从 0 重新取，但队列不会丢。
+     */
+    fun resumePendingTransfers() {
+        if (resumeTransfersJob?.isActive == true) return
+        val waiting = TransferCenter.waitingRecords()
+        if (waiting.isEmpty() || !isConnected) return
+        resumeTransfersJob = viewModelScope.launch(Dispatchers.IO) {
+            val diskNames = runCatching {
+                com.lutcamera.lutcamerapro.ui.douk.GalleryFileOps.appFileNameIndex()
+            }.getOrDefault(emptySet())
+            for (record in waiting) {
+                if (!isConnected) break
+                while (isLoadingStorageFiles || downloadingPhotoHandles.isNotEmpty()) delay(150)
+                val exact = storageFiles.firstOrNull {
+                    it.fileName == record.fileName &&
+                        (record.folder.isNullOrBlank() || it.folder == record.folder) &&
+                        (record.totalBytes <= 0L || it.sizeBytes == record.totalBytes)
+                }
+                val byName = exact ?: storageFiles.firstOrNull {
+                    it.fileName == record.fileName &&
+                        (record.totalBytes <= 0L || it.sizeBytes == record.totalBytes)
+                }
+                if (byName == null) {
+                    TransferCenter.markWaiting(record.id, "等待相机重新返回文件")
+                    continue
+                }
+                val diskBase = com.lutcamera.lutcamerapro.ui.douk.GalleryFileOps.diskBaseName(byName.fileName)
+                if (byName.isDownloaded || diskBase in diskNames) {
+                    TransferCenter.complete(record.id)
+                    continue
+                }
+                val done = CompletableDeferred<Boolean>()
+                withContext(Dispatchers.Main.immediate) {
+                    downloadPhoto(byName.handle) { ok ->
+                        if (!done.isCompleted) done.complete(ok)
+                    }
+                }
+                val ok = withTimeoutOrNull(240_000L) { done.await() }
+                if (ok == null) {
+                    TransferCenter.markWaiting(record.id, "等待下一次连接继续")
+                }
+                if (!isConnected) break
+            }
+        }
+    }
+
     fun downloadPhoto(handle: Int, callback: (Boolean) -> Unit) {
         if (downloadingPhotoHandles.isNotEmpty() || isLoadingStorageFiles) return
         val ctx = appContext
@@ -1792,17 +2021,27 @@ class NikonViewModel : ViewModel() {
             return
         }
         val file = storageFiles.find { it.handle == handle }
+        val transferId = TransferCenter.enqueue(
+            file?.fileName ?: "相机照片_$handle",
+            file?.folder,
+            file?.sizeBytes ?: 0L
+        )
         if (file?.isDownloaded == true) {
+            TransferCenter.complete(transferId)
             callback(true)
             return
         }
         downloadingPhotoHandles = setOf(handle)
         storageDownloadMessage = "正在下载 ${file?.fileName ?: handle}，请保持连接"
+        TransferCenter.start(transferId, file?.sizeBytes ?: 0L)
         viewModelScope.launch(Dispatchers.IO) {
             addLogInner("📥 正在下载原图: ${file?.fileName ?: handle}...")
             try {
-                val photoBytes = ptpClient.downloadCameraPhoto(handle)
+                val photoBytes = ptpClient.downloadCameraPhoto(handle) { copied, total ->
+                    TransferCenter.progress(transferId, copied, total)
+                }
                 if (photoBytes == null || photoBytes.isEmpty()) {
+                    TransferCenter.fail(transferId, "相机未返回图片")
                     withContext(Dispatchers.Main) {
                         addLogInner("Failed to fetch original photo")
                         storageDownloadMessage = "下载失败：相机未返回图片，请检查连接后重试"
@@ -1830,6 +2069,7 @@ class NikonViewModel : ViewModel() {
                 }
 
                 check(saved) { failureReason ?: "照片处理或保存失败，未完成下载" }
+                TransferCenter.complete(transferId)
                 withContext(Dispatchers.Main) {
                     if (file != null) {
                         val idx = storageFiles.indexOf(file)
@@ -1842,6 +2082,7 @@ class NikonViewModel : ViewModel() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                TransferCenter.fail(transferId, e.message ?: "下载失败")
                 withContext(Dispatchers.Main) {
                     addLogInner("⚠️ 下载失败: ${file?.fileName ?: handle} (${e.message})")
                     storageDownloadMessage = "下载失败：${e.message ?: "请重试"}"
@@ -2291,35 +2532,17 @@ class NikonViewModel : ViewModel() {
                 imageSizeOptions = sizeOptions.map { (label, _) -> CameraOption(label, 0, 0) }
                 imageSizeRawByLabel = sizeOptions.toMap()
             }
-            exposureCompOptions = evDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(decodeExposureComp(it), it, desc.dataType) }
-            } ?: exposureCompOptions
-            meteringOptions = meteringDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(meteringLabel(it), it, desc.dataType) }
-            } ?: meteringOptions
+            enumOptions(evDesc, ::decodeExposureComp)?.let { exposureCompOptions = it }
+            enumOptions(meteringDesc, ::meteringLabel)?.let { meteringOptions = it }
             // 0xD061 是实际可写属性，档位用它；没有 0xD061 时才退回 0x500A（去掉仅视频可用的 AF-F）。
-            val standardFocusValues = focusDesc?.takeIf { it.isEnum }?.enumValues
-            val liveFocusValues = nikonFocusDesc?.takeIf { it.isEnum }?.enumValues
-            focusModeOptions = when {
-                liveFocusValues != null ->
-                    liveFocusValues.map { CameraOption(nikonFocusModeLabelOf(it), it, 0x0002) }
-                standardFocusValues != null ->
-                    standardFocusValues
-                        .filter { it != 0x8013L }
-                        .map { CameraOption(focusModeLabelOf(it), it, focusDesc!!.dataType) }
-                else -> focusModeOptions
-            }
+            val liveFocusOptions = enumOptions(nikonFocusDesc, ::nikonFocusModeLabelOf)
+            val standardFocusOptions = enumOptions(focusDesc, ::focusModeLabelOf)?.filter { it.raw != 0x8013L }
+            focusModeOptions = liveFocusOptions ?: standardFocusOptions ?: focusModeOptions
             // 0x500A 在 Z50II 的描述里是 writable=false；0xD061 writable=true，才是可真正下发的属性。
             focusModeWritable = nikonFocusDesc?.writable == true || focusModeOptions.isNotEmpty()
-            whiteBalanceOptions = wbDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(whiteBalanceLabel(it), it, desc.dataType) }
-            } ?: whiteBalanceOptions
-            exposureModeOptions = modeDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(exposureModeLabelOf(it), it, desc.dataType) }
-            } ?: exposureModeOptions
-            driveModeOptions = driveDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(driveModeLabel(it), it, desc.dataType) }
-            } ?: driveModeOptions
+            enumOptions(wbDesc, ::whiteBalanceLabel)?.let { whiteBalanceOptions = it }
+            enumOptions(modeDesc, ::exposureModeLabelOf)?.let { exposureModeOptions = it }
+            enumOptions(driveDesc, ::driveModeLabel)?.let { driveModeOptions = it }
             burstCountOptions = if (burstDesc != null && burstDesc.rangeMax > burstDesc.rangeMin) {
                 (burstDesc.rangeMin..minOf(burstDesc.rangeMax, 100L)).map {
                     CameraOption(if (it == 0L) "不限张数" else "$it 张", it, burstDesc.dataType)
@@ -2328,12 +2551,8 @@ class NikonViewModel : ViewModel() {
                 // Z 系部分固件只回当前值不回范围；低速 CL 仍可写 1—5 张
                 (1L..5L).map { CameraOption("$it 张", it, burstDesc.dataType) }
             } else burstCountOptions
-            afAreaModeOptions = (afAreaDesc ?: afAreaFallbackDesc)?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(afAreaLabel(it), it, desc.dataType) }
-            } ?: afAreaModeOptions
-            subjectDetectionOptions = subjectDesc?.takeIf { it.isEnum }?.let { desc ->
-                desc.enumValues.map { CameraOption(subjectLabel(it), it, desc.dataType) }
-            } ?: subjectDetectionOptions
+            enumOptions(afAreaDesc ?: afAreaFallbackDesc, ::afAreaLabel)?.let { afAreaModeOptions = it }
+            enumOptions(subjectDesc, ::subjectLabel)?.let { subjectDetectionOptions = it }
             val mergedExtras = LinkedHashMap<String, ExtraPropState>()
             for ((key, fresh) in extras) {
                 val old = extraProps[key]
@@ -2602,7 +2821,9 @@ class NikonViewModel : ViewModel() {
             if (desc != null) {
                 val value = extraLabel(key, desc.currentRaw)
                 val options = if (desc.isEnum) {
-                    desc.enumValues.map { CameraOption(extraLabel(key, it), it, desc.dataType) }
+                    desc.enumValues
+                        .map { CameraOption(extraLabel(key, it), it, desc.dataType) }
+                        .filter { !isUnlabeledOption(it.label) }
                 } else if (desc.rangeMax > desc.rangeMin) {
                     val step = desc.rangeStep.takeIf { it > 0 } ?: 1L
                     val count = (desc.rangeMax - desc.rangeMin) / step
@@ -2729,14 +2950,19 @@ class NikonViewModel : ViewModel() {
         else -> "未识别曝光模式"
     }
 
-    /** 0x5013 释放模式：档位值来自本机 Z50II 实测（1/2/32784/32785/32793/33039/33054）。 */
+    /**
+     * 0x5013 释放模式。
+     * 关键修正：C15 与 C30 的编码原先写反了。真机反证——App 选「C30」下发 0x810F，
+     * 相机屏幕显示的是 C15，说明 0x810F = C15；尼康是在原有 C30(0x8019) 之后追加的 C15，
+     * 所以这两个档位的值并不是按速度递增排列的。
+     */
     private fun driveModeLabel(raw: Long): String = when (raw) {
         0x0001L -> "单张拍摄"
         0x0002L -> "连拍"
         0x8000L + 0x10 -> "低速连拍 CL"
         0x8000L + 0x11 -> "高速连拍 CH"
-        0x8019L -> "C15 高速连拍"
-        0x810FL -> "C30 高速连拍"
+        0x8019L -> "C30 高速连拍"
+        0x810FL -> "C15 高速连拍"
         0x811EL -> "C60 高速连拍"
         else -> "释放模式 0x%04X".format(raw)
     }
@@ -2763,67 +2989,105 @@ class NikonViewModel : ViewModel() {
         else -> "侦测对象 0x%04X".format(raw)
     }
 
-    /** 下发白平衡 */
-    fun applyWhiteBalance(option: CameraOption) {
-        whiteBalance = option.label
+    /** 相机报了、但我们还翻不出来的枚举档位：宁可不列，也不要让用户点到「未知档位」。 */
+    private fun isUnlabeledOption(label: String): Boolean =
+        label.startsWith("未识别") || label.contains(" 0x") || label.startsWith("档位 ")
+
+    /**
+     * 由相机上报的枚举值生成选项列表。
+     * 只保留能翻译成真实档位名的项——列表里出现「未识别曝光模式 ×5」这种条目，
+     * 用户一点就落到机身另一个档位，正是「改了跟相机对不上」的观感来源之一。
+     */
+    private fun enumOptions(
+        desc: NikonPtpClient.PropDesc?,
+        labelOf: (Long) -> String
+    ): List<CameraOption>? {
+        if (desc == null || !desc.isEnum) return null
+        return desc.enumValues
+            .map { CameraOption(labelOf(it), it, desc.dataType) }
+            .filter { !isUnlabeledOption(it.label) }
+            .distinctBy { "${it.label}:${it.raw}" }
+    }
+
+    /** C 档（C15/C30/C60）在机身上有硬前置条件，不满足时机身会自己降档，这里把原因说清楚。 */
+    private fun hintDriveModeRestriction(label: String): String =
+        if (label.contains("C15") || label.contains("C30") || label.contains("C60"))
+            "（机身要求画质为 JPEG 标准、图像尺寸为「大」、释放模式拨盘在 c 档；不满足时它会自动降档）"
+        else "（机身当前画质/尺寸/拨盘档位限制了这一档）"
+
+    /**
+     * 下发枚举类属性，并**以机身回读值**为准刷新界面。
+     *
+     * 尼康经常出现「回了 OK 但存的不是这一档」「回 OK 但机身其实没改」：
+     * 只凭下发成功就更新界面，就会出现 App 显示 C30、相机屏幕显示 C15 这种错位。
+     * 所以写完必须读回该属性的当前值，界面一律显示相机真实存档；不一致时明确提示。
+     */
+    private fun applyEnumPropChecked(
+        propId: Int,
+        name: String,
+        option: CameraOption,
+        setLabel: (String) -> Unit,
+        labelOf: (Long) -> String
+    ) {
+        setLabel(option.label)
         if (!isConnected) return
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x5005.toShort(), option.dataType, option.raw)
+            val id = propId.toShort()
+            val ok = ptpClient.setPropRawValue(id, option.dataType, option.raw)
+            val actual = runCatching { descOrNull(propId)?.currentRaw }.getOrNull()
+                ?: runCatching { ptpClient.getPropRawValue(id, option.dataType) }.getOrNull()
             withContext(Dispatchers.Main) {
-                if (ok) addLogInner("白平衡已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("白平衡", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
+                when {
+                    actual != null -> {
+                        val shown = labelOf(actual)
+                        setLabel(shown)
+                        if (actual == option.raw) {
+                            addLogInner("$name 已生效：$shown")
+                        } else {
+                            // 回读值与请求值不同：显示按机身走，并告诉用户机身为什么没接受。
+                            val why = when (name) {
+                                "释放模式" -> hintDriveModeRestriction(option.label)
+                                else -> "（机身当前画质/尺寸/拨盘档位限制了这一档）"
+                            }
+                            lastParamMessage = "$name 未生效，机身当前是「$shown」$why"
+                            addLogInner("⚠️ $name 未生效：相机当前是「$shown」，不是「${option.label}」$why")
+                            com.lutcamera.lutcamerapro.log.DoukLog.w(
+                                "Prop", "SET_NOT_EFFECTIVE",
+                                "prop" to "0x%04X".format(propId),
+                                "want" to option.raw, "actual" to actual,
+                                "code" to "0x%04X".format(ptpClient.lastResponseCode)
+                            )
+                        }
+                    }
+                    ok -> addLogInner("$name 已下发：${option.label}（机身未回读）")
+                    else -> {
+                        addLogInner(propFailMessage(name, ptpClient.lastResponseCode))
+                        refreshCameraParams(silent = true)
+                    }
                 }
             }
         }
     }
 
+    /** 下发白平衡 */
+    fun applyWhiteBalance(option: CameraOption) {
+        applyEnumPropChecked(0x5005, "白平衡", option, { whiteBalance = it }, ::whiteBalanceLabel)
+    }
+
     /** 下发曝光模式（会改变机身 P/A/S/M 挡位） */
-    fun applyExposureMode(option: CameraOption) {        exposureModeLabel = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x500E.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("曝光模式已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("曝光模式", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+    fun applyExposureMode(option: CameraOption) {
+        applyEnumPropChecked(0x500E, "曝光模式", option, { exposureModeLabel = it }, ::exposureModeLabelOf)
     }
 
     /** 下发释放模式 */
     fun applyDriveMode(option: CameraOption) {
-        driveMode = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x5013.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("释放模式已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("释放模式", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(0x5013, "释放模式", option, { driveMode = it }, ::driveModeLabel)
     }
 
     /** 下发低速连拍张数（0x5018），只在释放模式为低速时有效 */
     fun applyBurstCount(option: CameraOption) {
-        burstCount = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x5018.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("连拍张数已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("连拍张数", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(0x5018, "连拍张数", option, { burstCount = it },
+            { if (it == 0L) "不限张数" else "$it 张" })
     }
 
     fun applyImageSize(option: CameraOption) {
@@ -2832,9 +3096,18 @@ class NikonViewModel : ViewModel() {
         if (!isConnected) return
         viewModelScope.launch(Dispatchers.IO) {
             val ok = ptpClient.setImageSize(raw)
+            // 0x5003 是 PTP 字符串，回读比对同样以机身为准
+            val actual = runCatching {
+                parseImageSizeString(ptpClient.getDevicePropValue(0x5003.toShort()))
+            }.getOrNull()
             withContext(Dispatchers.Main) {
-                if (ok) addLogInner("图像尺寸已下发: ${option.label}")
-                else {
+                if (actual != null && actual.isNotBlank()) {
+                    imageSizeLabel = actual
+                    if (formatImageSize(raw) == actual) addLogInner("图像尺寸已生效：$actual")
+                    else addLogInner("⚠️ 图像尺寸未生效：相机当前是「$actual」，不是「${option.label}」")
+                } else if (ok) {
+                    addLogInner("图像尺寸已下发：${option.label}（机身未回读）")
+                } else {
                     addLogInner(propFailMessage("图像尺寸", ptpClient.lastResponseCode))
                     refreshCameraParams(silent = true)
                 }
@@ -2888,33 +3161,11 @@ class NikonViewModel : ViewModel() {
     }
 
     fun applyAfAreaMode(option: CameraOption) {
-        afAreaMode = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(afAreaPropId.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("AF 区域模式已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("AF 区域模式", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(afAreaPropId, "AF 区域模式", option, { afAreaMode = it }, ::afAreaLabel)
     }
 
     fun applySubjectDetection(option: CameraOption) {
-        subjectDetection = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x1D005.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("拍摄对象侦测已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("拍摄对象侦测", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(0x1D005, "拍摄对象侦测", option, { subjectDetection = it }, ::subjectLabel)
     }
 
     private fun decodeExposureComp(raw: Long): String {
@@ -2976,33 +3227,11 @@ class NikonViewModel : ViewModel() {
 
     /** 下发曝光补偿（单位跟随相机上报的档位定义） */
     fun applyExposureComp(option: CameraOption) {
-        exposureComp = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x5010.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("曝光补偿已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("曝光补偿", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(0x5010, "曝光补偿", option, { exposureComp = it }, ::decodeExposureComp)
     }
 
     fun applyMeteringMode(option: CameraOption) {
-        meteringMode = option.label
-        if (!isConnected) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = ptpClient.setPropRawValue(0x500B.toShort(), option.dataType, option.raw)
-            withContext(Dispatchers.Main) {
-                if (ok) addLogInner("测光模式已下发: ${option.label}")
-                else {
-                    addLogInner(propFailMessage("测光模式", ptpClient.lastResponseCode))
-                    refreshCameraParams(silent = true)
-                }
-            }
-        }
+        applyEnumPropChecked(0x500B, "测光模式", option, { meteringMode = it }, ::meteringLabel)
     }
 
     fun applyFocusMode(option: CameraOption) {
@@ -3035,9 +3264,22 @@ class NikonViewModel : ViewModel() {
                     ok = ptpClient.setPropRawValue(0x500A.toShort(), 0x0004, standardRaw)
                 }
             }
+            // 以机身回读为准：对焦模式有两套编码（0xD061 的 0/1/4/5 和 0x500A 的 0x801x），
+            // 只凭返回码更新界面容易把没生效显示成生效。
+            val liveActual = runCatching { descOrNull(0xD061)?.currentRaw }.getOrNull()
+            val standardActual = runCatching { descOrNull(0x500A)?.currentRaw }.getOrNull()
             withContext(Dispatchers.Main) {
-                if (ok) addLogInner("对焦模式已下发: ${option.label}")
-                else {
+                val shown = liveActual?.let { nikonFocusModeLabelOf(it) }
+                    ?: standardActual?.let { focusModeLabelOf(it) }
+                val accepted = (liveRaw != null && liveActual == liveRaw) ||
+                    (standardRaw != null && standardActual == standardRaw)
+                if (shown != null) {
+                    focusModeLabel = shown
+                    if (accepted) addLogInner("对焦模式已生效：$shown")
+                    else addLogInner("⚠️ 对焦模式未生效：相机当前是「$shown」，不是「${option.label}」")
+                } else if (ok) {
+                    addLogInner("对焦模式已下发：${option.label}（机身未回读）")
+                } else {
                     addLogInner(propFailMessage("对焦模式", ptpClient.lastResponseCode))
                     refreshCameraParams(silent = true)
                 }

@@ -401,10 +401,15 @@ object DoukPrefs {
         get() = str("ignored_update_version", "")
         set(v) = putStr("ignored_update_version", v)
 
-    /** 上一次弹出月度赞赏提示的月份（yyyy-MM）；每个月只弹一次。 */
+    /** 上一次弹出月度赞赏提示的月份（yyyy-MM）；旧版本用，现仅作升级迁移判断。 */
     var lastSupportPromptMonth: String
         get() = str("last_support_prompt_month", "")
         set(v) = putStr("last_support_prompt_month", v)
+
+    /** 已经提示过赞赏的那次安装时间戳（PackageInfo.firstInstallTime）；同一安装只提示一次。 */
+    var supportPromptInstall: String
+        get() = str("support_prompt_install", "")
+        set(v) = putStr("support_prompt_install", v)
 
 
     // ===== 控制页参数排序 / 显示 =====

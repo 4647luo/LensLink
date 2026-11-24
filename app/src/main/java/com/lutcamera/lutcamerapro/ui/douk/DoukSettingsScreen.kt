@@ -288,8 +288,6 @@ fun DoukSettingsScreen(state: DoukState) {
     /** 下载二级页：null = 设置主页；"auto" = 自动下载；"locked" = 下载保护文件 */
     var downloadPage by remember { mutableStateOf<String?>(null) }
     var saveFormat by remember { mutableStateOf(DoukPrefs.saveFormat) }
-    // FTP 回传鉴权：相机 FTP 配置里用户名固定 nikon，密码填这串口令。
-    var ftpToken by remember { mutableStateOf(DoukPrefs.ftpToken) }
     // 图库默认打开来源：相机内 / 应用内 / 手机内
     var galleryDefault by remember { mutableStateOf(DoukPrefs.galleryDefaultSource) }
     var galleryPreload by remember { mutableStateOf(DoukPrefs.galleryCameraPreload) }
@@ -1906,16 +1904,6 @@ fun DoukSettingsScreen(state: DoukState) {
                         listOf("JPG", "RAW", "JPG + RAW", "全部格式"),
                         DoukPrefs.saveFormat
                     ) { v -> saveFormat = v; DoukPrefs.saveFormat = v }
-                }
-                SettingDivider()
-                SettingRow(
-                    title = "FTP 上传口令",
-                    subtitle = "相机 FTP 用户名填 nikon，密码填这串口令；点一下复制",
-                    value = ftpToken
-                ) {
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("连镜 FTP 口令", ftpToken))
-                    Toast.makeText(context, "FTP 口令已复制", Toast.LENGTH_SHORT).show()
                 }
             }
 

@@ -19,7 +19,6 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 熄屏后 CPU 仍要跑 BLE 回调与定位推送；前台服务本身不保证 CPU 不休眠 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- 用户主动点「后台保活」时申请系统电池优化白名单 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
@@ -28,10 +27,11 @@
 
     <!-- 4. 相册存储权限（Android 14 起支持「仅选中照片」的部分访问） -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <!-- 读取照片内 GPS/位置 EXIF；没有它 Android 会把相册文件的定位信息脱敏成 0 -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
     <!-- Android 12- 扫描 Wi-Fi 需要定位；蓝牙 GPS 推送在任何版本都需要精确定位 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -40,7 +40,8 @@
     <!-- 5. 蓝牙 GPS 推送（尼康「智能设备」模式） -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
@@ -50,7 +51,7 @@
 
     <application
         android:name=".DoukApplication"
-        android:usesCleartextTraffic="true"
+        android:usesCleartextTraffic="false"
         android:allowBackup="false"
         android:largeHeap="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

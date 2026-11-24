@@ -19,11 +19,25 @@
 | Jetpack Compose (BOM) | 2024.12.01 | Apache-2.0 |
 | AndroidX Navigation Compose | 2.7.7 | Apache-2.0 |
 | Haze (dev.chrisbanes.haze) | 1.2.0 | Apache-2.0 |
+| Coil (coil-compose / coil-base) | 2.6.0 | Apache-2.0 |
+| Telephoto (zoomable, zoomable-image, zoomable-image-coil) | 0.13.0 | Apache-2.0 |
+| Telephoto sub-sampling-image（随 zoomable-image 传递引入） | 0.13.0 | Apache-2.0 |
+| Molecule runtime（Telephoto 传递依赖） | 1.4.3 | Apache-2.0 |
+| Accompanist DrawablePainter（Telephoto 传递依赖） | 0.34.0 | Apache-2.0 |
 | Material Icons Extended | Compose BOM | Apache-2.0 |
+| LibRaw | 0.23.0 Snapshot202611 | CDDL-1.0（本项目选择）或 LGPL-2.1 |
+
+LibRaw 以源码形式随工程编译（`app/src/main/cpp/libraw/`），包含 `nikonhe.cpp` 对尼康 Z50II HE/HE★ NEF 的解码支持。许可原文见同目录 `LICENSE.CDDL`、`LICENSE.LGPL` 与 `COPYRIGHT`。上游：https://github.com/LibRaw/LibRaw
 
 Test-only: JUnit 4.13.2 (EPL-1.0), AndroidX Test JUnit 1.3.0, Espresso 3.7.0 (Apache-2.0). They are not shipped as application features.
 
 Apache-2.0 license text: https://www.apache.org/licenses/LICENSE-2.0
+
+### 1.1 Coil / Telephoto 使用说明
+
+- Coil 用于图库缩略图的解码与内存缓存（`ui/douk/GalleryThumbs.kt`），内存缓存按进程堆 15% 封顶，不写磁盘缓存；Coil 的 API 以 Gradle 依赖形式引用，**未修改其源码**。
+- Telephoto 用于「细节查看」页的平移缩放（`ui/douk/ImageDetailScreen.kt`），同样以 Gradle 依赖引用，未修改源码；当前版本内**未启用**其 `sub-sampling` 分块渲染路径。
+- 两者均为 Apache-2.0，保留原作者版权与许可声明；本项目未使用其项目名称、Logo 或图标作为自身品牌。
 
 ## 2. Protocol research references / 协议研究参考
 
@@ -48,3 +62,20 @@ The following public projects were consulted for protocol facts (UUIDs, operatio
 ## 4. Trademarks / 商标
 
 Nikon、Nikon Z 等名称与标识归尼康株式会社所有，仅用于说明兼容的相机型号。连镜是**非官方**第三方应用，与尼康株式会社没有任何关联、隶属、授权、赞助或背书关系。
+
+## 5. Review-only, not bundled / 仅评估参考，未打包
+
+以下项目在选型阶段被评估过，但**没有**任何源码、资源、二进制或模型权重进入本应用。列入此节是为了记录结论，避免后续误以为已经接入。
+
+| Project | License | Decision |
+| --- | --- | --- |
+| LightCraft（artcraft-android） | 主仓库 MIT OR Apache-2.0，但内含非 OSI 的 SAM3 权重、GPL-3.0 降噪模型、OFL 字体、非开源品牌资产 | 只参考页面结构与交互；未复制源码/字体/Logo/权重 |
+| AndroidX Media3 | Apache-2.0 | 暂缓：需要 compileSdk 35/36 构建链，等升级后再评估视频编辑 |
+| ClearCut | MIT | 只参考视频管线与导出校验思路；若未来借用代码片段，须在此处补 MIT 版权声明 |
+| gpupixel | Apache-2.0 | 计划仅作为滤镜/美颜效果层接入，不接 RAW 解码与显影主链路；本轮未接入 |
+| libultrahdr | MIT OR Apache-2.0 | 计划用于替换手写 MPF/GainMap 容器；本轮未接入，需先完成 NDK 交叉编译与 JNI 封装 |
+| CapCraft | AGPL-3.0 | 仅看架构，未复制代码 |
+| RawTherapee / darktable | GPL-3.0 | 仅参考调色与 RAW 处理思路，未复制代码 |
+| libgphoto2android | CC-BY-4.0（非标准软件许可） | 仅作交叉编译参考 |
+| camera-connect-sdk | 仓库根目录无 LICENSE（视为保留全部权利） | 仅参考 |
+

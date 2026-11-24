@@ -38,8 +38,6 @@ fun SettingsScreen(
     val context = LocalContext.current
     val apple = AppleTheme.colors
     val isDark by AppThemeManager.isDarkMode.collectAsState()
-    val clipboard = LocalClipboardManager.current
-    val ftpToken = remember { DoukPrefs.ftpToken }
 
     var showNikonIpDialog by remember { mutableStateOf(false) }
     var nikonIpEditText by remember { mutableStateOf(viewModel.nikonIp) }
@@ -204,35 +202,6 @@ fun SettingsScreen(
                     onCheckedChange = { viewModel.setAutoApplyBorder(it) },
                     colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = apple.accent)
                 )
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-            Divider(color = apple.border, thickness = 1.dp)
-            Spacer(modifier = Modifier.height(10.dp))
-
-            // FTP 回传口令：相机 FTP 配置的用户名填 nikon，密码填这串 8 位口令。
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                    SettingIconBadge(icon = Icons.Default.Lock, color = apple.accent)
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text("FTP 上传口令", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = apple.textPrimary)
-                        Text("相机 FTP 用户名填 nikon，密码填这串口令", fontSize = 11.sp, color = apple.textSecondary)
-                        Text(ftpToken, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold, color = apple.accent)
-                    }
-                }
-                IconButton(
-                    onClick = {
-                        clipboard.setText(AnnotatedString(ftpToken))
-                        Toast.makeText(context, "FTP 口令已复制", Toast.LENGTH_SHORT).show()
-                    }
-                ) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = "复制 FTP 口令", tint = apple.accent)
-                }
             }
         }
 

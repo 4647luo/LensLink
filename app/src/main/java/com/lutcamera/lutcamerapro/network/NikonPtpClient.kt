@@ -303,7 +303,7 @@ class NikonPtpClient {
                     "ops" to device.operations.joinToString(",") { "0x" + it.toString(16) })
                 listener?.onLog("相机 ${device.model}，固件 ${device.firmware}，上报 ${device.operations.size} 个命令和 ${device.properties.size} 个属性")
 
-                // 尼康 Z 系列（二代/三代机）连上后必须先发 ChangeApplicationMode(0x9435, p1=1)
+                // 尼康 Z 系列机型连上后必须先发 ChangeApplicationMode(0x9435, p1=1)
                 // 才会把相机从受限保护态切到"应用控制"模式。不发这条，相机只公布
                 // 0x952b/0x935a 这类最小命令集，看起来像「待配对」，其实是没被授权。
                 var unlockCode = -1

@@ -1,40 +1,50 @@
 package com.lutcamera.lutcamerapro.network
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.util.Log
 import com.lutcamera.lutcamerapro.gpu.ImageAutoProcessor
 import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.model.BorderState
+import com.lutcamera.lutcamerapro.ui.douk.DoukPrefs
 import com.lutcamera.lutcamerapro.ui.screens.connect.wired.SaveMode
+import com.lutcamera.lutcamerapro.util.BoundedIo
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 
 /**
- * 🚀 极速照片回传通道：手搓微型 FTP 服务器
- * 配合尼康相机的“FTP 上传”功能，实现按下快门，照片瞬间推送到手机
- * 支持 AP 直连模式与 STA 局域网模式，支持自动解析 PASV IP 与多图片并发接收 */
+ * 照片回传通道：手搓微型 FTP 服务器。
+ *
+ * 安全约束：
+ * - 不再是匿名 FTP：相机 FTP 配置里的密码必须等于设置页显示的 8 位口令；
+ * - 控制连接和数据连接都尽量只绑当前 Wi‑Fi 本机地址；
+ * - 上传先落到 cache/ftp-incoming 临时文件，不再把 200MB 读进 ByteArray；
+ * - 单文件 200MB、并发 2 个、临时目录最多 500MB / 32 个文件。
+ */
 object FtpPushReceiver {
     private const val TAG = "FtpPushReceiver"
-    /** 单张照片/视频上限：防止匿名 FTP 被用来塞超大文件把内存打爆。 */
-    private const val MAX_UPLOAD_BYTES = 200L * 1024 * 1024
+    private const val MAX_UPLOAD_BYTES = BoundedIo.MAX_FTP_BYTES
+    private const val MAX_INCOMING_TOTAL_BYTES = 500L * 1024 * 1024
+    private const val MAX_INCOMING_FILES = 32
+    private const val MAX_EVENTS_PER_CLIENT = 512
+    private const val MAX_AUTH_FAILURES = 3
+
     private var cmdServer: ServerSocket? = null
     private var serverJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    // 停止服务时主动关掉已接入的控制/数据 socket，而不是只取消协程等对端超时。
     private val clientSockets = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val dataSockets = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     private val dataServers = Collections.newSetFromMap(ConcurrentHashMap<ServerSocket, Boolean>())
+    private val uploadSlots = Semaphore(2, true)
 
     private val _isRunning = MutableStateFlow(false)
     val isRunning = _isRunning.asStateFlow()
@@ -42,38 +52,55 @@ object FtpPushReceiver {
     private val _receivedCount = MutableStateFlow(0)
     val receivedCount = _receivedCount.asStateFlow()
 
-    // 回传照片的原始数据流全局回调 (fileName, jpegBytes)
-                var onPhotoReceived: ((fileName: String, jpegBytes: ByteArray) -> Unit)? = null
+    /**
+     * 收到一张已经落盘的相机 JPEG。回调方拥有这个临时文件的所有权：
+     * 必须把它移进 PhotoInbox 或处理完删除，不能直接丢掉引用。
+     */
+    var onPhotoFileReceived: ((fileName: String, file: File) -> Unit)? = null
 
-    // 自动化流水线配置
-                var autoApplyLut: Boolean = true
+    // 自动化流水线配置（只有在没有 onPhotoFileReceived 时才会直接处理）
+    var autoApplyLut: Boolean = true
     var autoApplyBorder: Boolean = false
     var currentLut: LutData? = null
     var intensity: Float = 1.0f
     var saveMode: SaveMode = SaveMode.DUAL
     var borderState: BorderState = BorderState()
+
     private var appContext: Context? = null
+    private var ftpToken: String = ""
     private var onProcessedCallback: ((String) -> Unit)? = null
 
+    /** 在 Application 启动时调用，确保即使没连相机也能拿到当前口令。 */
+    fun init(context: Context) {
+        appContext = context.applicationContext
+        ftpToken = DoukPrefs.ftpToken
+    }
+
     /**
-     * 启动 FTP 监听 (默认端口 2121，避开 Android 低端口权限问题)
+     * 启动 FTP 监听（默认端口 2121，避开 Android 低端口权限问题）。
      */
     fun startReceiver(port: Int = 2121) {
         if (_isRunning.value) return
+        val token = ftpToken.ifBlank { DoukPrefs.ftpToken }
+        if (token.isBlank()) {
+            Log.e(TAG, "FTP 未启动：缺少上传口令")
+            return
+        }
+        ftpToken = token
+        appContext?.let { trimIncoming(it) }
         _isRunning.value = true
 
         serverJob = scope.launch {
             try {
-                // 尽量只监听当前 Wi‑Fi/热点这块网卡，不要把所有网卡都暴露成匿名 FTP。
                 val localIp = runCatching { NetworkUtils.getLocalIpv4Address() }.getOrNull()
                     ?.takeIf { it.isNotBlank() && it != "0.0.0.0" && it != "127.0.0.1" }
                 cmdServer = ServerSocket().apply {
                     reuseAddress = true
-                    try {
-                        if (localIp != null) bind(InetSocketAddress(localIp, port))
-                        else bind(InetSocketAddress(port))
-                    } catch (e: Exception) {
-                        Log.w(TAG, "绑定 $localIp:$port 失败，回退到默认网卡: ${e.message}")
+                    if (localIp != null) {
+                        bind(InetSocketAddress(localIp, port))
+                    } else {
+                        // 拿不到本机 Wi‑Fi IP 时仍要能用，但此时已有口令校验兜底。
+                        Log.w(TAG, "未取到本机 Wi‑Fi IP，控制连接回退到默认网卡")
                         bind(InetSocketAddress(port))
                     }
                 }
@@ -91,9 +118,7 @@ object FtpPushReceiver {
                     }
                 }
             } catch (e: Exception) {
-                if (_isRunning.value) {
-                    Log.e(TAG, "FTP 监听服务异常", e)
-                }
+                if (_isRunning.value) Log.e(TAG, "FTP 监听服务异常", e)
             } finally {
                 _isRunning.value = false
             }
@@ -101,7 +126,7 @@ object FtpPushReceiver {
     }
 
     /**
-     * 开启自动化处理管道
+     * 开启自动化处理管道。
      */
     fun startListening(
         context: Context,
@@ -111,7 +136,8 @@ object FtpPushReceiver {
         onPhotoProcessed: (String) -> Unit,
         port: Int = 2121
     ) {
-        this.appContext = context.applicationContext
+        appContext = context.applicationContext
+        ftpToken = DoukPrefs.ftpToken
         this.currentLut = currentLut
         this.intensity = intensity
         this.autoApplyLut = autoApplyLut
@@ -127,11 +153,8 @@ object FtpPushReceiver {
         _isRunning.value = false
         serverJob?.cancel()
         serverJob = null
-        try {
-            cmdServer?.close()
-        } catch (e: Exception) {}
+        runCatching { cmdServer?.close() }
         cmdServer = null
-        // 不主动断开已经接入的客户端，取消协程后它们会一直挂到 readLine/readBytes 超时。
         dataServers.toList().forEach { runCatching { it.close() } }
         dataServers.clear()
         dataSockets.toList().forEach { runCatching { it.close() } }
@@ -142,122 +165,182 @@ object FtpPushReceiver {
     }
 
     private suspend fun handleCameraClient(client: Socket) = withContext(Dispatchers.IO) {
-        var currentFileName = "CAMERA_${System.currentTimeMillis()}.JPG"
+        val context = appContext
         try {
-            // 控制连接 30 秒没有新命令就释放，避免异常断开的相机 socket 长期占着线程。
             client.soTimeout = 30_000
             val reader = client.inputStream.bufferedReader()
             val writer = client.outputStream.bufferedWriter()
             var dataServer: ServerSocket? = null
+            var authenticated = false
+            var authFailures = 0
+            var events = 0
 
             fun reply(code: String) {
-                try {
+                runCatching {
                     writer.write("$code\r\n")
                     writer.flush()
-                } catch (e: Exception) {
-                    Log.w(TAG, "发送响应失败: $code")
-                }
+                }.onFailure { Log.w(TAG, "发送响应失败: $code") }
             }
 
-            // 1. 尼康连入，发送欢迎语
-                reply("220 Welcome to LutCameraPro Pro FTP Server")
+            fun requireAuth(): Boolean {
+                if (authenticated) return true
+                reply("530 Please login with USER and PASS")
+                return false
+            }
 
-            while (isActive && _isRunning.value && !client.isClosed) {
+            reply("220 Welcome to LianJing FTP Server")
+
+            while (isActive && _isRunning.value && !client.isClosed && events < MAX_EVENTS_PER_CLIENT) {
                 val line = reader.readLine() ?: break
+                if (line.length > 512) {
+                    reply("500 Command line too long")
+                    break
+                }
                 val trimmed = line.trim()
                 if (trimmed.isEmpty()) continue
+                events++
 
                 val parts = trimmed.split(" ", limit = 2)
                 val cmd = parts[0].uppercase()
                 val arg = if (parts.size > 1) parts[1] else ""
 
                 when (cmd) {
-                    "USER" -> reply("331 Anonymous access allowed")
-                    "PASS" -> reply("230 User logged in successfully")
-                    "SYST" -> reply("215 UNIX Type: L8")
-                    "PWD" -> reply("257 \"/\" is current directory")
-                    "TYPE" -> reply("200 Type set to I (Binary)")
-                    "PORT" -> reply("200 PORT command successful")
+                    "USER" -> reply("331 Password required")
+                    "PASS" -> {
+                        if (arg == ftpToken) {
+                            authenticated = true
+                            reply("230 User logged in successfully")
+                        } else {
+                            authFailures++
+                            delay(500)
+                            reply("530 Authentication failed")
+                            if (authFailures >= MAX_AUTH_FAILURES) break
+                        }
+                    }
+                    "SYST" -> if (requireAuth()) reply("215 UNIX Type: L8")
+                    "PWD" -> if (requireAuth()) reply("257 \"/\" is current directory")
+                    "TYPE" -> if (requireAuth()) reply("200 Type set to I (Binary)")
+                    "PORT" -> if (requireAuth()) reply("200 PORT command successful")
                     "PASV" -> {
-                        // 被动模式：开辟随机端口接收图片流
-                dataServer?.let { old -> dataServers.remove(old); runCatching { old.close() } }
-                        dataServer = ServerSocket(0).apply { reuseAddress = true }
-                        dataServers.add(dataServer!!)
-                        val server = dataServer!!
+                        if (!requireAuth()) continue
+                        dataServer?.let { old -> dataServers.remove(old); runCatching { old.close() } }
+                        val localIp = client.localAddress?.hostAddress
+                            ?.takeIf { it != "0.0.0.0" && it != "127.0.0.1" }
+                            ?: NetworkUtils.getLocalIpv4Address()
+                        val server = runCatching {
+                            ServerSocket(0, 1, InetAddress.getByName(localIp))
+                        }.getOrElse {
+                            Log.w(TAG, "PASV 绑定 $localIp 失败，回退到默认网卡: ${it.message}")
+                            ServerSocket(0)
+                        }.apply { reuseAddress = true }
+                        dataServer = server
+                        dataServers.add(server)
                         val localPort = server.localPort
-
-                        // 智能获取对外通信的真实 IP
-                val localIp = client.localAddress?.hostAddress?.let { ip ->
-                            if (ip == "0.0.0.0" || ip == "127.0.0.1") NetworkUtils.getLocalIpv4Address() else ip
-                        } ?: NetworkUtils.getLocalIpv4Address()
-
                         val formattedIp = localIp.replace('.', ',')
                         val p1 = localPort / 256
                         val p2 = localPort % 256
                         reply("227 Entering Passive Mode ($formattedIp,$p1,$p2)")
                     }
                     "STOR" -> {
-                        // 🌟 核心：相机开始推送照片
-                val rawName = if (arg.isNotBlank()) arg.substringAfterLast('/').substringAfterLast('\\') else "IMG_${System.currentTimeMillis()}.JPG"
-                        val filename = rawName.take(120).ifBlank { "IMG_${System.currentTimeMillis()}.JPG" }
-                        currentFileName = filename
-                        reply("150 Opening BINARY mode data connection for $filename")
+                        if (!requireAuth()) continue
+                        if (!uploadSlots.tryAcquire()) {
+                            reply("450 Too many concurrent uploads")
+                            continue
+                        }
+                        try {
+                            val rawName = if (arg.isNotBlank()) {
+                                arg.substringAfterLast('/').substringAfterLast('\\')
+                            } else "IMG_${System.currentTimeMillis()}.JPG"
+                            val filename = rawName.take(120).ifBlank {
+                                "IMG_${System.currentTimeMillis()}.JPG"
+                            }
+                            if (!filename.endsWith(".jpg", true) && !filename.endsWith(".jpeg", true)) {
+                                reply("550 Only JPEG uploads are accepted")
+                                continue
+                            }
+                            reply("150 Opening BINARY mode data connection for $filename")
 
-                        val server = dataServer
-                        var imageBytes: ByteArray? = null
-                        if (server != null) {
+                            val server = dataServer
+                            if (server == null) {
+                                reply("425 Use PASV first")
+                                continue
+                            }
+                            val incoming = context?.let {
+                                File(it.cacheDir, "ftp-incoming").apply { mkdirs() }
+                            }
+                            if (incoming == null) {
+                                reply("451 Storage unavailable")
+                                continue
+                            }
+                            trimIncoming(context)
+                            val temp = File(incoming, "ftp-${System.nanoTime()}.part")
+                            var copied = 0L
                             var dataSocket: Socket? = null
                             try {
-                                server.soTimeout = 15000
+                                server.soTimeout = 15_000
                                 dataSocket = server.accept()
                                 dataSockets.add(dataSocket)
-                                dataSocket.soTimeout = 20000
-                                imageBytes = readLimited(dataSocket.inputStream, MAX_UPLOAD_BYTES)
+                                dataSocket.soTimeout = 20_000
+                                copied = temp.outputStream().use { output ->
+                                    BoundedIo.copyWithLimit(dataSocket.inputStream, output, MAX_UPLOAD_BYTES)
+                                }
                             } catch (e: Exception) {
                                 Log.e(TAG, "接收图片数据流超时或异常", e)
+                                temp.delete()
+                                reply("426 Transfer aborted")
+                                continue
                             } finally {
                                 dataSocket?.let { dataSockets.remove(it); runCatching { it.close() } }
                                 dataServers.remove(server)
-                                server.close()
+                                runCatching { server.close() }
                                 dataServer = null
                             }
-                        }
 
-                        reply("226 Transfer complete")
-
-                        // 收到照片数据
-                        if (imageBytes != null && imageBytes.isNotEmpty()) {
-                            _receivedCount.value += 1
-                            Log.d(TAG, "📸 成功接收相机照片: $currentFileName, 大小: ${imageBytes.size / 1024} KB")
-
-                            // 1. 回调给业务监听
-                            withContext(Dispatchers.Main) {
-                                onPhotoReceived?.invoke(currentFileName, imageBytes)
+                            if (copied <= 0L) {
+                                temp.delete()
+                                reply("550 Empty upload")
+                                continue
                             }
+                            reply("226 Transfer complete")
+                            _receivedCount.value += 1
+                            Log.d(TAG, "📸 成功接收相机照片: $filename, 大小: ${copied / 1024} KB")
 
-                            // 2. 如果开启了自动化流水线，执行自动渲染与保存
-                            val ctx = appContext
-                            if (ctx != null) {
+                            val callback = onPhotoFileReceived
+                            if (callback != null) {
+                                try {
+                                    withContext(Dispatchers.Main) { callback(filename, temp) }
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "照片移交失败", e)
+                                    temp.delete()
+                                }
+                            } else if (context != null) {
                                 scope.launch(Dispatchers.IO) {
-                                    ByteArrayInputStream(imageBytes).use { stream ->
-                                        val ok = ImageAutoProcessor.processIncomingCameraPhoto(
-                                            context = ctx,
-                                            imageStream = stream,
-                                            currentLut = currentLut,
-                                            intensity = intensity,
-                                            autoApplyLut = autoApplyLut,
-                                            autoApplyBorder = autoApplyBorder,
-                                            saveMode = saveMode,
-                                            borderState = borderState
-                                        )
-                                        if (ok) {
-                                            withContext(Dispatchers.Main) {
-                                                onProcessedCallback?.invoke(currentFileName)
+                                    try {
+                                        temp.inputStream().use { stream ->
+                                            val ok = ImageAutoProcessor.processIncomingCameraPhoto(
+                                                context = context,
+                                                imageStream = stream,
+                                                currentLut = currentLut,
+                                                intensity = intensity,
+                                                autoApplyLut = autoApplyLut,
+                                                autoApplyBorder = autoApplyBorder,
+                                                saveMode = saveMode,
+                                                borderState = borderState,
+                                                sourceFileName = filename
+                                            )
+                                            if (ok) withContext(Dispatchers.Main) {
+                                                onProcessedCallback?.invoke(filename)
                                             }
                                         }
+                                    } finally {
+                                        temp.delete()
                                     }
                                 }
+                            } else {
+                                temp.delete()
                             }
+                        } finally {
+                            uploadSlots.release()
                         }
                     }
                     "QUIT" -> {
@@ -265,7 +348,7 @@ object FtpPushReceiver {
                         break
                     }
                     "NOOP" -> reply("200 OK")
-                    "FEAT" -> {
+                    "FEAT" -> if (requireAuth()) {
                         writer.write("211-Features:\r\n PASV\r\n SIZE\r\n UTF8\r\n211 End\r\n")
                         writer.flush()
                     }
@@ -279,19 +362,21 @@ object FtpPushReceiver {
         }
     }
 
-    /** 有上限地读取数据流：超过上限直接中断，绝不把整个 socket 无限制读进 ByteArray。 */
-    private fun readLimited(input: java.io.InputStream, maxBytes: Long): ByteArray {
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(64 * 1024)
-        var total = 0L
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            total += read
-            if (total > maxBytes) throw IOException("FTP 文件超过上限 ${maxBytes / 1024 / 1024}MB")
-            out.write(buffer, 0, read)
+    /**
+     * 临时目录配额：先删 1 小时前的残留，再按最旧优先删到 500MB / 32 个以内。
+     * 只处理 ftp-*.part，不碰 PhotoInbox 或导出目录。
+     */
+    private fun trimIncoming(context: Context?) {
+        val dir = context?.let { File(it.cacheDir, "ftp-incoming") } ?: return
+        val files = dir.listFiles()?.filter { it.isFile && it.name.startsWith("ftp-") } ?: return
+        val cutoff = System.currentTimeMillis() - 60L * 60 * 1000
+        files.filter { it.lastModified() < cutoff }.forEach { runCatching { it.delete() } }
+        var remaining = files.filter { it.exists() }.sortedBy { it.lastModified() }.toMutableList()
+        var total = remaining.sumOf { it.length() }
+        while (remaining.size > MAX_INCOMING_FILES || total > MAX_INCOMING_TOTAL_BYTES) {
+            val oldest = remaining.removeFirstOrNull() ?: break
+            total -= oldest.length()
+            runCatching { oldest.delete() }
         }
-        return out.toByteArray()
     }
 }
-

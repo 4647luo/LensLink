@@ -25,6 +25,7 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import com.lutcamera.lutcamerapro.ui.douk.DoukPrefs
 import kotlinx.coroutines.CoroutineScope
@@ -373,8 +374,9 @@ class NikonBleGpsClient(private val context: Context) {
     }
 
     /**
-     * TIME 心跳轨：READY 后立刻发第一拍，之后每 1.5 秒一拍（对齐 HarmoNiLink 前景节奏）。
-     * 之前只在 GEO 成功后才校时，第一次 GEO 永远没有 TIME 打底，相机会一直回 128。
+     * TIME 心跳轨：READY 后立刻发第一拍保活，之后每 4 秒一拍。
+     * 握手/状态注入阶段用 HIGH 连接优先级，进入 READY 后切 LOW_POWER，
+     * 由 4 秒心跳承担保活，不再每 1.5 秒唤醒一次相机和手机射频。
      */
     private fun startTimeKeepAlive() {
         timeKeepAliveJob?.cancel()
@@ -382,7 +384,11 @@ class NikonBleGpsClient(private val context: Context) {
             delay(250)
             while (_phase.value == Phase.READY && !geoRecovering && !repairingBond) {
                 sendTimeHeartbeat("周期心跳")
-                delay(1500)
+                // 亮屏时 4 秒一次保证参数/取景响应；熄屏后拉长到 10 秒，
+                // BLE 只做低功耗保活，避免口袋里边每 1.5 秒唤醒一次射频。
+                val screenOn = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                    ?.isInteractive == true
+                delay(if (screenOn) 4_000L else 10_000L)
             }
         }
     }
@@ -1484,6 +1490,15 @@ class NikonBleGpsClient(private val context: Context) {
                 .apply()
         }
         log("就绪：可以开始推送 GPS")
+        // 握手/状态注入已完成，BLE 只保留「低频状态心跳 + 保活」职责。
+        // 立刻申请 LOW_POWER 连接间隔，避免相机和手机射频维持高刷新率持续耗电。
+        runCatching {
+            gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER)
+        }.onSuccess {
+            log("BLE 已切换 LOW_POWER 连接优先级，进入低功耗保活")
+        }.onFailure {
+            log("BLE 低功耗优先级切换失败：${it.message}")
+        }
         rememberThisCamera()
         readyAt = System.currentTimeMillis()
         // 先把 TIME 心跳轨拉起来：相机 GPS 会话靠它保活，GEO 不能抢在它前面。

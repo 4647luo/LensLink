@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.SystemClock
 import com.lutcamera.lutcamerapro.log.Log
@@ -203,9 +204,19 @@ class NikonPtpClient {
         DoukLog.i("NikonPtp", "IDENTITY", "hostGuid" to hostGuid.toString(), "mode" to mode, "target" to cameraIp)
         watchJob = scope.launch {
             var own: Connection? = null
+            // VPN 存在时，进程默认网络会被 tun 接管；socket 级绑定在部分 ROM 上会被忽略。
+            // 这里把「进程默认网络 = 相机 Wi-Fi」保持到握手完成，再恢复，覆盖建 socket 和 connect 两段。
+            val cm = context?.applicationContext
+                ?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val vpnNow = vpnActive(context)
+            var processBound = false
             try {
                 context?.let { recorder(it).note("BEGIN mode=$mode target=$cameraIp:$PTP_PORT generation=$token\n${environment(it)}") }
                 DoukLog.i("NikonPtp", "CONNECT_BEGIN", "mode" to mode, "target" to "$cameraIp:$PTP_PORT")
+                if (vpnActive(context)) {
+                    DoukLog.w("NikonPtp", "VPN_ACTIVE", "target" to cameraIp)
+                    listener?.onLog("检测到 VPN / 代理正在接管网络，相机热点的包可能发不出去；连不上请先关闭 VPN，或把「连镜」加入该 VPN 的分应用直连名单")
+                }
                 require(cameraIp.matches(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) &&
                     cameraIp.split('.').all { it.toInt() in 0..255 }) { "请输入相机的 IPv4 地址" }
                 // AP 直连时不能只认 192.168.1.1：不同机身/固件的热点网段不一样
@@ -236,11 +247,22 @@ class NikonPtpClient {
                     listener?.onLog("当前 Wi-Fi 能访问互联网，可能是家用路由器。相机热点模式请先连接机身显示的 Wi-Fi，再连接相机地址。")
                     trace?.note("AP_NETWORK_WARNING ${route.describe()} target=$targetIp may be a router")
                 }
-                val commandSocket = route.network?.socketFactory?.createSocket() ?: Socket()
-                val eventSocket = route.network?.socketFactory?.createSocket() ?: Socket()
+                // 开着 VPN / 双网加速时，即使 socketFactory 指定了 Wi-Fi 网络，部分 ROM 仍会把包
+                // 塞进 tun 网卡（日志里本机出口会显示 172.17.x.x）。这里把「进程默认网络」临时指向
+                // 相机 Wi-Fi，并保持到握手结束才恢复（只覆盖建 socket + connect 这两段）。
+                val needProcessBind = route.network != null && cm != null && vpnNow
+                if (needProcessBind) {
+                    val ok = runCatching { cm?.bindProcessToNetwork(route.network) }.getOrNull() == true
+                    processBound = ok
+                    DoukLog.i("NikonPtp", "PROCESS_BIND", "target" to targetIp, "ok" to ok)
+                }
+                val commandSocket = openCameraSocket(route.network)
+                val eventSocket = openCameraSocket(route.network)
                 route.pinnedLocalIp?.let { ip ->
                     runCatching { commandSocket.bind(InetSocketAddress(ip, 0)) }
+                        .onFailure { DoukLog.w("NikonPtp", "PIN_FAIL", "socket" to "command", "ip" to ip, "error" to (it.message ?: it::class.java.simpleName)) }
                     runCatching { eventSocket.bind(InetSocketAddress(ip, 0)) }
+                        .onFailure { DoukLog.w("NikonPtp", "PIN_FAIL", "socket" to "event", "ip" to ip, "error" to (it.message ?: it::class.java.simpleName)) }
                 }
                 DoukLog.i("NikonPtp", "NET_ROUTE", "target" to targetIp, "route" to route.describe())
                 if (route.source == CameraRouteResolver.Route.Source.REQUESTED_NETWORK) {
@@ -400,9 +422,19 @@ class NikonPtpClient {
                     synchronized(lifecycle) {
                         if (generation == token) {
                             val onCameraNet = context?.let { CameraLanProbe.localIpForSubnet(cameraIp) }
+                            val usedLocal = own?.command?.localSocketAddress?.let {
+                                (it as? java.net.InetSocketAddress)?.address?.hostAddress
+                            }
+                            // 包从别的网卡发出去了（例如 VPN 的 172.17.x.x），相机根本收不到
+                            val wentOffSubnet = usedLocal != null && onCameraNet == null
+                            val vpn = vpnActive(context)
                             val friendly = when {
                                 e is java.net.SocketTimeoutException ->
                                     "相机端口可达但 PTP/IP 握手无响应：请先在相机上断开 SnapBridge/旧设备，重新进入「连接至智能设备」后再试"
+                                wentOffSubnet && vpn ->
+                                    "流量被 VPN 接管了（本机出口 $usedLocal），相机的连接包发不到。请在系统设置里关闭 VPN / 代理，或把「连镜」加入该 VPN 的分应用直连名单后重试"
+                                wentOffSubnet ->
+                                    "流量走了非 Wi-Fi 网卡（本机出口 $usedLocal），相机 192.168.1.x 收不到。请关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试"
                                 e is java.net.ConnectException && onCameraNet == null ->
                                     "手机不在相机网段（本机 ${CameraLanProbe.localNetworkSummary()}，相机 $cameraIp）。请确认已连上相机显示的 Wi-Fi 热点，并关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试；若相机 Wi-Fi 已自动关闭，请在相机上重新进入「连接至智能设备 → Wi-Fi 连接」"
                                 e is java.net.ConnectException ->
@@ -411,7 +443,8 @@ class NikonPtpClient {
                             }
                             DoukLog.e("NikonPtp", "CONNECT_FAIL", "stage" to _connectionStage.value,
                                 "error" to (e.message ?: e::class.java.simpleName), "type" to e::class.java.simpleName,
-                                "onCameraNet" to (onCameraNet ?: "-"),
+                                "onCameraNet" to (onCameraNet ?: "-"), "usedLocal" to (usedLocal ?: "-"),
+                                "vpn" to vpn,
                                 "localNets" to CameraLanProbe.localNetworkSummary())
                             _connectionStage.value = "连接失败：$friendly"
                             _isConnected.value = false
@@ -420,8 +453,41 @@ class NikonPtpClient {
                         }
                     }
                 }
+            } finally {
+                // 无论成功、失败还是取消，都要把进程默认网络恢复，避免影响更新检查、FTP 等其它网络行为。
+                if (processBound) {
+                    runCatching { cm?.bindProcessToNetwork(null) }
+                    DoukLog.i("NikonPtp", "PROCESS_BIND_RESTORE", "target" to cameraIp)
+                }
             }
         }
+    }
+
+    /**
+     * 建 socket 时显式绑到相机所在网络。
+     * HarmonyOS / 部分国产 ROM 上 `network.socketFactory.createSocket()` 只是打了个标记，
+     * 一旦手机开着 VPN、代理或「双网加速」，实际发包仍会走 tun 网卡（表现为本机地址变成
+     * 172.17.x.x，相机侧收到的是陌生源地址，直接 ECONNABORTED）。这里补一次
+     * `Network.bindSocket()`，把 socket 真正钉在 Wi-Fi 上，并把失败原因记进日志。
+     */
+    private fun openCameraSocket(network: Network?): Socket {
+        val socket = network?.socketFactory?.createSocket() ?: Socket()
+        if (network != null) {
+            runCatching { network.bindSocket(socket) }
+                .onFailure { DoukLog.w("NikonPtp", "NET_BIND_FAIL", "error" to (it.message ?: it::class.java.simpleName)) }
+        }
+        return socket
+    }
+
+    /** 是否存在接管流量的 VPN / 代理网络。 */
+    private fun vpnActive(context: Context?): Boolean {
+        val cm = context?.applicationContext
+            ?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        return runCatching {
+            cm.allNetworks.any { n ->
+                cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            }
+        }.getOrDefault(false)
     }
 
     fun stopNikonWatch() {

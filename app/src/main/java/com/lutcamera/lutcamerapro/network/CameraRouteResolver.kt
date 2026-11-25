@@ -46,6 +46,15 @@ object CameraRouteResolver {
             .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
         var network: Network? = CameraLanProbe.networkForIp(context, cameraIp)?.network
+        // 兜底校验：VPN 网络带 Wi-Fi 传输时也会被子网匹配命中，但它会把包吞进 tun，
+        // 相机收不到（日志表现为出口 172.17.x.x + ECONNABORTED）。这类网络直接作废。
+        if (network != null) {
+            val caps = cm?.getNetworkCapabilities(network)
+            val usable = caps != null &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            if (!usable) network = null
+        }
         var source = if (network != null) Route.Source.EXISTING_NETWORK else Route.Source.DEFAULT
 
         if (network == null) {

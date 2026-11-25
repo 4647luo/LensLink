@@ -2091,6 +2091,22 @@ private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
     ChangelogEntry(
+        "1.1.3",
+        listOf(
+            "· 相机网络选择更严格：排除 VPN / 代理网络（要求 Wi‑Fi 且带 NOT_VPN），避免把包送进 tun 网卡后相机收不到。",
+            "· VPN 存在时，进程默认网络在「建 socket → 握手」整段保持指向相机热点，握手结束立即恢复，不再只覆盖建链瞬间。",
+            "· 相机热点（AP）模式探测次数由 4 次降到最多 3 次，探测后冷却由 400ms 延长到 1.2 秒，减少占用机身唯一的 PTP 客户端槽。",
+            "· 连接失败日志补充出口地址、VPN 状态与绑定结果，便于判断是选路、端口还是握手层。"
+        )
+    ),
+    ChangelogEntry(
+        "1.1.2",
+        listOf(
+            "· 修复开着 VPN / 代理 / 双网加速时连相机热点失败：连接包会从虚拟网卡（如 172.17.x.x）发出，现强制把 PTP 连接钉在相机 Wi‑Fi 上。",
+            "· 检测到 VPN 接管网络时提前提示，连接失败时直接显示真实出口地址。"
+        )
+    ),
+    ChangelogEntry(
         "1.1.1",
         listOf(
             "· 优化尼康 Z6II / Z7II 等二代机型的相机热点（AP）连接成功率：自动识别相机热点网段，预检失败自动重试，探测后留出冷却再发起握手。",

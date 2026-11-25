@@ -1559,14 +1559,16 @@ class DoukState(
             // 二代机（Z6II/Z7II 等）尤其慢。多给几次机会，别一次探测失败就判死刑。
             val apMode = detectedWifiRole == ConnectMode.WIFI_AP || connectMode == ConnectMode.WIFI_AP
             var reachable = false
-            val tries = if (apMode) attempts.coerceAtLeast(4) else attempts.coerceAtLeast(1)
+            // AP 下机身只有一个 PTP/IP 客户端槽，每探一次就占一次、关掉还要等机身回收。
+            // 参考 N-link / Z Console 的做法：少探、探到就等久一点再正式握手（不是 400ms）。
+            val tries = if (apMode) attempts.coerceAtLeast(1).coerceAtMost(3) else attempts.coerceAtLeast(1)
             for (i in 1..tries) {
-                reachable = CameraLanProbe.isOpen(target, 1500)
+                reachable = CameraLanProbe.isOpen(target, if (apMode) 900 else 1500)
                 DoukLog.i("Connect", "PRECHECK_PROBE", "attempt" to i, "of" to tries,
                     "target" to target, "open" to reachable)
                 if (reachable) break
                 if (i < tries) {
-                    val wait = (1200L * i).coerceAtMost(4000L)
+                    val wait = (2000L * i).coerceAtMost(4000L)
                     withContext(Dispatchers.Main) {
                         lastHint = "$target:${CameraLanProbe.PTP_PORT} 暂时没开（第 $i/$tries 次）" +
                             "，${wait / 1000} 秒后再试…"
@@ -1577,8 +1579,9 @@ class DoukState(
             if (reachable) {
                 // 探测只做 TCP 建链后立刻 close，但机身只有一个 PTP/IP 客户端槽，
                 // 关掉的连接在相机侧还要一小段时间回收。立刻发真实握手会撞在满的
-                // accept 队列上，表现就是「端口可达却连接失败」。留 400ms 缓冲。
-                delay(400)
+                // accept 队列上，表现就是「端口可达却连接失败」。AP 机型回收更慢，
+                // 留 1.2 秒；STA（家用路由）400ms 足够。
+                delay(if (apMode) 1200 else 400)
                 withContext(Dispatchers.Main) {
                     DoukLog.i("Connect", "PREFLIGHT_OK", "target" to "$target:${CameraLanProbe.PTP_PORT}")
                     lastHint = "$target 端口可达，正在建立 PTP/IP 会话…"

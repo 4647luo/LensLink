@@ -303,6 +303,10 @@ object CameraLanProbe {
                 ?: return emptyList()
             for (network in cm.allNetworks) {
                 val caps = cm.getNetworkCapabilities(network) ?: continue
+                // VPN / 代理会以「Wi-Fi + VPN」的混合形态出现，日志里表现为本机出口变成 172.17.x.x。
+                // 这种网络绝不能拿来当相机网络，直接跳过（与 Shotdeck 的 NOT_VPN 判定一致）。
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
                 if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
                     !caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) continue
                 val lp = cm.getLinkProperties(network) ?: continue

@@ -1,8 +1,7 @@
 package com.lutcamera.lutcamerapro.gpu
 
 import android.opengl.GLES30
-import android.util.Log
-
+import com.lutcamera.lutcamerapro.log.Log
 /**
  * 🚀 Color Engine V5.0 电影级 GPU 着色器引擎
  * 支持：Adobe XMP 全能调色管线 + 3D LUT 四面体插值 + ACES Filmic 高光映射

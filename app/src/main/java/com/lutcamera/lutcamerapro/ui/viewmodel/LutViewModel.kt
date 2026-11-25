@@ -470,21 +470,13 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                 val filename = "LUT_${System.currentTimeMillis()}.jpg"
                 val contentResolver = context.contentResolver
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/LutCameraPro")
-                    }
-                    contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)?.let { uri ->
-                        contentResolver.openOutputStream(uri)?.use { fos ->
-                            filteredBmp.compress(Bitmap.CompressFormat.JPEG, 95, fos)
-                        }
-                    }
-                } else {
-                    val imagesDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES)
-                    val image = File(imagesDir, filename)
-                    java.io.FileOutputStream(image).use { fos ->
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/LutCameraPro")
+                }
+                contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)?.let { uri ->
+                    contentResolver.openOutputStream(uri)?.use { fos ->
                         filteredBmp.compress(Bitmap.CompressFormat.JPEG, 95, fos)
                     }
                 }

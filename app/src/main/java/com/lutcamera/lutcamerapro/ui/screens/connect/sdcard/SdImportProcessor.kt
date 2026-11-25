@@ -9,7 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.exifinterface.media.ExifInterface
 import com.lutcamera.lutcamerapro.gpu.GpuLutOffscreenFilter
 import com.lutcamera.lutcamerapro.lut.LutData
@@ -39,8 +39,6 @@ object SdImportProcessor {
         currentLut: LutData?,
         lutIntensity: Float
     ): ImportResult {
-        val resolver = context.contentResolver
-
         try {
             // ================= 1. RAW 文件流式直存（零堆内存占用，绝不参与 GPU 渲染）=================
                 if (item.isRaw) {
@@ -110,38 +108,25 @@ object SdImportProcessor {
      */
     private fun streamSaveRawToMediaStore(context: Context, sourceUri: Uri, fileName: String): Boolean {
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/x-raw")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera_RAW")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-
-                val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-
-                context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                    context.contentResolver.openOutputStream(destUri)?.use { output ->
-                        input.copyTo(output, bufferSize = 64 * 1024)
-                    }
-                }
-
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                context.contentResolver.update(destUri, values, null, null)
-                true
-            } else {
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCamera_RAW")
-                if (!dir.exists()) dir.mkdirs()
-                val targetFile = File(dir, fileName)
-
-                context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output, bufferSize = 64 * 1024)
-                    }
-                }
-                true
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/x-raw")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera_RAW")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
+
+            val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+
+            context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                context.contentResolver.openOutputStream(destUri)?.use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
+
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            context.contentResolver.update(destUri, values, null, null)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "RAW 流式写入失败: $fileName", e)
             false
@@ -154,38 +139,25 @@ object SdImportProcessor {
         return try {
             val finalName = if (isOriginal) "ORIG_${fileName}" else fileName
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, finalName)
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-
-                val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-
-                context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                    context.contentResolver.openOutputStream(destUri)?.use { output ->
-                        input.copyTo(output, bufferSize = 64 * 1024)
-                    }
-                }
-
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                context.contentResolver.update(destUri, values, null, null)
-                true
-            } else {
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCamera")
-                if (!dir.exists()) dir.mkdirs()
-                val targetFile = File(dir, finalName)
-
-                context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output, bufferSize = 64 * 1024)
-                    }
-                }
-                true
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, finalName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
+
+            val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+
+            context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                context.contentResolver.openOutputStream(destUri)?.use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
+
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            context.contentResolver.update(destUri, values, null, null)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "JPG 原图写入失败: $fileName", e)
             false
@@ -196,34 +168,23 @@ object SdImportProcessor {
      * 保存调色位图到相册     */
     private fun saveRenderedBitmapToMediaStore(context: Context, bitmap: Bitmap, fileName: String): Boolean {
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-
-                val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-
-                context.contentResolver.openOutputStream(destUri)?.use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                context.contentResolver.update(destUri, values, null, null)
-                true
-            } else {
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LutCamera")
-                if (!dir.exists()) dir.mkdirs()
-                val targetFile = File(dir, fileName)
-
-                FileOutputStream(targetFile).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-                true
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LutCamera")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
+
+            val destUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+
+            context.contentResolver.openOutputStream(destUri)?.use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            context.contentResolver.update(destUri, values, null, null)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "LUT 位图写入失败: $fileName", e)
             false
@@ -234,7 +195,6 @@ object SdImportProcessor {
      * 严格限制最大边距防止内存爆炸     */
     private fun decodeUriSafely(context: Context, uri: Uri, maxDimension: Int): Bitmap? {
         val resolver = context.contentResolver
-
         val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, boundsOptions)

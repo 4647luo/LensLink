@@ -115,7 +115,7 @@ object UpdateCenter {
      */
     private fun showLaunchDialog(activity: Activity, info: Info) {
         if (activity.isFinishing) return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed) return
+        if (activity.isDestroyed) return
         val dialog = Dialog(activity).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
         dialog.setContentView(buildUpdateCard(activity, info, dialog))
         dialog.setCanceledOnTouchOutside(true)
@@ -520,9 +520,7 @@ object UpdateCenter {
             Toast.makeText(context, "安装包不存在或为空", Toast.LENGTH_LONG).show()
             return false
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            !context.packageManager.canRequestPackageInstalls()
-        ) {
+        if (!context.packageManager.canRequestPackageInstalls()) {
             Toast.makeText(context, "请先允许「连镜」安装未知来源应用", Toast.LENGTH_LONG).show()
             openUnknownSourcesSettings(context)
             return false

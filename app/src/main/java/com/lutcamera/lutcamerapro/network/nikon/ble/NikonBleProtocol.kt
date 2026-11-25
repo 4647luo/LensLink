@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.network.nikon.ble
 
+import android.annotation.SuppressLint
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Calendar
@@ -95,6 +96,7 @@ data class NikonPairingMessage(
  * 尼康握手用的自定义散列：底层是标准 Blowfish/ECB/NoPadding，8 字节密钥
  * FF FF AA 55 11 22 33 00，按 CBC-MAC 方式把 32 位大端字串起来。
  */
+@SuppressLint("GetInstance")
 class NikonBlowfishMac {
     private val cipher: Cipher = Cipher.getInstance("Blowfish/ECB/NoPadding").apply {
         init(Cipher.ENCRYPT_MODE, SecretKeySpec(KEY, "Blowfish"))

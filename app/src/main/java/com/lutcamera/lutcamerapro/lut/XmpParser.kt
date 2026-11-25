@@ -1,6 +1,6 @@
 package com.lutcamera.lutcamerapro.lut
 
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import android.util.Xml
 import org.xmlpull.v1.XmlPullParser
 import java.io.BufferedReader

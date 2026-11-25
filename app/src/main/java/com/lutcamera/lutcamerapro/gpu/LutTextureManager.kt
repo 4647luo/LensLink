@@ -2,7 +2,7 @@ package com.lutcamera.lutcamerapro.gpu
 
 import android.opengl.EGL14
 import android.opengl.GLES30
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import com.lutcamera.lutcamerapro.lut.LutData
 import java.nio.ByteBuffer
 import java.nio.ByteOrder

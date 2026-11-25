@@ -7,7 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
 import android.provider.MediaStore
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.exifinterface.media.ExifInterface
 import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.lut.XmpData

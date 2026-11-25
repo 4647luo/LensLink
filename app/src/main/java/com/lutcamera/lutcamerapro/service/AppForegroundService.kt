@@ -14,7 +14,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.IBinder
 import android.provider.MediaStore
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.core.app.NotificationCompat
 import com.lutcamera.lutcamerapro.gpu.ImageAutoProcessor
 import com.lutcamera.lutcamerapro.lut.LutData
@@ -306,15 +306,13 @@ class AppForegroundService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "有线相机后台回传服务",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "有线相机后台回传服务",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.createNotificationChannel(channel)
     }
 
     private fun buildNotification(contentText: String): Notification {

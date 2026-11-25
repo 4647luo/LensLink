@@ -883,9 +883,7 @@ internal fun PhotoEditorScreen(
                 w.statusBarColor = android.graphics.Color.TRANSPARENT
                 val panelColor = android.graphics.Color.rgb(255, 253, 249)
                 w.navigationBarColor = panelColor
-                if (android.os.Build.VERSION.SDK_INT >= 28) {
-                    w.navigationBarDividerColor = panelColor
-                }
+                w.navigationBarDividerColor = panelColor
                 w.isStatusBarContrastEnforced = false
                 w.isNavigationBarContrastEnforced = false
             }
@@ -917,9 +915,7 @@ internal fun PhotoEditorScreen(
             // Dialog 的 navigationBarColor 改不动它时，Activity 这一层也刷暖白。
             activityWindow?.let { aw ->
                 aw.navigationBarColor = android.graphics.Color.rgb(255, 253, 249)
-                if (android.os.Build.VERSION.SDK_INT >= 28) {
-                    aw.navigationBarDividerColor = android.graphics.Color.rgb(255, 253, 249)
-                }
+                aw.navigationBarDividerColor = android.graphics.Color.rgb(255, 253, 249)
                 aw.isNavigationBarContrastEnforced = false
             }
             activityController?.isAppearanceLightNavigationBars = !gestureNavigation

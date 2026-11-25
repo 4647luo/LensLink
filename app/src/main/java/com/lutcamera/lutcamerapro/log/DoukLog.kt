@@ -6,7 +6,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -113,7 +113,7 @@ object DoukLog {
                 append(value.toString().replace('\n', ' '))
             }
         }
-        runCatching { Log.println(level.ordinal + 2, LOGGER_TAG, line) }
+        runCatching { android.util.Log.println(level.ordinal + 2, LOGGER_TAG, line) }
         // xLog 只落文件：给崩溃前一帧留一份独立副本
         runCatching { XLog.d(line) }
         synchronized(lock) {

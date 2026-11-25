@@ -2091,6 +2091,26 @@ private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
     ChangelogEntry(
+        "1.1.1",
+        listOf(
+            "· 优化尼康 Z6II / Z7II 等二代机型的相机热点（AP）连接成功率：自动识别相机热点网段，预检失败自动重试，探测后留出冷却再发起握手。",
+            "· AP 模式不再扫描整个网段，避免相机热点被并发连接压断。",
+            "· 连接后的参数刷新频率下调，减少相机 Wi‑Fi 指示灯闪动与整机电量消耗。",
+            "· 修复局域网模式误标为「手机热点」的问题，设备页按真实拓扑显示「相机热点」或「局域网」。",
+            "· 添加设备页右上角新增「连接教程」，连接步骤与失败排查集中到弹窗里。",
+            "· 清理静态检查告警，日志统一走 Timber 桥接，行为不变。"
+        )
+    ),
+    ChangelogEntry(
+        "1.1.0",
+        listOf(
+            "· 新增持久化传输中心：回传、导入任务在切页与切后台后继续执行。",
+            "· 图库支持 RAW + JPG 合并显示、Live 图长按播放与 40MP 图片预览。",
+            "· 编辑器新增 HDR 直出与 LUT 滤镜链路，支持视频片段转 Live 图。",
+            "· 蓝牙遥控、定位写入与保活重连完善。"
+        )
+    ),
+    ChangelogEntry(
         "1.0.0",
         listOf(
             "· 连镜第一个正式版本。",

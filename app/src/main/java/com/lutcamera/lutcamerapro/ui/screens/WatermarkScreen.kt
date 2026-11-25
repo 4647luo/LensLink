@@ -414,22 +414,14 @@ fun WatermarkScreen() {
 private fun saveBitmapToGallery(context: Context, bitmap: Bitmap) {
     val resolver = context.contentResolver
     val filename = "FRAME_${System.currentTimeMillis()}.jpg"
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/LutCameraPro")
-        }
-        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-        uri?.let {
-            resolver.openOutputStream(it)?.use { fos ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)
-            }
-        }
-    } else {
-        val imagesDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES)
-        val file = java.io.File(imagesDir, filename)
-        java.io.FileOutputStream(file).use { fos ->
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/LutCameraPro")
+    }
+    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+    uri?.let {
+        resolver.openOutputStream(it)?.use { fos ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)
         }
     }

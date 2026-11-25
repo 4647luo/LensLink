@@ -1034,9 +1034,9 @@ class NikonViewModel : ViewModel() {
             delay(2000)
             while (isActive && isConnected) {
                 runCatching { pollCameraParamSnapshot() }
-                // 取景时参数会被机身实时改动，3 秒够用；空闲时没有再拉 2.5 秒的必要，
-                // 降到 6 秒后连相机 Wi‑Fi 的命令流量少一半，机身也不容易被反复唤醒。
-                delay(if (ptpClient.isLiveViewActive.value) 3_000L else 6_000L)
+                // 取景时参数会被机身实时改动，3 秒够用；空闲时把间隔拉到 10 秒：
+                // 机身 Wi‑Fi 指示灯只在传数据时闪，轮询越密灯闪得越频繁、相机和手机都费电。
+                delay(if (ptpClient.isLiveViewActive.value) 3_000L else 10_000L)
             }
         }
     }

@@ -61,12 +61,10 @@ object ImageDecode {
             var frame: android.graphics.Bitmap? = null
             for (t in candidates) {
                 frame = runCatching {
-                    if (Build.VERSION.SDK_INT >= 27) {
-                        retriever.getScaledFrameAtTime(
-                            t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                            targetSize, targetSize
-                        )
-                    } else null
+                    retriever.getScaledFrameAtTime(
+                        t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                        targetSize, targetSize
+                    )
                 }.getOrNull()
                 if (frame == null) {
                     frame = runCatching {
@@ -661,7 +659,7 @@ object ImageDecode {
      * 目标 RGBA_F16 + BT.2020 PQ，能出 16bit 就交给 HDR 上屏。
      */
     private fun decodeHdrViaFactory(file: File, maxSide: Int): android.graphics.Bitmap? = runCatching {
-        if (Build.VERSION.SDK_INT < 26) return@runCatching null
+
         val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
         android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
         if (bounds.outWidth <= 0) return@runCatching null
@@ -697,7 +695,7 @@ object ImageDecode {
         maxSide: Int,
         forceSdr: Boolean = false
     ): ImageBitmap? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+
         return runCatching {
             var decoded: Bitmap? = null
             val listener = ImageDecoder.OnHeaderDecodedListener { decoder, info, _ ->

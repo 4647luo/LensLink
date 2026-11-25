@@ -388,7 +388,9 @@ class NikonBleGpsClient(private val context: Context) {
                 // BLE 只做低功耗保活，避免口袋里边每 1.5 秒唤醒一次射频。
                 val screenOn = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
                     ?.isInteractive == true
-                delay(if (screenOn) 4_000L else 10_000L)
+                // 4 秒/10 秒对保活是过剩的：每次 TIME 写入都会唤醒机身 MCU 和手机射频。
+                // 拉到 6 秒/12 秒后仍远短于相机的 BLE 超时窗口，但整机功耗明显下降。
+                delay(if (screenOn) 6_000L else 12_000L)
             }
         }
     }

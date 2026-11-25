@@ -497,23 +497,21 @@ object GalleryFileOps {
             }
         }
         // 手机相册里带定位的照片，MediaStore 会存经纬度（API 29+ 才有这两列）
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            runCatching {
-                context.contentResolver.query(
-                    uri,
-                    arrayOf(
-                        MediaStore.Images.Media.LATITUDE,
-                        MediaStore.Images.Media.LONGITUDE
-                    ),
-                    null, null, null
-                )?.use { c ->
-                    if (c.moveToFirst()) {
-                        val la = c.getDouble(0)
-                        val lo = c.getDouble(1)
-                        if (la != 0.0 || lo != 0.0) {
-                            lat = la
-                            lon = lo
-                        }
+        runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(
+                    MediaStore.Images.Media.LATITUDE,
+                    MediaStore.Images.Media.LONGITUDE
+                ),
+                null, null, null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val la = c.getDouble(0)
+                    val lo = c.getDouble(1)
+                    if (la != 0.0 || lo != 0.0) {
+                        lat = la
+                        lon = lo
                     }
                 }
             }
@@ -562,10 +560,8 @@ object GalleryFileOps {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, mime)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, dir)
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
+            put(MediaStore.Images.Media.RELATIVE_PATH, dir)
+            put(MediaStore.Images.Media.IS_PENDING, 1)
         }
         val uri = runCatching {
             context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -574,11 +570,9 @@ object GalleryFileOps {
         return runCatching {
             context.contentResolver.openOutputStream(uri)?.use(write)
                 ?: error("打不开写入流")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                context.contentResolver.update(uri, values, null, null)
-            }
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            context.contentResolver.update(uri, values, null, null)
             uri
         }.onFailure {
             runCatching { context.contentResolver.delete(uri, null, null) }

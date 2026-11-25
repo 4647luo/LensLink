@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.lut.XmpData
 import java.nio.ByteBuffer

@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -94,7 +95,7 @@ fun DuoButton(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(height)
-                .offset(y = animatedTopOffset)
+                .offset { IntOffset(0, animatedTopOffset.roundToPx()) }
                 .clip(RoundedCornerShape(cornerRadius))
                 .background(if (enabled) topColor else duo.surfaceSecondary)
                 .border(
@@ -188,7 +189,7 @@ fun DuoIconButton(
                 Box(
             modifier = Modifier
                 .size(size)
-                .offset(y = animatedTopOffset)
+                .offset { IntOffset(0, animatedTopOffset.roundToPx()) }
                 .clip(CircleShape)
                 .background(if (enabled) topColor else duo.surfaceSecondary)
                 .border(

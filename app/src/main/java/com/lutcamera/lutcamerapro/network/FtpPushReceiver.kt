@@ -1,7 +1,7 @@
 package com.lutcamera.lutcamerapro.network
 
 import android.content.Context
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import com.lutcamera.lutcamerapro.gpu.ImageAutoProcessor
 import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.model.BorderState

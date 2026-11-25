@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- 版本管理风格类：依赖版本已集中在 gradle/libs.versions.toml，
+         但 build.gradle.kts 仍有内联字面量属于既有工程结构，不在本版强行改造。 -->
+    <issue id="UseTomlInstead" severity="ignore" />
+
+    <!-- 依赖可升级提示：离线环境无法稳定拉取新版本，且升级需单独回归，本版保持锁定。 -->
+    <issue id="GradleDependency" severity="ignore" />
+
+    <!-- 文案国际化：连镜仅面向中文用户，界面硬编码中文属于设计选择。 -->
+    <issue id="SetTextI18n" severity="ignore" />
+
+    <!-- 图标资源：adaptive icon 保留 drawable 内的前景/背景 png 与 mipmap 旧版 webp，
+         属于兼容旧启动器的有意保留。 -->
+    <issue id="IconLocation" severity="ignore" />
+    <issue id="IconXmlAndPng" severity="ignore" />
+</lint>

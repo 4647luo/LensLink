@@ -2,7 +2,7 @@ package com.lutcamera.lutcamerapro
 
 import android.app.Application
 import android.content.Context
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.memory.MemoryCache
@@ -158,14 +158,14 @@ class DoukApplication : Application(), ImageLoaderFactory {
         Timber.plant(object : Timber.Tree() {
             override fun log(priority: Int, tag: String?, message: String, t: Throwable?) {
                 val level = when (priority) {
-                    Log.VERBOSE -> DoukLog.Level.VERBOSE
-                    Log.DEBUG -> DoukLog.Level.DEBUG
-                    Log.INFO -> DoukLog.Level.INFO
-                    Log.WARN -> DoukLog.Level.WARN
+                    android.util.Log.VERBOSE -> DoukLog.Level.VERBOSE
+                    android.util.Log.DEBUG -> DoukLog.Level.DEBUG
+                    android.util.Log.INFO -> DoukLog.Level.INFO
+                    android.util.Log.WARN -> DoukLog.Level.WARN
                     else -> DoukLog.Level.ERROR
                 }
                 val body = if (t != null) {
-                    message + "\n" + Log.getStackTraceString(t)
+                    message + "\n" + android.util.Log.getStackTraceString(t)
                 } else {
                     message
                 }

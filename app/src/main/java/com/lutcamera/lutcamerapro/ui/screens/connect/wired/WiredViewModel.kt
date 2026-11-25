@@ -17,7 +17,7 @@ import android.mtp.MtpDevice
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.compose.runtime.*
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
@@ -452,11 +452,7 @@ class WiredViewModel : ViewModel() {
             }
 
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    appContext.startForegroundService(intent)
-                } else {
-                    appContext.startService(intent)
-                }
+                appContext.startForegroundService(intent)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start foreground service", e)
                 _uiEvent.trySend(WiredUiEvent.ShowToast("Failed to start foreground service"))
@@ -470,11 +466,9 @@ class WiredViewModel : ViewModel() {
     }
 
     private fun checkBatteryOptimizationPrompt(context: Context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (powerManager != null && !powerManager.isIgnoringBatteryOptimizations(context.packageName)) {
-                _uiEvent.trySend(WiredUiEvent.ShowToast("Please ignore battery optimizations for stable USB connection"))
-            }
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (powerManager != null && !powerManager.isIgnoringBatteryOptimizations(context.packageName)) {
+            _uiEvent.trySend(WiredUiEvent.ShowToast("Please ignore battery optimizations for stable USB connection"))
         }
     }
 

@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.network.nikon.ble
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -44,17 +45,15 @@ class DoukBleKeepAliveService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            // 渠道已存在时也更新名字/描述，旧安装升级后文案保持一致
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "相机连接保活",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            channel.description = "保持蓝牙 GPS、蓝牙遥控或 Wi‑Fi / USB 相机连接不被系统冻结"
-            manager.createNotificationChannel(channel)
-        }
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // 渠道已存在时也更新名字/描述，旧安装升级后文案保持一致
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "相机连接保活",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        channel.description = "保持蓝牙 GPS、蓝牙遥控或 Wi‑Fi / USB 相机连接不被系统冻结"
+        manager.createNotificationChannel(channel)
         acquireWakeLock()
     }
 
@@ -74,11 +73,7 @@ class DoukBleKeepAliveService : Service() {
         val restart = Intent(this, DoukBleKeepAliveService::class.java)
             .putExtra(EXTRA_TEXT, latestText)
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(restart)
-            } else {
-                startService(restart)
-            }
+            startForegroundService(restart)
         }
         super.onTaskRemoved(rootIntent)
     }
@@ -86,12 +81,7 @@ class DoukBleKeepAliveService : Service() {
     override fun onDestroy() {
         releaseWakeLock()
         super.onDestroy()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     private fun acquireWakeLock() {
@@ -128,12 +118,7 @@ class DoukBleKeepAliveService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
+        val builder = Notification.Builder(this, CHANNEL_ID)
         val contentIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -169,11 +154,7 @@ class DoukBleKeepAliveService : Service() {
                 .putExtra(EXTRA_TEXT, text)
             // 后台时 startForegroundService 可能被系统拒绝；不能让保活失败反过来崩溃界面
             runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
+                context.startForegroundService(intent)
             }
         }
 
@@ -191,6 +172,7 @@ class DoukBleKeepAliveService : Service() {
          * 申请电池优化白名单。部分 ROM 没有这个系统弹窗，会直接抛 ActivityNotFound；
          * 这时退回到应用详情页，让用户手动把「省电策略」改成「无限制」。
          */
+        @SuppressLint("BatteryLife")
         fun requestIgnoreBatteryOptimizations(context: Context) {
             val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
                 .setData(Uri.parse("package:${context.packageName}"))

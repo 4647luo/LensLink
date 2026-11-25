@@ -1,7 +1,7 @@
 package com.lutcamera.lutcamerapro.gpu
 
 import android.graphics.*
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import androidx.exifinterface.media.ExifInterface
 import com.lutcamera.lutcamerapro.model.BorderCategory
 import com.lutcamera.lutcamerapro.model.BorderMode

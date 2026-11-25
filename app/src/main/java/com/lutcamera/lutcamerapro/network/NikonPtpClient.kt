@@ -6,7 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.SystemClock
-import android.util.Log
+import com.lutcamera.lutcamerapro.log.Log
 import com.lutcamera.lutcamerapro.log.DoukLog
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel

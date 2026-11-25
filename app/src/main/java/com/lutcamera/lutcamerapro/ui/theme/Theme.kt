@@ -67,10 +67,8 @@ fun LutcameraproTheme(
                 // edge-to-edge 下由根布局的渐变一路铺到屏幕顶端。
                 window.statusBarColor = android.graphics.Color.TRANSPARENT
                 window.navigationBarColor = android.graphics.Color.TRANSPARENT
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    window.isStatusBarContrastEnforced = false
-                    window.isNavigationBarContrastEnforced = false
-                }
+                window.isStatusBarContrastEnforced = false
+                window.isNavigationBarContrastEnforced = false
                 val insetsController = WindowCompat.getInsetsController(window, view)
                 insetsController.isAppearanceLightStatusBars = !isDark
                 insetsController.isAppearanceLightNavigationBars = !isDark

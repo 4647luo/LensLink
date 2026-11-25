@@ -1555,8 +1555,11 @@ class DoukState(
         lastHint = "正在验证 $target:${CameraLanProbe.PTP_PORT} …"
         DoukLog.i("Connect", "PRECHECK_BEGIN", "target" to "$target:${CameraLanProbe.PTP_PORT}", "mode" to connectMode)
         ioScope.launch {
+            // 相机热点模式下，机身要先把热点服务从「配对」切到「传输」，端口会晚几秒才开；
+            // 二代机（Z6II/Z7II 等）尤其慢。多给几次机会，别一次探测失败就判死刑。
+            val apMode = detectedWifiRole == ConnectMode.WIFI_AP || connectMode == ConnectMode.WIFI_AP
             var reachable = false
-            val tries = attempts.coerceAtLeast(1)
+            val tries = if (apMode) attempts.coerceAtLeast(4) else attempts.coerceAtLeast(1)
             for (i in 1..tries) {
                 reachable = CameraLanProbe.isOpen(target, 1500)
                 DoukLog.i("Connect", "PRECHECK_PROBE", "attempt" to i, "of" to tries,
@@ -1580,9 +1583,19 @@ class DoukState(
                 return@launch
             }
 
-            // 端口一直不通：再扫一遍本机所有网段。STA 模式下相机重新加入热点后
-            // 很可能被 DHCP 换到另一个地址，一直拿老 IP 探测就会永远「不可达」。
-            val hits = if (connectMode == ConnectMode.WIFI_STA || connectMode == ConnectMode.WIFI_AP) {
+            // 端口一直不通：STA 模式下相机重新加入热点后很可能被 DHCP 换地址，才需要扫 /24；
+            // AP 模式下绝不能扫整个网段 —— 相机热点的 Wi‑Fi 栈扛不住两百多个并发 SYN，
+            // 扫一轮就会把热点压断，相机上直接显示「连接失败」。
+            val hits = if (apMode) {
+                CameraLanProbe.probePreferred(
+                    context = context.applicationContext,
+                    ips = CameraLanProbe.priorityTargets(
+                        context,
+                        listOf(target) + DoukPrefs.knownDevices().map { it.ip }
+                    ),
+                    timeoutMs = 700
+                )
+            } else if (connectMode == ConnectMode.WIFI_STA) {
                 CameraLanProbe.scan(
                     context = context.applicationContext,
                     timeoutMs = 350,

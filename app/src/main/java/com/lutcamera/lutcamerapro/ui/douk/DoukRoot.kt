@@ -607,9 +607,9 @@ private fun ServiceSwitchSegment(
 private fun DoukBottomBar(
     nav: androidx.navigation.NavHostController,
     state: DoukState,
+    modifier: Modifier = Modifier,
     onGalleryReselect: () -> Unit = {},
-    onDeviceReselect: () -> Unit = {},
-    modifier: Modifier = Modifier
+    onDeviceReselect: () -> Unit = {}
 ) {
     val tabs = listOf(
         DoukTab("设备", "device", Icons.Rounded.CameraAlt),

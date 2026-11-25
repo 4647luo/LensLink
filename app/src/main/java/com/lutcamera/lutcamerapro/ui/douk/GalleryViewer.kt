@@ -544,12 +544,10 @@ internal fun PhotoViewerScreen(
                 // Compose 的 DialogLayout 会在首帧 measure 时把窗口重新压回 2780，
                 // 所以等它布局完再按真实屏幕尺寸补一次，才能盖住导航栏。
                 w.decorView.post { w.setLayout(fullW, fullH) }
-                if (android.os.Build.VERSION.SDK_INT >= 28) {
-                    w.attributes?.let { attrs ->
-                        attrs.layoutInDisplayCutoutMode =
-                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                        w.attributes = attrs
-                    }
+                w.attributes?.let { attrs ->
+                    attrs.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    w.attributes = attrs
                 }
                 // Android 15 起 statusBarColor 本身会被忽略；设成透明让根布局的黑底
                 // 透上来，比设黑色更可靠（部分 ROM 会给旧式黑色栏加一层灰 scrim）。

@@ -100,6 +100,24 @@ object CameraLanProbe {
         return gatewayAddresses(context.applicationContext, network).firstOrNull()
     }
 
+    /**
+     * 只探一组已知地址（网关 / 历史 IP / 机身默认 IP），**不扫 /24**。
+     *
+     * 相机自己开热点时，机身 Wi‑Fi 栈很弱：并发 96 个 SYN 扫 254 个地址会把热点
+     * 直接压垮，表现为「刚连上相机 Wi‑Fi 就断开、相机显示连接失败」。
+     * AP 模式下只用这个入口。
+     */
+    suspend fun probePreferred(
+        context: Context,
+        ips: List<String>,
+        timeoutMs: Int = 700
+    ): List<Found> = probeCandidates(
+        context,
+        ips,
+        timeoutMs,
+        activeLanNetworks(context)
+    )
+
     /** 当前 Wi-Fi / 有线网络的默认网关与 DHCP 服务器地址。 */    private fun gatewayAddresses(context: Context): List<String> = activeLanNetworks(context)
         .mapNotNull { it.network }
         .distinct()

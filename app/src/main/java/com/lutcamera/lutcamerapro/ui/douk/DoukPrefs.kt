@@ -187,30 +187,6 @@ object DoukPrefs {
         get() = str("download_video_format", "MOV")
         set(v) = putStr("download_video_format", v)
 
-    /**
-     * FTP 回传口令。相机 FTP 配置里的用户名可填 nikon，密码填这串 8 位口令。
-     * 首次读取时生成并持久化；不要再用「任何 PASS 都放行」的匿名模式。
-     */
-    var ftpToken: String
-        get() {
-            val existing = str("ftp_token", "")
-            if (existing.isNotBlank()) return existing
-            val generated = generateFtpToken()
-            putStr("ftp_token", generated)
-            return generated
-        }
-        set(v) = putStr("ftp_token", v.filter { it.isLetterOrDigit() }.take(32))
-
-    fun regenerateFtpToken(): String = generateFtpToken().also { ftpToken = it }
-
-    private fun generateFtpToken(): String {
-        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        val random = java.security.SecureRandom()
-        return buildString {
-            repeat(8) { append(alphabet[random.nextInt(alphabet.length)]) }
-        }
-    }
-
     /** 只下载相机里已锁定的照片 */
     var lockedOnly: Boolean
         get() = flag("locked_only", false)

@@ -336,7 +336,7 @@ fun LutPreviewScreen(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            items(viewModel.lutLibraryList.value) { item ->
+            items(viewModel.lutLibraryList.value, contentType = { "lut-preview" }) { item ->
                 val isSelected = viewModel.currentLutId == item.id
                 Box(
                     modifier = Modifier

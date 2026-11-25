@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -37,7 +38,7 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     val apple = AppleTheme.colors
-    val isDark by AppThemeManager.isDarkMode.collectAsState()
+    val isDark by AppThemeManager.isDarkMode.collectAsStateWithLifecycle()
 
     var showNikonIpDialog by remember { mutableStateOf(false) }
     var nikonIpEditText by remember { mutableStateOf(viewModel.nikonIp) }

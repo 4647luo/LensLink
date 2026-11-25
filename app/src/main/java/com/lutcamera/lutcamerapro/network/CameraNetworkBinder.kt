@@ -53,7 +53,11 @@ object CameraNetworkBinder {
                     }
                     callbackRef.set(cb)
                     try {
-                        cm.requestNetwork(request, cb)
+                        // 只能「被动监听」已有 Wi‑Fi 网络，绝不能用 requestNetwork：
+                        // requestNetwork 会让系统为了满足请求去维持/拉起某个 Wi‑Fi，
+                        // 3.5 秒超时后 unregister 释放请求时，系统会把这条「没有外网」的
+                        // 网络断掉 —— 表现就是「手机刚连上相机 Wi‑Fi 就自己断开，相机报连接失败」。
+                        cm.registerNetworkCallback(request, cb)
                     } catch (_: Exception) {
                         if (cont.isActive) cont.resume(Unit)
                     }

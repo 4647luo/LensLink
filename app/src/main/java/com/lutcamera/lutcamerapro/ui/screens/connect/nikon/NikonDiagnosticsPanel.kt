@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.ui.screens.connect.nikon
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,10 +29,10 @@ fun NikonDiagnosticsPanel(vm: NikonViewModel, ip: String, onIp: (String) -> Unit
     val recoverIdentity = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { vm.restorePairingIdentity(context, it) }
     }
-    val stage by vm.connectionStage.collectAsState()
-    val camera by vm.actualCameraLabel.collectAsState()
-    val stats by vm.liveMetrics.collectAsState()
-    val live by vm.isLiveViewActive.collectAsState()
+    val stage by vm.connectionStage.collectAsStateWithLifecycle()
+    val camera by vm.actualCameraLabel.collectAsStateWithLifecycle()
+    val stats by vm.liveMetrics.collectAsStateWithLifecycle()
+    val live by vm.isLiveViewActive.collectAsStateWithLifecycle()
     var advanced by remember { mutableStateOf(false) }
     var choice by remember { mutableStateOf<Long?>(null) }
     val desc = vm.compressionDesc

@@ -714,7 +714,7 @@ internal fun PhotoEditorScreen(
                     runCatching { sourcePair.base.recycle() }
                     val orientation = GalleryFileOps.exifOrientationOf(sourceFile!!)
                     val gain = if (!sourcePair.orientationApplied &&
-                        orientation != android.media.ExifInterface.ORIENTATION_NORMAL
+                        orientation != androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
                     ) {
                         GalleryFileOps.applyExifOrientation(sourcePair.gain, orientation).also {
                             if (it !== sourcePair.gain) runCatching { sourcePair.gain.recycle() }
@@ -3752,7 +3752,7 @@ private fun decodeSampledForEdit(file: File, maxSide: Int): Bitmap? {
     // BitmapFactory 不按 EXIF 方向转，预览走 ImageDecoder 已经转正；
     // 保存时也要先把底图转成和预览一致的方向，否则导出会横竖颠倒。
     val orientation = GalleryFileOps.exifOrientationOf(file)
-    if (orientation != android.media.ExifInterface.ORIENTATION_NORMAL) {
+    if (orientation != androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL) {
         val upright = GalleryFileOps.applyExifOrientation(bitmap, orientation)
         if (upright !== bitmap) bitmap.recycle()
         bitmap = upright
@@ -4555,7 +4555,7 @@ internal fun writeUltraHdrJpeg(
     bmp: Bitmap,
     quality: Int,
     sourcePair: ImageDecode.HdrPair? = null,
-    sourceOrientation: Int = android.media.ExifInterface.ORIENTATION_NORMAL,
+    sourceOrientation: Int = androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
     hdrStrength: Float = 1f,
     rawSensorGain: Bitmap? = null,
     rawSensorGainMax: Float = 2.9f
@@ -4582,7 +4582,7 @@ internal fun writeUltraHdrJpeg(
             // 不需要重新按直方图猜一张；调色/滤镜只改变底图，高光层次仍沿用相机那套。
             val rawGain = sourcePair.gain
             val gain = if (!sourcePair.orientationApplied &&
-                sourceOrientation != android.media.ExifInterface.ORIENTATION_NORMAL
+                sourceOrientation != androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
             ) {
                 GalleryFileOps.applyExifOrientation(rawGain, sourceOrientation).also {
                     if (it !== rawGain) orientedSourceGain = it

@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.ui.screens
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import android.graphics.Bitmap
 import android.widget.Toast
@@ -118,12 +119,12 @@ fun CameraScreen(
     var selectedBrand by remember { mutableStateOf(CameraBrand.NIKON) }
 
     // 实时图传流
-    val nikonLiveViewActive by nikonViewModel.isLiveViewActive.collectAsState()
-    val nikonLiveViewBmp by nikonViewModel.liveViewBitmap.collectAsState()
-    val nikonLiveStats by nikonViewModel.liveMetrics.collectAsState()
+    val nikonLiveViewActive by nikonViewModel.isLiveViewActive.collectAsStateWithLifecycle()
+    val nikonLiveViewBmp by nikonViewModel.liveViewBitmap.collectAsStateWithLifecycle()
+    val nikonLiveStats by nikonViewModel.liveMetrics.collectAsStateWithLifecycle()
 
-    val usbLiveViewActive by wiredViewModel.isUsbLiveViewActive.collectAsState()
-    val usbLiveViewBmp by wiredViewModel.usbLiveViewBitmap.collectAsState()
+    val usbLiveViewActive by wiredViewModel.isUsbLiveViewActive.collectAsStateWithLifecycle()
+    val usbLiveViewBmp by wiredViewModel.usbLiveViewBitmap.collectAsStateWithLifecycle()
 
     val currentLiveFrame: Bitmap? = when (tetherMode) {
         ActiveTetherMode.WIRELESS_NIKON -> if (nikonLiveViewActive) nikonLiveViewBmp else null
@@ -497,7 +498,7 @@ fun CameraScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                items(lutViewModel.lutLibraryList.value) { lutItem ->
+                items(lutViewModel.lutLibraryList.value, contentType = { "camera-lut" }) { lutItem ->
                     val isSelected = lutViewModel.currentLutId == lutItem.id
                     Box(
                         modifier = Modifier
@@ -978,7 +979,7 @@ fun CameraScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.weight(1f)
                     ) {
-                        items(photoList, key = { it.handle }) { file ->
+                        items(photoList, key = { it.handle }, contentType = { "camera-photo" }) { file ->
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(12.dp))
@@ -1199,7 +1200,7 @@ fun CameraScreen(
                     }
                 } else {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(currentLogs) { log ->
+                        items(currentLogs, contentType = { "camera-log" }) { log ->
                             Text(
                                 text = log,
                                 fontSize = 11.sp,

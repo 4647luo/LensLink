@@ -163,6 +163,35 @@ class DoukState(
     /** 用户在添加设备页选中的连接方式；真正连接时映射为 PTP 的网络模式。 */
     var connectMode by mutableStateOf(ConnectMode.WIFI_STA)
 
+    /**
+     * 连接时按实际网络推断出来的 Wi‑Fi 角色：相机 IP 等于当前网络网关 → 手机连相机热点（AP）；
+     * 不等于网关 → 相机加入路由器/手机热点（STA）；推断不出来就是 null。
+     *
+     * 不能再直接拿 [connectMode] 当展示值：它的默认值是 WIFI_STA，用相机热点连上时
+     * 界面会一直写「Wi‑Fi STA」，与实际拓扑不符。
+     */
+    var detectedWifiRole by mutableStateOf<ConnectMode?>(null)
+        private set
+
+    /** 界面用的一句话模式文案；推断不出来时只说「Wi‑Fi」，不猜。 */
+    val wifiModeLabel: String
+        get() = when (detectedWifiRole) {
+            ConnectMode.WIFI_AP -> "Wi‑Fi · 相机热点"
+            ConnectMode.WIFI_STA -> "Wi‑Fi · 局域网"
+            else -> "Wi‑Fi"
+        }
+
+    /** 连接前记录一次真实拓扑；推断失败保持 null，界面就显示「Wi‑Fi」。 */
+    fun refreshWifiRole(context: Context, ip: String) {
+        detectedWifiRole = detectWifiRole(context.applicationContext, ip)
+    }
+
+    private fun detectWifiRole(context: Context, ip: String): ConnectMode? {
+        val net = CameraLanProbe.networkForIp(context, ip) ?: return null
+        val gateway = CameraLanProbe.gatewayFor(context, net) ?: return null
+        return if (gateway == ip) ConnectMode.WIFI_AP else ConnectMode.WIFI_STA
+    }
+
     /** USB PTP 是否已建立会话（由 DoukRoot 从 UsbPtpClient 的 StateFlow 同步进来）。 */
     var usbConnected by mutableStateOf(false)
 
@@ -1511,6 +1540,9 @@ class DoukState(
         // 用户主动点连接/搜索时恢复自动探测：之前手动断开留下的暂停标记清掉。
         autoConnectPaused = false
         lastAutoConnectAttemptAt = 0L
+        // 先按真实网关确定手机与相机的 Wi‑Fi 角色，再映射 PTP 网络模式：
+        // 否则枚举默认值 WIFI_STA 会把相机热点连成「手机热点」模式。
+        refreshWifiRole(context, target)
         applyNetworkMode(target)
         // 自动连接/搜索结果已经用 TCP 15740 探通过，没必要再做一次 1.5 秒预检；
         // 这一步在旧实现里会把每次自动连接都白白拖慢 1.5~4 秒。
@@ -1581,7 +1613,8 @@ class DoukState(
 
     /** 按当前选中的连接方式，把网络模式映射到 PTP 客户端 */
     private fun applyNetworkMode(ip: String) {
-        when (connectMode) {
+        // 实际拓扑优先：能判断出手机连着相机热点，就不按枚举里的默认 STA 走。
+        when (detectedWifiRole ?: connectMode) {
             ConnectMode.WIFI_AP -> {
                 vm.connectionMode = NikonPtpClient.ConnectionMode.CAMERA_AP
                 vm.switchWirelessMode(WirelessSubMode.AP_DIRECT)
@@ -1651,6 +1684,7 @@ class DoukState(
         // 用户主动断开：先暂停自动探测，别刚断开 20 秒又被自动连回去。
         autoConnectPaused = true
         lastAutoConnectAttemptAt = System.currentTimeMillis()
+        detectedWifiRole = null
         vm.disconnect()
         usb.disconnect()
         ble.disconnect()

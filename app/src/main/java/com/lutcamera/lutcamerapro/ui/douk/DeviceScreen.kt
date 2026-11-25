@@ -52,7 +52,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -424,7 +424,7 @@ private fun ConnectedStatus(state: DoukState) {
         )
         Spacer(modifier = Modifier.width(6.dp))
         Text(
-            "已连接 · ${state.connectMode.label}",
+            "已连接 · ${state.wifiModeLabel}",
             style = DoukType.caption,
             color = DoukColors.success
         )
@@ -565,7 +565,7 @@ private fun WifiPanel(state: DoukState, onOpenWizard: () -> Unit) {
         Text("Wi‑Fi 连接", style = DoukType.title, color = DoukColors.textPrimary)
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            if (wifi) "已连接 · ${state.connectMode.label}" else "未连接",
+            if (wifi) "已连接 · ${state.wifiModeLabel}" else "未连接",
             style = DoukType.caption,
             color = if (wifi) DoukColors.accent else DoukColors.textSecondary
         )
@@ -666,9 +666,9 @@ private fun BleCards(state: DoukState, context: android.content.Context) {
  */
 @Composable
 private fun BleRemoteCard(state: DoukState, context: android.content.Context) {
-    val phase by state.bleRemote.phase.collectAsState()
-    val status by state.bleRemote.status.collectAsState()
-    val cameras by state.bleRemote.cameras.collectAsState()
+    val phase by state.bleRemote.phase.collectAsStateWithLifecycle()
+    val status by state.bleRemote.status.collectAsStateWithLifecycle()
+    val cameras by state.bleRemote.cameras.collectAsStateWithLifecycle()
     val ready = phase == NikonBleRemoteClient.Phase.READY
 
     val permissions = remember {
@@ -838,30 +838,30 @@ private fun BleRemoteCard(state: DoukState, context: android.content.Context) {
 @Composable
 /** 蓝牙 GPS 卡片：连接状态 + 推送间隔 + 最近一次推送的时间与中文地名 */
 private fun BleGpsCard(state: DoukState, context: android.content.Context) {
-    val phase by state.ble.phase.collectAsState()
-    val detail by state.ble.statusDetail.collectAsState()
-    val lastPushAt by state.ble.lastPushAt.collectAsState()
-    val place by state.ble.lastPushPlace.collectAsState()
-    val lastLat by state.ble.lastPushLat.collectAsState()
-    val lastLon by state.ble.lastPushLon.collectAsState()
-    val cameras by state.ble.cameras.collectAsState()
-    val pushCount by state.ble.pushCount.collectAsState()
-    val locationText by state.ble.locationText.collectAsState()
-    val intervalMinutes by state.ble.intervalMinutes.collectAsState()
-    val gpsEnabled by state.ble.gpsEnabledFlow.collectAsState()
-    val accuracyMode by state.ble.locationAccuracy.collectAsState()
-    val syncTime by state.ble.syncTime.collectAsState()
-    val connectedName by state.ble.connectedCameraName.collectAsState()
-    val connectedAddress by state.ble.connectedCameraAddress.collectAsState()
-    val connectedRssi by state.ble.connectedCameraRssi.collectAsState()
-    val lastFixAt by state.ble.lastFixAt.collectAsState()
-    val lastFixAccuracy by state.ble.lastFixAccuracy.collectAsState()
-    val lastFixAltitude by state.ble.lastFixAltitude.collectAsState()
-    val lastFixSatellites by state.ble.lastFixSatellites.collectAsState()
-    val lastFixProvider by state.ble.lastFixProvider.collectAsState()
-    val payloadSatellites by state.ble.lastPayloadSatellites.collectAsState()
-    val payloadAltitude by state.ble.lastPayloadAltitude.collectAsState()
-    val pushConfirmed by state.ble.lastPushConfirmed.collectAsState()
+    val phase by state.ble.phase.collectAsStateWithLifecycle()
+    val detail by state.ble.statusDetail.collectAsStateWithLifecycle()
+    val lastPushAt by state.ble.lastPushAt.collectAsStateWithLifecycle()
+    val place by state.ble.lastPushPlace.collectAsStateWithLifecycle()
+    val lastLat by state.ble.lastPushLat.collectAsStateWithLifecycle()
+    val lastLon by state.ble.lastPushLon.collectAsStateWithLifecycle()
+    val cameras by state.ble.cameras.collectAsStateWithLifecycle()
+    val pushCount by state.ble.pushCount.collectAsStateWithLifecycle()
+    val locationText by state.ble.locationText.collectAsStateWithLifecycle()
+    val intervalMinutes by state.ble.intervalMinutes.collectAsStateWithLifecycle()
+    val gpsEnabled by state.ble.gpsEnabledFlow.collectAsStateWithLifecycle()
+    val accuracyMode by state.ble.locationAccuracy.collectAsStateWithLifecycle()
+    val syncTime by state.ble.syncTime.collectAsStateWithLifecycle()
+    val connectedName by state.ble.connectedCameraName.collectAsStateWithLifecycle()
+    val connectedAddress by state.ble.connectedCameraAddress.collectAsStateWithLifecycle()
+    val connectedRssi by state.ble.connectedCameraRssi.collectAsStateWithLifecycle()
+    val lastFixAt by state.ble.lastFixAt.collectAsStateWithLifecycle()
+    val lastFixAccuracy by state.ble.lastFixAccuracy.collectAsStateWithLifecycle()
+    val lastFixAltitude by state.ble.lastFixAltitude.collectAsStateWithLifecycle()
+    val lastFixSatellites by state.ble.lastFixSatellites.collectAsStateWithLifecycle()
+    val lastFixProvider by state.ble.lastFixProvider.collectAsStateWithLifecycle()
+    val payloadSatellites by state.ble.lastPayloadSatellites.collectAsStateWithLifecycle()
+    val payloadAltitude by state.ble.lastPayloadAltitude.collectAsStateWithLifecycle()
+    val pushConfirmed by state.ble.lastPushConfirmed.collectAsStateWithLifecycle()
 
     val ready = phase == com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient.Phase.READY
     // 设备页的「多久之前」每 30 秒刷新一次；只在这张卡可见时跑，退出设备页就停。

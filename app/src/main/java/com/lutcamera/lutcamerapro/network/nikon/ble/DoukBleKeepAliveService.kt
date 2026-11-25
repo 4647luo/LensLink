@@ -9,7 +9,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import com.lutcamera.lutcamerapro.MainActivity
@@ -30,6 +32,13 @@ class DoukBleKeepAliveService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var latestText: String = "正在保持相机连接"
+    private val renewHandler = Handler(Looper.getMainLooper())
+    private val renewRunnable = object : Runnable {
+        override fun run() {
+            renewWakeLock()
+            renewHandler.postDelayed(this, RENEW_INTERVAL_MS)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -91,13 +100,29 @@ class DoukBleKeepAliveService : Service() {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LianJing:KeepAlive")
             lock.setReferenceCounted(false)
-            // 没有超时：连接断开后 stop() 会立刻释放；超时反而会把长连接晾在后台
-            lock.acquire()
+            // 带超时持有，避免服务异常退出后留下永久 WakeLock；服务存活期间由定时光标续期。
+            lock.acquire(WAKE_LOCK_TIMEOUT_MS)
             wakeLock = lock
+            renewHandler.removeCallbacks(renewRunnable)
+            renewHandler.postDelayed(renewRunnable, RENEW_INTERVAL_MS)
+        }
+    }
+
+    /** setReferenceCounted(false) 下重复 acquire 无效，只能先释放再拿一次来刷新超时。 */
+    private fun renewWakeLock() {
+        val lock = wakeLock
+        if (lock == null) {
+            acquireWakeLock()
+            return
+        }
+        runCatching {
+            if (lock.isHeld) lock.release()
+            lock.acquire(WAKE_LOCK_TIMEOUT_MS)
         }
     }
 
     private fun releaseWakeLock() {
+        renewHandler.removeCallbacks(renewRunnable)
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
     }
@@ -133,6 +158,11 @@ class DoukBleKeepAliveService : Service() {
         private const val CHANNEL_ID = "douk_ble_gps"
         private const val NOTIFICATION_ID = 1201
         const val EXTRA_TEXT = "text"
+
+        /** WakeLock 单次持有上限，作为异常场景的兜底。 */
+        private const val WAKE_LOCK_TIMEOUT_MS = 15L * 60 * 1000
+        /** 续期间隔要明显小于超时，保证正常使用不会掉锁。 */
+        private const val RENEW_INTERVAL_MS = 10L * 60 * 1000
 
         fun start(context: Context, text: String) {
             val intent = Intent(context, DoukBleKeepAliveService::class.java)

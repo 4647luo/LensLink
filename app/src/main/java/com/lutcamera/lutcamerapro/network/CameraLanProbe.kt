@@ -73,8 +73,34 @@ object CameraLanProbe {
         return out.filter { isValidIpv4(it) }
     }
 
-    /** 当前 Wi-Fi / 有线网络的默认网关与 DHCP 服务器地址。 */
-    private fun gatewayAddresses(context: Context): List<String> = activeLanNetworks(context)
+    /**
+     * AP 直连时确认相机真实地址：把用户填的地址和当前 Wi‑Fi 网关/DHCP 服务器并发探一遍，
+     * 返回第一个 15740 端口真能连通的地址。
+     *
+     * 不同机身/固件的热点网段不同（192.168.1.x、192.168.122.x、192.168.125.x 都出现过），
+     * 只写死 192.168.1.1 会在连上相机 Wi‑Fi 后握手失败，相机等不到 PTP 就自己关热点。
+     *
+     * @return 命中的地址；都不通返回 null，调用方保持原地址即可。
+     */
+    suspend fun resolveReachableTarget(
+        context: Context,
+        preferred: String,
+        timeoutMs: Int = 700
+    ): String? {
+        val nets = activeLanNetworks(context)
+        val ips = (listOf(preferred.trim()) + gatewayAddresses(context))
+            .filter { isValidIpv4(it) }
+            .distinct()
+        return probeCandidates(context, ips, timeoutMs, nets).firstOrNull()?.ip
+    }
+
+    /** 指定网络上报的 IPv4 网关 / DHCP 服务器；取不到返回 null。 */
+    fun gatewayFor(context: Context, net: LanNet): String? {
+        val network = net.network ?: return null
+        return gatewayAddresses(context.applicationContext, network).firstOrNull()
+    }
+
+    /** 当前 Wi-Fi / 有线网络的默认网关与 DHCP 服务器地址。 */    private fun gatewayAddresses(context: Context): List<String> = activeLanNetworks(context)
         .mapNotNull { it.network }
         .distinct()
         .flatMap { network -> gatewayAddresses(context, network) }

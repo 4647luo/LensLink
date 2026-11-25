@@ -489,7 +489,7 @@ internal fun VideoLutScreen(
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     item { VideoChip("原片", lutId == null) { applyLut(null) } }
-                    items(lutEntries, key = { it.id }) { entry ->
+                    items(lutEntries, key = { it.id }, contentType = { "lut-entry" }) { entry ->
                         VideoChip(entry.label, lutId == entry.id) { applyLut(entry.id) }
                     }
                 }

@@ -41,6 +41,7 @@ import okhttp3.Request
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.Locale
 
 /**
  * 统一更新入口。
@@ -287,10 +288,11 @@ object UpdateCenter {
         }
     }
 
+    /** 体积文案固定用 Locale.US 格式化，避免阿拉伯语等区域把小数点变成「٫」。 */
     private fun sizeText(bytes: Long): String = when {
-        bytes >= 1024L * 1024L * 1024L -> String.format("%.2f GB", bytes / 1024.0 / 1024.0 / 1024.0)
-        bytes >= 1024L * 1024L -> String.format("%.1f MB", bytes / 1024.0 / 1024.0)
-        else -> String.format("%.0f KB", bytes / 1024.0)
+        bytes >= 1024L * 1024L * 1024L -> String.format(Locale.US, "%.2f GB", bytes / 1024.0 / 1024.0 / 1024.0)
+        bytes >= 1024L * 1024L -> String.format(Locale.US, "%.1f MB", bytes / 1024.0 / 1024.0)
+        else -> String.format(Locale.US, "%.0f KB", bytes / 1024.0)
     }
 
     private fun downloadAndInstall(activity: Activity, info: Info) {

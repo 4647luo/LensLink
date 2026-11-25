@@ -879,7 +879,7 @@ class NikonViewModel : ViewModel() {
         // 1. 启动 FTP 接收服务：只有用户打开「自动下载」才监听端口，
         //    否则相机连上后一直占着 21 端口，既多耗电也扩大局域网暴露面。
         if (com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.autoDownload) {
-            FtpPushReceiver.startReceiver(ftpPort)
+            FtpPushReceiver.startReceiver(ftpPort, cameraIp)
         } else {
             FtpPushReceiver.stopReceiver()
         }

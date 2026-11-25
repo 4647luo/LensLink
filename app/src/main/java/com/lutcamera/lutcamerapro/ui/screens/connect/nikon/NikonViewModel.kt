@@ -85,6 +85,9 @@ class NikonViewModel : ViewModel() {
     var isConnecting by mutableStateOf(false)
         private set
 
+    /** 首次连接失败后自动换 socket 重连的次数（对齐 Z Console 的 RefreshingSocketRoute）。 */
+    private var connectRetryCount = 0
+
     var capturedCount by mutableIntStateOf(0)
         private set
 
@@ -891,6 +894,7 @@ class NikonViewModel : ViewModel() {
             mode = connectionMode,
             listener = object : NikonPtpClient.NikonEventListener {
                 override fun onConnected() {
+                    connectRetryCount = 0
                     viewModelScope.launch(Dispatchers.Main) {
                         isConnecting = false
                         isConnected = true
@@ -921,6 +925,8 @@ class NikonViewModel : ViewModel() {
                 }
 
                 override fun onDisconnected(reason: String) {
+                    // 握手阶段就失败（还没连上过）才值得自动重连；已经连上又掉线不算。
+                    val failedWhileConnecting = isConnecting && !isConnected
                     stopParamPolling()
                     viewModelScope.launch(Dispatchers.Main) {
                         runCatching { FtpPushReceiver.stopReceiver() }
@@ -933,7 +939,18 @@ class NikonViewModel : ViewModel() {
                         lockedBaseline = null
                         compressionDesc = null
                         addLogInner("🔴 ${currentBrand.displayName} 相机已断开: $reason")
-                        _uiEvent.send(NikonUiEvent.ShowToast("🔴 已断开连接"))
+                        // Z Console 的做法：路由失效后不修补旧 socket，直接重建整条连接。
+                        // 这里在首次连接失败时自动再来一次，换掉旧 socket 与旧路由快照。
+                        val ctx = appContext
+                        val target = cameraIp
+                        if (failedWhileConnecting && connectRetryCount < 1 && ctx != null && target.isNotBlank()) {
+                            connectRetryCount++
+                            addLogInner("🔁 连接失败，重建网络路由后自动重试（第 $connectRetryCount 次）")
+                            delay(1500)
+                            connect(ctx, target)
+                        } else {
+                            _uiEvent.send(NikonUiEvent.ShowToast("🔴 已断开连接"))
+                        }
                     }
                 }
 

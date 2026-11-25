@@ -70,6 +70,8 @@ class NikonPtpClient {
         val mutex = Mutex()
         var transaction = 1
         @Volatile var restricted = false
+        /** 机身是否公布 0x952B（PC 主机注册预备）。只有「连接至 PC」向导态才为 true。 */
+        @Volatile var hostRegistration = false
         fun close() { photos.close(); trace?.note("$label CLOSE sockets"); runCatching { command.close() }; runCatching { events.close() } }
     }
     private class CameraResponse(val code: Int) : IOException("相机返回 0x${code.toString(16)}")
@@ -323,6 +325,7 @@ class NikonPtpClient {
                 var device = PtpIpWire.deviceInfo(info.data)
                 if (device.model.isBlank()) throw IOException("相机返回的机身信息为空，会话未成立")
                 c.restricted = PtpIpWire.restrictedNikonProfile(device.operations)
+                c.hostRegistration = 0x952b in device.operations
                 c.pollEvents = 0x90c7 in device.operations
                 trace?.note("${c.label} CAPABILITIES restricted=${c.restricted} operations=${device.operations.joinToString { "0x" + it.toString(16) }} properties=${device.properties.joinToString { "0x" + it.toString(16) }}")
                 _cameraLabel.value = "${device.model} · ${device.firmware}"
@@ -358,6 +361,7 @@ class NikonPtpClient {
                             if (d2.operations.size >= device.operations.size) {
                                 device = d2
                                 c.restricted = PtpIpWire.restrictedNikonProfile(d2.operations)
+                                c.hostRegistration = 0x952b in d2.operations
                                 c.pollEvents = 0x90c7 in d2.operations
                             }
                         }
@@ -1357,16 +1361,28 @@ class NikonPtpClient {
     }
     // Protocol sequence corroborated by open-nikonz/zf-capture-one-helper pairing fixtures.
     // Z30 compatibility remains experimental; user must compare the camera's displayed code.
+    /** 0x952B 发出后，机身落库 host profile 需要的窗口（对齐 N-link 实测的 8.5s）。 */
+    @Volatile private var pairingPreparedAtMs = 0L
+    private val pairingSettleMs = 8500L
+
     suspend fun beginPairing(version: Long): String {
         val c = sessionFor(version)
-        if (!c.restricted) throw IOException("当前会话不是已识别的待配对能力状态")
+        // 原来只认「受限会话」才配对，结果相机在「连接至 PC」向导态但操作码表并未被裁到
+        // 受限时，配对入口直接被挡死。改为按机身自己公布的能力判定：有 0x952B 就允许发。
+        if (!c.restricted && !c.hostRegistration) throw IOException("相机未公布主机注册命令（0x952B），当前模式不支持配对")
         val result = operation(0x952b, expected = c)
         if (result.response.code != 0x2001) throw CameraResponse(result.response.code)
+        pairingPreparedAtMs = System.currentTimeMillis()
         return PtpIpWire.pairingCode(result.data)
     }
     suspend fun confirmPairing(version: Long) {
         val c = sessionFor(version)
-        if (!c.restricted) throw IOException("配对会话状态已变化")
+        if (!c.restricted && !c.hostRegistration) throw IOException("配对会话状态已变化")
+        // 机身要先落库主机档案再接受确认；确认发得太早会被回绝。等满 8.5s 窗口。
+        val waited = System.currentTimeMillis() - pairingPreparedAtMs
+        if (pairingPreparedAtMs > 0L && waited < pairingSettleMs) {
+            withContext(Dispatchers.IO) { delay(pairingSettleMs - waited) }
+        }
         val result = operation(0x935a, intArrayOf(0x2001), expected = c)
         if (result.response.code != 0x2001) throw CameraResponse(result.response.code)
         c.trace?.note("PAIR_SUBMIT_OK; waiting for user to finish wizard on camera; reconnect required")
@@ -1375,9 +1391,10 @@ class NikonPtpClient {
     // 用当前这条待配对会话直接请求 / 提交配对，不需要外部再传会话版本号
     suspend fun requestPairingNow(): String {
         val c = connection ?: throw IOException("会话已断开，请重新连接相机")
-        if (!c.restricted) throw IOException("当前会话已是完整权限，不需要配对")
+        if (!c.restricted && !c.hostRegistration) throw IOException("当前会话已是完整权限，不需要配对")
         val result = operation(0x952b, expected = c)
         if (result.response.code != 0x2001) throw CameraResponse(result.response.code)
+        pairingPreparedAtMs = System.currentTimeMillis()
         val code = PtpIpWire.pairingCode(result.data)
         DoukLog.i("NikonPtp", "PAIR_CODE", "code" to code)
         return code
@@ -1385,6 +1402,11 @@ class NikonPtpClient {
 
     suspend fun submitPairingNow(): Int {
         val c = connection ?: throw IOException("会话已断开，请重新连接相机")
+        // 等满 8.5s 落库窗口再提交，避免机身还在写档案时把确认回绝。
+        val waited = System.currentTimeMillis() - pairingPreparedAtMs
+        if (pairingPreparedAtMs > 0L && waited < pairingSettleMs) {
+            withContext(Dispatchers.IO) { kotlinx.coroutines.delay(pairingSettleMs - waited) }
+        }
         val result = operation(0x935a, intArrayOf(0x2001), expected = c)
         DoukLog.i("NikonPtp", "PAIR_SUBMIT", "code" to "0x%04X".format(result.response.code))
         return result.response.code

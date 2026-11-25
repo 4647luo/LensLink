@@ -2091,6 +2091,14 @@ private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
     ChangelogEntry(
+        "1.1.4",
+        listOf(
+            "· 优化尼康 Z6II / Z7II 等机型的相机热点（AP）连接成功率：首次握手失败会自动重建网络路由与 socket 再试一次，不必手动点重连。",
+            "· 主机注册（配对）不再要求相机处于「仅公布少量命令」的受限态，只要机身公布 0x952B 就能发起；提交确认前会等满 8.5 秒，避免相机还在落库档案时回绝。",
+            "· 相机端公布的 0x952B / 0x935A 配对流程与 0x9435/0x90C2 接管流程保持独立，AP 模式仍不碰这两个命令。"
+        )
+    ),
+    ChangelogEntry(
         "1.1.3",
         listOf(
             "· 相机网络选择更严格：排除 VPN / 代理网络（要求 Wi‑Fi 且带 NOT_VPN），避免把包送进 tun 网卡后相机收不到。",

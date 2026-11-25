@@ -1575,6 +1575,10 @@ class DoukState(
                 }
             }
             if (reachable) {
+                // 探测只做 TCP 建链后立刻 close，但机身只有一个 PTP/IP 客户端槽，
+                // 关掉的连接在相机侧还要一小段时间回收。立刻发真实握手会撞在满的
+                // accept 队列上，表现就是「端口可达却连接失败」。留 400ms 缓冲。
+                delay(400)
                 withContext(Dispatchers.Main) {
                     DoukLog.i("Connect", "PREFLIGHT_OK", "target" to "$target:${CameraLanProbe.PTP_PORT}")
                     lastHint = "$target 端口可达，正在建立 PTP/IP 会话…"

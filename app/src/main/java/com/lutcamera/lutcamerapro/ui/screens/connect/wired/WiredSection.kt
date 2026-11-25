@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.ui.screens.connect.wired
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -177,7 +178,7 @@ fun WiredSection(
                     }
                 }
 
-                val liveActive by viewModel.isUsbLiveViewActive.collectAsState()
+                val liveActive by viewModel.isUsbLiveViewActive.collectAsStateWithLifecycle()
                 Surface(
                     modifier = Modifier
                         .weight(1f)

@@ -1,5 +1,6 @@
 package com.lutcamera.lutcamerapro.ui.screens.connect.nikon
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -315,6 +316,8 @@ fun NikonSection(
 
             // 5. 快速线控与图传控制区 (连接成功后显示)
                 if (viewModel.isConnected) {
+                // 同一个 flow 只订阅一次：按钮底色和文案共用这一份状态，避免双收集器。
+                val liveActive by viewModel.isLiveViewActive.collectAsStateWithLifecycle()
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -345,13 +348,13 @@ fun NikonSection(
                         onClick = { viewModel.toggleLiveView() },
                         modifier = Modifier.weight(1f).height(38.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (viewModel.isLiveViewActive.collectAsState().value) Color(0xFF7C4DFF) else Color(0xFF262C3A)
+                            containerColor = if (liveActive) Color(0xFF7C4DFF) else Color(0xFF262C3A)
                         ),
                         shape = RoundedCornerShape(8.dp)
                     ) {
                         Icon(Icons.Default.Videocam, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(if (viewModel.isLiveViewActive.collectAsState().value) "Stop LiveView" else "LiveView", fontSize = 12.sp)
+                        Text(if (liveActive) "Stop LiveView" else "LiveView", fontSize = 12.sp)
                     }
                 }
 
@@ -391,7 +394,7 @@ fun NikonSection(
                     Text("等待连接尼康相机 (支持 AP 与 STA 模式)...", color = Color.DarkGray, fontSize = 10.sp)
                 } else {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(viewModel.logs) { log ->
+                        items(viewModel.logs, contentType = { "nikon-log" }) { log ->
                             Text(log, color = Color(0xFF00FF66), fontSize = 10.sp, lineHeight = 13.sp)
                         }
                     }

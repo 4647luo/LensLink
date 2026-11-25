@@ -8,7 +8,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -51,7 +51,7 @@ private val AppleLightColorScheme = lightColorScheme(
 fun LutcameraproTheme(
     content: @Composable () -> Unit
 ) {
-    val isDark by AppThemeManager.isDarkMode.collectAsState()
+    val isDark by AppThemeManager.isDarkMode.collectAsStateWithLifecycle()
     val colorScheme = if (isDark) AppleDarkColorScheme else AppleLightColorScheme
     val duoColors = if (isDark) DarkDuoPalette else LightDuoPalette
     val appleColors = if (isDark) DarkApplePalette else LightApplePalette

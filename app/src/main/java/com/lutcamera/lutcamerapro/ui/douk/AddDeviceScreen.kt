@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.PaddingValues
@@ -74,6 +75,8 @@ fun AddDeviceScreen(
     }
     /** 手动填 IP 只是搜索失败时的备用手段，默认收起，避免和主流程抢注意力 */
     var manualExpanded by remember { mutableStateOf(false) }
+    // 连接教程收进右上角弹窗，页面正文只留选方式与连接按钮。
+    var showHint by remember { mutableStateOf(false) }
     LaunchedEffect(selectedMode) {
         when (selectedMode) {
             ConnectMode.WIFI_AP -> if (manualIp.isBlank()) manualIp = "192.168.1.1"
@@ -139,6 +142,14 @@ fun AddDeviceScreen(
                 color = DoukColors.textPrimary,
                 modifier = Modifier.weight(1f)
             )
+            TextButton(onClick = { showHint = true }) {
+                Text(
+                    "连接教程",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = DoukColors.accent
+                )
+            }
         }
 
         Column(
@@ -218,8 +229,7 @@ fun AddDeviceScreen(
                 Spacer(modifier = Modifier.height(10.dp))
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-            ConnectionHint(selectedMode, spec)
+            // 连接教程已收进右上角「连接教程」弹窗，正文不再重复占版面。
 
             // 主流程：先用搜索自动发现相机（mDNS + 局域网端口探测）
             Spacer(modifier = Modifier.height(16.dp))
@@ -598,6 +608,32 @@ fun AddDeviceScreen(
 
             Spacer(modifier = Modifier.height(30.dp))
         }
+    }
+
+    if (showHint) {
+        AlertDialog(
+            onDismissRequest = { showHint = false },
+            title = {
+                Text("连接教程", style = DoukType.title, color = DoukColors.textPrimary)
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 460.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    ConnectionHint(
+                        selectedMode,
+                        NikonModelSpec.of(state.profile.model.takeIf { it != "—" && it.isNotBlank() })
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showHint = false }) {
+                    Text("知道了", color = DoukColors.accent, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        )
     }
 }
 

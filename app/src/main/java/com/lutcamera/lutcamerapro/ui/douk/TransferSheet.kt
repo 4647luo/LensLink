@@ -33,7 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,8 +64,8 @@ import java.util.Locale
  */
 @Composable
 internal fun TransferSheet(onDismiss: () -> Unit) {
-    val records by TransferCenter.records.collectAsState()
-    val thumbnails by TransferCenter.thumbnails.collectAsState()
+    val records by TransferCenter.records.collectAsStateWithLifecycle()
+    val thumbnails by TransferCenter.thumbnails.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val active = records.filter { it.isActive }
         .sortedWith(compareBy({ if (it.status == TransferStatus.RUNNING) 0 else 1 }, { it.createdAt }))
@@ -163,7 +163,7 @@ internal fun TransferSheet(onDismiss: () -> Unit) {
                             item {
                                 SectionLabel("正在传输 / 等待继续", active.size)
                             }
-                            items(active, key = { it.id }) { record ->
+                            items(active, key = { it.id }, contentType = { "transfer-active" }) { record ->
                                 TransferRow(record, thumbnails[record.id])
                             }
                         }
@@ -171,7 +171,7 @@ internal fun TransferSheet(onDismiss: () -> Unit) {
                             item {
                                 SectionLabel("最近记录", finished.size)
                             }
-                            items(finished.take(60), key = { it.id }) { record ->
+                            items(finished.take(60), key = { it.id }, contentType = { "transfer-finished" }) { record ->
                                 TransferRow(record, thumbnails[record.id])
                             }
                         }

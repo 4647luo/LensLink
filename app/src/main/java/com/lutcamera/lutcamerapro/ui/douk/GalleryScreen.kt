@@ -78,7 +78,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -319,7 +319,7 @@ fun GalleryScreen(
     val showFormatBadge = galleryFormatBadge.value
     var showSourceMenu by remember { mutableStateOf(false) }
     var showTransfers by remember { mutableStateOf(false) }
-    val transferRecords by TransferCenter.records.collectAsState()
+    val transferRecords by TransferCenter.records.collectAsStateWithLifecycle()
     var previewItem by remember { mutableStateOf<GalleryItem?>(null) }
     var galleryView by remember { mutableStateOf(GalleryView.PHOTOS) }
     var showViewSwitch by remember { mutableStateOf(false) }

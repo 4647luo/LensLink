@@ -141,7 +141,7 @@ fun LutLibraryScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            items(categories) { cat ->
+            items(categories, contentType = { "lut-category" }) { cat ->
                 val isSelected = viewModel.selectedCategory == cat
                 Box(
                     modifier = Modifier
@@ -175,7 +175,7 @@ fun LutLibraryScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier.weight(1f)
         ) {
-            items(filteredList) { item ->
+            items(filteredList, contentType = { "lut-item" }) { item ->
                 val isCurrent = viewModel.currentLutId == item.id
                 AppleCard(
                     modifier = Modifier

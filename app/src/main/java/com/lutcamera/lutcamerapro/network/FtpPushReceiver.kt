@@ -23,7 +23,9 @@ import java.util.concurrent.Semaphore
  * 照片回传通道：手搓微型 FTP 服务器。
  *
  * 运行约束：
- * - 仅绑定当前 Wi‑Fi 本机地址；相机通过手机热点 / 直连 Wi-Fi 接入，免密登录；
+ * - 仅绑定当前 Wi‑Fi 本机地址；取不到本机地址时不启动，避免回退到监听全部网卡；
+ * - 只接受来源 IP 等于当前相机地址的连接，挡掉同网段其他设备；
+ * - 相机通过手机热点 / 直连 Wi-Fi 接入，免密登录；
  * - 上传先落到 cache/ftp-incoming 临时文件，不再把 200MB 读进 ByteArray；
  * - 单文件 200MB、并发 2 个、临时目录最多 500MB / 32 个文件。
  */
@@ -33,6 +35,10 @@ object FtpPushReceiver {
     private const val MAX_INCOMING_TOTAL_BYTES = 500L * 1024 * 1024
     private const val MAX_INCOMING_FILES = 32
     private const val MAX_EVENTS_PER_CLIENT = 512
+
+    /** 当前连接的相机地址；非空且是合法 IPv4 时，只放行来自该地址的上传。 */
+    @Volatile
+    private var allowedClientIp: String? = null
 
     private var cmdServer: ServerSocket? = null
     private var serverJob: Job? = null
@@ -72,29 +78,41 @@ object FtpPushReceiver {
 
     /**
      * 启动 FTP 监听（默认端口 2121，避开 Android 低端口权限问题）。
+     *
+     * @param cameraIp 当前 PTP 会话的相机地址。传入合法 IPv4 时只接受该地址的连接；
+     *                 为空或不是 IPv4（例如用户填了主机名）时退化为只绑定本机网卡，
+     *                 不放开全接口。
      */
-    fun startReceiver(port: Int = 2121) {
+    fun startReceiver(port: Int = 2121, cameraIp: String? = null) {
         if (_isRunning.value) return
+        allowedClientIp = cameraIp?.trim()?.takeIf { isIpv4(it) }
         appContext?.let { trimIncoming(it) }
+
+        // 先解析绑定地址；取不到本机 Wi‑Fi IP 就不启动，避免 0.0.0.0 暴露在所有网卡上。
+        val localIp = runCatching { NetworkUtils.getLocalIpv4Address() }.getOrNull()
+            ?.takeIf { it.isNotBlank() && it != "0.0.0.0" && it != "127.0.0.1" }
+        if (localIp == null) {
+            Log.w(TAG, "未取到本机 Wi‑Fi IP，FTP 回传通道不启动")
+            _isRunning.value = false
+            return
+        }
+
         _isRunning.value = true
 
         serverJob = scope.launch {
             try {
-                val localIp = runCatching { NetworkUtils.getLocalIpv4Address() }.getOrNull()
-                    ?.takeIf { it.isNotBlank() && it != "0.0.0.0" && it != "127.0.0.1" }
                 cmdServer = ServerSocket().apply {
                     reuseAddress = true
-                    if (localIp != null) {
-                        bind(InetSocketAddress(localIp, port))
-                    } else {
-                        // 拿不到本机 Wi‑Fi IP 时仍要能用，只是控制连接会落在默认网卡。
-                        Log.w(TAG, "未取到本机 Wi‑Fi IP，控制连接回退到默认网卡")
-                        bind(InetSocketAddress(port))
-                    }
+                    bind(InetSocketAddress(localIp, port))
                 }
 
                 while (isActive && _isRunning.value) {
                     val client = cmdServer?.accept() ?: break
+                    if (!isClientAllowed(client)) {
+                        Log.w(TAG, "拒绝非相机来源的 FTP 连接: ${client.inetAddress?.hostAddress}")
+                        runCatching { client.close() }
+                        continue
+                    }
                     clientSockets.add(client)
                     launch {
                         try {
@@ -112,6 +130,16 @@ object FtpPushReceiver {
             }
         }
     }
+
+    /** 只放行当前相机地址；未配置相机地址时不额外限制（仍只绑在本机 Wi‑Fi 网卡上）。 */
+    private fun isClientAllowed(client: Socket): Boolean {
+        val expected = allowedClientIp ?: return true
+        val actual = client.inetAddress?.hostAddress ?: return false
+        return actual == expected
+    }
+
+    private fun isIpv4(value: String): Boolean =
+        value.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))
 
     /**
      * 开启自动化处理管道。
@@ -138,6 +166,7 @@ object FtpPushReceiver {
 
     fun stopReceiver() {
         _isRunning.value = false
+        allowedClientIp = null
         serverJob?.cancel()
         serverJob = null
         runCatching { cmdServer?.close() }

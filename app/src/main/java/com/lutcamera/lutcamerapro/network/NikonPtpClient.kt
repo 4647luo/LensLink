@@ -208,10 +208,23 @@ class NikonPtpClient {
                 DoukLog.i("NikonPtp", "CONNECT_BEGIN", "mode" to mode, "target" to "$cameraIp:$PTP_PORT")
                 require(cameraIp.matches(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) &&
                     cameraIp.split('.').all { it.toInt() in 0..255 }) { "请输入相机的 IPv4 地址" }
-                val address = InetAddress.getByName(cameraIp)
+                // AP 直连时不能只认 192.168.1.1：不同机身/固件的热点网段不一样
+                // （实测有 192.168.1.x、192.168.122.x、192.168.125.x）。用当前 Wi‑Fi 网关
+                // 和用户填的地址并发探一次 15740，谁真能连上就用谁，避免「连上相机 Wi‑Fi
+                // 却握手失败 → 相机自己关热点」这种假连接。
+                var targetIp = cameraIp
+                if (mode == ConnectionMode.CAMERA_AP && context != null) {
+                    val reachable = CameraLanProbe.resolveReachableTarget(context, cameraIp)
+                    if (reachable != null && reachable != cameraIp) {
+                        targetIp = reachable
+                        DoukLog.i("NikonPtp", "AP_TARGET_SWITCH", "from" to cameraIp, "to" to targetIp)
+                        listener?.onLog("相机热点实际地址为 $targetIp，已自动切换（不是 $cameraIp）")
+                    }
+                }
+                val address = InetAddress.getByName(targetIp)
                 // 选路交给 CameraRouteResolver：现成网络优先，再 requestNetwork 兜底，
                 // 最后把 source 地址钉到相机网段（鸿蒙上 per-network socket 不保证生效）。
-                val route = context?.let { CameraRouteResolver.resolve(it, cameraIp) }
+                val route = context?.let { CameraRouteResolver.resolve(it, targetIp) }
                     ?: CameraRouteResolver.Route(
                         network = null,
                         pinnedLocalIp = null,
@@ -220,8 +233,8 @@ class NikonPtpClient {
                         localNets = CameraLanProbe.localNetworkSummary()
                     )
                 if (mode == ConnectionMode.CAMERA_AP && route.validated) {
-                    listener?.onLog("当前 Wi-Fi 能访问互联网，可能是家用路由器。相机热点模式请先连接机身显示的 Wi-Fi，再连接 192.168.1.1。")
-                    trace?.note("AP_NETWORK_WARNING ${route.describe()} target=$cameraIp may be a router")
+                    listener?.onLog("当前 Wi-Fi 能访问互联网，可能是家用路由器。相机热点模式请先连接机身显示的 Wi-Fi，再连接相机地址。")
+                    trace?.note("AP_NETWORK_WARNING ${route.describe()} target=$targetIp may be a router")
                 }
                 val commandSocket = route.network?.socketFactory?.createSocket() ?: Socket()
                 val eventSocket = route.network?.socketFactory?.createSocket() ?: Socket()
@@ -229,18 +242,18 @@ class NikonPtpClient {
                     runCatching { commandSocket.bind(InetSocketAddress(ip, 0)) }
                     runCatching { eventSocket.bind(InetSocketAddress(ip, 0)) }
                 }
-                DoukLog.i("NikonPtp", "NET_ROUTE", "target" to cameraIp, "route" to route.describe())
+                DoukLog.i("NikonPtp", "NET_ROUTE", "target" to targetIp, "route" to route.describe())
                 if (route.source == CameraRouteResolver.Route.Source.REQUESTED_NETWORK) {
-                    DoukLog.i("NikonPtp", "NET_REQUESTED", "target" to cameraIp, "granted" to true)
+                    DoukLog.i("NikonPtp", "NET_REQUESTED", "target" to targetIp, "granted" to true)
                 }
                 val c = Connection(commandSocket, eventSocket, trace)
                 own = c
                 synchronized(lifecycle) {
                     if (generation != token) { c.close(); throw CancellationException() }
                     connection = c
-                    _connectionStage.value = "正在连接 $cameraIp:$PTP_PORT"
+                    _connectionStage.value = "正在连接 $targetIp:$PTP_PORT"
                 }
-                listener?.onLog("连接方式 $mode，目标 $cameraIp；${if (route.bound) "使用 Wi-Fi 路由" else "使用系统本地路由"}")
+                listener?.onLog("连接方式 $mode，目标 $targetIp；${if (route.bound) "使用 Wi-Fi 路由" else "使用系统本地路由"}")
                 trace?.note("${c.label} ROUTE ${route.describe()} mode=$mode target=$address:$PTP_PORT")
                 c.command.tcpNoDelay = true
                 c.command.soTimeout = 12000
@@ -257,7 +270,7 @@ class NikonPtpClient {
                 if (PtpIpWire.type(ack) == 5) {
                     val reason = if (ack.size >= 12) PtpIpWire.le(ack).getInt(8) else -1
                     // 相机端屏幕上那句「连接失败」就对应这里：机身主动回了 InitFail
-                    DoukLog.e("NikonPtp", "HANDSHAKE_FAIL", "initFail" to reason, "target" to "$cameraIp:$PTP_PORT",
+                    DoukLog.e("NikonPtp", "HANDSHAKE_FAIL", "initFail" to reason, "target" to "$targetIp:$PTP_PORT",
                         "hint" to if (reason == 1) "相机不认这个配对身份" else "相机主动断开")
                     throw IOException(if (reason == 1)
                         "相机拒绝此应用的配对身份 (InitFail 1)。若曾重装或清除应用数据，请从旧日志恢复身份，或在相机上新建配置并重新配对。"

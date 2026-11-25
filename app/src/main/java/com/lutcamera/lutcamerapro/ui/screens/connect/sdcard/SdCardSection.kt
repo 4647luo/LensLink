@@ -218,7 +218,7 @@ fun SdCardSection(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(photos, key = { it.id }) { item ->
+                        items(photos, key = { it.id }, contentType = { "sd-photo" }) { item ->
                             AppleSdPhotoGridItem(
                                 item = item,
                                 viewModel = viewModel,

@@ -26,8 +26,11 @@
 | Accompanist DrawablePainter（Telephoto 传递依赖） | 0.34.0 | Apache-2.0 |
 | Material Icons Extended | Compose BOM | Apache-2.0 |
 | LibRaw | 0.23.0 Snapshot202611 | CDDL-1.0（本项目选择）或 LGPL-2.1 |
+| LibRaw-CMake（构建包装脚本） | 随工程内嵌 | BSD-3-Clause |
 
 LibRaw 以源码形式随工程编译（`app/src/main/cpp/libraw/`），包含 `nikonhe.cpp` 对尼康 Z50II HE/HE★ NEF 的解码支持。许可原文见同目录 `LICENSE.CDDL`、`LICENSE.LGPL` 与 `COPYRIGHT`。上游：https://github.com/LibRaw/LibRaw
+
+LibRaw-CMake 是随工程内嵌的构建包装脚本（`app/src/main/cpp/libraw-cmake/`），仅负责把 LibRaw 接入 CMake 并生成 `libraw::libraw` 目标，本身不含 LibRaw 源码。许可为 BSD-3-Clause，原文见同目录 `LICENSE`，已原样保留。
 
 Test-only: JUnit 4.13.2 (EPL-1.0), AndroidX Test JUnit 1.3.0, Espresso 3.7.0 (Apache-2.0). They are not shipped as application features.
 

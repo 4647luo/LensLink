@@ -55,8 +55,8 @@ class MainActivity : ComponentActivity() {
                 DoukRoot()
             }
         }
-        // 启动顺序：本月还没弹过赞赏提示就先弹一次，关掉后再检查更新；
-        // 本月已弹过则直接检查更新。两个对话框不叠在一起。
+        // 启动顺序：安装满一个月且本次安装没提示过，就先弹一次赞赏提示，关掉后再检查更新；
+        // 其余情况（未满一个月、已提示过、覆盖升级）直接检查更新。两个对话框不叠在一起。
         lifecycleScope.launch {
             val supportShown = SupportReminder.showIfDue(this@MainActivity) {
                 lifecycleScope.launch {

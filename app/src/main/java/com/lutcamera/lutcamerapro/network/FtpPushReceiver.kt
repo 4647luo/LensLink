@@ -5,14 +5,12 @@ import android.util.Log
 import com.lutcamera.lutcamerapro.gpu.ImageAutoProcessor
 import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.model.BorderState
-import com.lutcamera.lutcamerapro.ui.douk.DoukPrefs
 import com.lutcamera.lutcamerapro.ui.screens.connect.wired.SaveMode
 import com.lutcamera.lutcamerapro.util.BoundedIo
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
-import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -24,9 +22,8 @@ import java.util.concurrent.Semaphore
 /**
  * 照片回传通道：手搓微型 FTP 服务器。
  *
- * 安全约束：
- * - 不再是匿名 FTP：相机 FTP 配置里的密码必须等于设置页显示的 8 位口令；
- * - 控制连接和数据连接都尽量只绑当前 Wi‑Fi 本机地址；
+ * 运行约束：
+ * - 仅绑定当前 Wi‑Fi 本机地址；相机通过手机热点 / 直连 Wi-Fi 接入，免密登录；
  * - 上传先落到 cache/ftp-incoming 临时文件，不再把 200MB 读进 ByteArray；
  * - 单文件 200MB、并发 2 个、临时目录最多 500MB / 32 个文件。
  */
@@ -36,7 +33,6 @@ object FtpPushReceiver {
     private const val MAX_INCOMING_TOTAL_BYTES = 500L * 1024 * 1024
     private const val MAX_INCOMING_FILES = 32
     private const val MAX_EVENTS_PER_CLIENT = 512
-    private const val MAX_AUTH_FAILURES = 3
 
     private var cmdServer: ServerSocket? = null
     private var serverJob: Job? = null
@@ -67,13 +63,11 @@ object FtpPushReceiver {
     var borderState: BorderState = BorderState()
 
     private var appContext: Context? = null
-    private var ftpToken: String = ""
     private var onProcessedCallback: ((String) -> Unit)? = null
 
-    /** 在 Application 启动时调用，确保即使没连相机也能拿到当前口令。 */
+    /** 在 Application 启动时调用，先记下 applicationContext 并清理临时目录。 */
     fun init(context: Context) {
         appContext = context.applicationContext
-        ftpToken = DoukPrefs.ftpToken
     }
 
     /**
@@ -81,12 +75,6 @@ object FtpPushReceiver {
      */
     fun startReceiver(port: Int = 2121) {
         if (_isRunning.value) return
-        val token = ftpToken.ifBlank { DoukPrefs.ftpToken }
-        if (token.isBlank()) {
-            Log.e(TAG, "FTP 未启动：缺少上传口令")
-            return
-        }
-        ftpToken = token
         appContext?.let { trimIncoming(it) }
         _isRunning.value = true
 
@@ -99,7 +87,7 @@ object FtpPushReceiver {
                     if (localIp != null) {
                         bind(InetSocketAddress(localIp, port))
                     } else {
-                        // 拿不到本机 Wi‑Fi IP 时仍要能用，但此时已有口令校验兜底。
+                        // 拿不到本机 Wi‑Fi IP 时仍要能用，只是控制连接会落在默认网卡。
                         Log.w(TAG, "未取到本机 Wi‑Fi IP，控制连接回退到默认网卡")
                         bind(InetSocketAddress(port))
                     }
@@ -137,7 +125,6 @@ object FtpPushReceiver {
         port: Int = 2121
     ) {
         appContext = context.applicationContext
-        ftpToken = DoukPrefs.ftpToken
         this.currentLut = currentLut
         this.intensity = intensity
         this.autoApplyLut = autoApplyLut
@@ -172,7 +159,6 @@ object FtpPushReceiver {
             val writer = client.outputStream.bufferedWriter()
             var dataServer: ServerSocket? = null
             var authenticated = false
-            var authFailures = 0
             var events = 0
 
             fun reply(code: String) {
@@ -207,15 +193,9 @@ object FtpPushReceiver {
                 when (cmd) {
                     "USER" -> reply("331 Password required")
                     "PASS" -> {
-                        if (arg == ftpToken) {
-                            authenticated = true
-                            reply("230 User logged in successfully")
-                        } else {
-                            authFailures++
-                            delay(500)
-                            reply("530 Authentication failed")
-                            if (authFailures >= MAX_AUTH_FAILURES) break
-                        }
+                        // 局域网 / 手机热点直连场景：免密放行，不再设置 FTP 密码。
+                        authenticated = true
+                        reply("230 User logged in successfully")
                     }
                     "SYST" -> if (requireAuth()) reply("215 UNIX Type: L8")
                     "PWD" -> if (requireAuth()) reply("257 \"/\" is current directory")

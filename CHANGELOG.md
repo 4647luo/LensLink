@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.5
+
+更换 Release 签名证书，并补齐合规说明。
+
+- **签名更换**：从 1.1.5 起使用新的 RSA 4096 证书（有效期至 2054-04-13）。指纹与 1.1.4 及更早版本不同，**升级需先卸载旧版再安装**，直接覆盖会失败。
+- 设置 → 关于 新增「开源许可」页：集中列出 LibRaw（CDDL-1.0，附源码地址与 LICENSE 文件位置）、Jetpack Compose / AndroidX / Coil / Telephoto / Haze、OkHttp / Gson / Timber / xLog / ACRA，以及各许可证原文链接。
+- 使用条款「知识产权与商标」补充 LibRaw 源码获取地址；README 增加指向 THIRD_PARTY_NOTICES.md 的说明。
+- 仓库历史清理：从全部提交中移除此前误打包进源码 zip 的本机构建配置与签名口令。
 ## 1.1.4
 
 连接失败自动换路、配对门控放宽。

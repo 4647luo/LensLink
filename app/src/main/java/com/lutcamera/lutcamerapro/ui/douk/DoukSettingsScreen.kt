@@ -2091,6 +2091,14 @@ private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
     ChangelogEntry(
+        "1.1.5",
+        listOf(
+            "· 更换 Release 签名证书：已安装旧版的用户需先卸载再安装 1.1.5，直接覆盖会提示应用未安装。",
+            "· 「关于」新增开源许可页，列出 LibRaw、Compose、Coil、Telephoto、OkHttp 等组件与许可证原文链接。",
+            "· 使用条款补充 LibRaw 源码获取地址。"
+        )
+    ),
+    ChangelogEntry(
         "1.1.4",
         listOf(
             "· 优化尼康 Z6II / Z7II 等机型的相机热点（AP）连接成功率：首次握手失败会自动重建网络路由与 socket 再试一次，不必手动点重连。",

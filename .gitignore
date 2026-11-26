@@ -32,3 +32,4 @@ Nikon-STA-*.zip
 # Built application packages are published as release artifacts, not source
 *.apk
 *.aab
+keystore.properties.*

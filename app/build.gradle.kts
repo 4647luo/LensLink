@@ -6,13 +6,35 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.android)
 }
 
-// Release 签名配置从本地 keystore.properties 读取；该文件和签名密钥都不进仓库。
-val keystorePropsFile = rootProject.file("keystore.properties")
+// Release 签名配置从仓库外的 signing/ 目录读取；仓库（含根目录）不再保留任何明文口令。
+// 查找顺序：环境变量 LENSLINK_SIGNING_DIR → 仓库上一级的 signing/ → 仓库内的 signing/（仅兼容旧布局）
+// 目录内优先取 keystore.properties，否则取最新的 keystore.properties-YYYYMMDD
+val signingDirs = listOfNotNull(
+    System.getenv("LENSLINK_SIGNING_DIR")?.let { File(it) },
+    rootProject.projectDir.parentFile?.resolve("signing"),
+    rootProject.projectDir.resolve("signing")
+)
+val keystorePropsFile: File? = signingDirs
+    .filter { it.isDirectory }
+    .mapNotNull { dir ->
+        dir.resolve("keystore.properties").takeIf { it.isFile }
+            ?: dir.listFiles { f -> f.isFile && f.name.startsWith("keystore.properties-") }
+                ?.maxByOrNull { it.lastModified() }
+    }
+    .firstOrNull()
+
 val keystoreProps = Properties().apply {
-    if (keystorePropsFile.exists()) {
+    if (keystorePropsFile != null) {
         FileInputStream(keystorePropsFile).use { load(it) }
     }
 }
+
+fun signingProp(name: String): String =
+    keystoreProps.getProperty(name)?.takeIf { it.isNotBlank() }
+        ?: throw GradleException(
+            "缺少签名配置 $name：release 包必须使用固定的连镜签名密钥。" +
+                "请在 signing/keystore.properties 中提供（已查找：${signingDirs.joinToString("、")}）。"
+        )
 
 android {
     namespace = "com.lutcamera.lutcamerapro"
@@ -49,13 +71,10 @@ android {
 
     signingConfigs {
         create("release") {
-            require(keystorePropsFile.exists()) {
-                "缺少 keystore.properties：release 包必须使用固定的连镜签名密钥。"
-            }
-            storeFile = file(keystoreProps.getProperty("storeFile"))
-            storePassword = keystoreProps.getProperty("storePassword")
-            keyAlias = keystoreProps.getProperty("keyAlias")
-            keyPassword = keystoreProps.getProperty("keyPassword")
+            storeFile = file(signingProp("storeFile"))
+            storePassword = signingProp("storePassword")
+            keyAlias = signingProp("keyAlias")
+            keyPassword = signingProp("keyPassword")
             enableV1Signing = false
             enableV2Signing = true
             enableV3Signing = true

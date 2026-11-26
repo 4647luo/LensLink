@@ -34,7 +34,7 @@
 
 ## 安装
 
-1. 在 [Releases](https://github.com/4647luo/lianjing/releases/latest) 下载 `lianjing-1.0.0.apk`。
+1. 在 [Releases](https://github.com/4647luo/lianjing/releases/latest) 下载 `lianjing-1.1.5.apk`。
 2. 在 Android 手机上允许「安装未知来源应用」。
 3. 安装后打开连镜，按提示授予照片、附近设备、定位等权限。
 

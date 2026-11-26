@@ -33,3 +33,5 @@ Nikon-STA-*.zip
 *.apk
 *.aab
 keystore.properties.*
+# Release 资产临时目录：由 CI 上传到 Release 后自动删除
+!release-assets/

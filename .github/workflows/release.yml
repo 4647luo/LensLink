@@ -1,0 +1,75 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tag = os.environ['GITHUB_REF_NAME']
+          ver = tag.lstrip('v')
+          text = open('CHANGELOG.md', encoding='utf-8').read()
+          start = text.find('## ' + ver)
+          if start < 0:
+              notes = '见仓库 CHANGELOG.md'
+          else:
+              nxt = text.find('\n## ', start + 3)
+              notes = text[start: nxt if nxt > 0 else len(text)].strip()
+          open('notes.md', 'w', encoding='utf-8').write(notes)
+          print(notes[:400])
+          PY
+
+      - name: Publish GitHub Release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          TAG="$GITHUB_REF_NAME"
+          APK="release-assets/lianjing-${VER}.apk"
+          ls -l "$APK"
+          sha256sum "$APK"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "连镜 ${VER}" --notes-file notes.md
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" --title "连镜 ${VER}" --notes-file notes.md "$APK"
+          fi
+
+      - name: Drop old APK assets from earlier releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for rel in v1.1.1 v1.1.0 v1.0.1 v1.0.0; do
+            if gh release view "$rel" >/dev/null 2>&1; then
+              for a in $(gh release view "$rel" --json assets -q '.assets[].name'); do
+                echo "delete asset: $rel / $a"
+                gh release delete-asset "$rel" "$a" --yes || true
+              done
+            fi
+          done
+
+      - name: Remove the temporary APK from the repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -r --cached release-assets >/dev/null || true
+          rm -rf release-assets
+          git commit -m "chore: 移除临时发布用的 APK" || exit 0
+          git push origin HEAD:main || true

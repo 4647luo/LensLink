@@ -1,0 +1,14 @@
+# 让 git archive 与 GitHub「Download ZIP」不带出本机签名配置
+keystore.properties export-ignore
+keystore.properties.* export-ignore
+signing/ export-ignore
+signing.properties export-ignore
+local.properties export-ignore
+*.jks export-ignore
+*.keystore export-ignore
+*.p12 export-ignore
+*.pfx export-ignore
+
+# 统一换行，避免脚本与 CI 在 Windows/Linux 之间来回改动
+*.sh text eol=lf
+*.ps1 text eol=crlf

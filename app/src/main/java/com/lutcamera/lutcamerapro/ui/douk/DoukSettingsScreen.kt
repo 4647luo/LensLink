@@ -2270,6 +2270,36 @@ private fun changelogFor(current: String): List<String> {
     }
 }
 
+/** 「开源许可」页正文：满足 CDDL / Apache-2.0 / BSD 的署名与源码可获取要求。完整清单见仓库 THIRD_PARTY_NOTICES.md */
+private val OPEN_SOURCE_LINES = listOf(
+    "连镜使用下列开源组件，各组件的版权归其作者所有，许可证原文随组件保留在仓库对应目录。本页只作署名与源码获取说明，不改变任何许可证条款。",
+    "",
+    "一、RAW 解码",
+    "LibRaw 0.23.0 Snapshot202611：本项目选择 CDDL-1.0 许可，以源码形式随工程编译。",
+    "源码获取：https://github.com/4647luo/lianjing/tree/main/app/src/main/cpp/libraw",
+    "许可证原文：同目录下的 LICENSE.CDDL、LICENSE.LGPL 与 COPYRIGHT。你也可以按 LGPL-2.1 的条款使用该组件。",
+    "LibRaw-CMake（把 LibRaw 接入 CMake 的构建包装脚本）：BSD-3-Clause，源码在 app/src/main/cpp/libraw-cmake。",
+    "",
+    "二、界面与图像",
+    "Jetpack Compose（BOM 2024.12.01）、AndroidX Core KTX、Lifecycle、Activity Compose、Navigation Compose、ExifInterface、DocumentFile：Apache-2.0。",
+    "Coil 2.6.0、Telephoto 0.13.0、Haze 1.2.0、Material Icons Extended：Apache-2.0，均以 Gradle 依赖引用，未修改其源码。",
+    "",
+    "三、网络与基础库",
+    "OkHttp 4.12.0、Gson 2.10.1、Timber 5.0.1、xLog 1.11.0、ACRA 5.11.4：Apache-2.0。",
+    "",
+    "四、许可证原文",
+    "Apache-2.0：https://www.apache.org/licenses/LICENSE-2.0",
+    "BSD-3-Clause：见 app/src/main/cpp/libraw-cmake/LICENSE",
+    "CDDL-1.0 与 LGPL-2.1：见 app/src/main/cpp/libraw/LICENSE.CDDL、LICENSE.LGPL",
+    "",
+    "五、商标",
+    "Nikon、Nikon Z、NIKKOR 等名称与标识归尼康株式会社及其权利人所有，本项目仅在说明兼容的相机型号时提及，与尼康株式会社没有任何关联、隶属、授权、赞助或背书关系。",
+    "",
+    "完整组件清单与逐项许可判定见仓库根目录 THIRD_PARTY_NOTICES.md：",
+    "https://github.com/4647luo/lianjing/blob/main/THIRD_PARTY_NOTICES.md",
+    ""
+)
+
 private val TERMS_LINES = listOf(
     "一、关于本应用",
     "「连镜」是一款非官方的第三方应用，用于连接尼康相机，提供图片回传、参数控制、实时取景与定位写入等功能。本应用为个人开发项目，免费提供，不含任何付费功能或广告。安装并使用本应用，即表示你已阅读、理解并同意本条款的全部内容。如果你不同意其中任何一条，请停止使用并卸载本应用。",
@@ -2301,7 +2331,7 @@ private val TERMS_LINES = listOf(
     "4. 因用户违反当地法律法规使用本应用而产生的后果，由用户自行承担。",
     "",
     "七、知识产权与商标",
-    "应用代码按 Apache-2.0 许可开源；「连镜」名称与应用图标仅用于标识本项目，不得用于暗示官方认可或授权。RAW 解码使用 LibRaw 0.23.0 Snapshot202611，按 CDDL-1.0 许可随包编译。尼康、Nikon、NIKKOR 等商标归尼康株式会社或其权利人所有，本应用仅在说明兼容性时提及，与尼康株式会社没有任何隶属、授权、赞助或背书关系。界面中的相机照片由用户自行设置，不代表尼康官方素材。",
+    "应用代码按 Apache-2.0 许可开源；「连镜」名称与应用图标仅用于标识本项目，不得用于暗示官方认可或授权。RAW 解码使用 LibRaw 0.23.0 Snapshot202611，按 CDDL-1.0 许可随包编译，完整源码随工程提供（https://github.com/4647luo/lianjing/tree/main/app/src/main/cpp/libraw）。尼康、Nikon、NIKKOR 等商标归尼康株式会社或其权利人所有，本应用仅在说明兼容性时提及，与尼康株式会社没有任何隶属、授权、赞助或背书关系。界面中的相机照片由用户自行设置，不代表尼康官方素材。",
     "",
     "八、服务变更与终止",
     "作者可能在不另行通知的情况下调整功能、修复问题或停止维护本项目。由于本应用不依赖任何在线服务，你已安装的版本不会因服务下线而立即失效。",
@@ -2983,6 +3013,13 @@ private fun AboutPanel(
     BackHandler(onBack = onBack)
     // 权限说明已经从「通用」搬到关于里，仍然是一个独立全屏页
     var showPermission by remember { mutableStateOf(false) }
+    var showLicenses by remember { mutableStateOf(false) }
+    if (showLicenses) {
+        SettingsSubPage(title = "开源许可", onBack = { showLicenses = false }) {
+            InfoLines(OPEN_SOURCE_LINES)
+        }
+        return
+    }
     if (showPermission) {
         SettingsSubPage(title = "权限说明", onBack = { showPermission = false }) {
             Text(
@@ -3079,6 +3116,8 @@ private fun AboutPanel(
                 SettingRow("使用条款", "数据使用与免责说明") { onTerms() }
                 SettingDivider()
                 SettingRow("权限说明", "各功能需要的系统权限") { showPermission = true }
+                SettingDivider()
+                SettingRow("开源许可", "第三方组件、许可证与源码地址") { showLicenses = true }
                 SettingDivider()
                 SettingRow("支持作者", "扫码赞赏") { onDonate() }
             }

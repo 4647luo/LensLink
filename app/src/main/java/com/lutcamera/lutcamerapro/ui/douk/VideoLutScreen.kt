@@ -33,6 +33,7 @@ import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -88,6 +89,7 @@ import javax.microedition.khronos.opengles.GL10
 @Composable
 internal fun VideoLutScreen(
     item: GalleryItem,
+    startInLutMode: Boolean = true,
     onDismiss: () -> Unit,
     onExported: (String) -> Unit
 ) {
@@ -109,6 +111,8 @@ internal fun VideoLutScreen(
     var lutEntries by remember { mutableStateOf<List<FilterEntry>>(emptyList()) }
     var lutRuntime by remember { mutableStateOf<FilterRuntime?>(null) }
     var lutId by remember { mutableStateOf<String?>(null) }
+    // true 才是调色工作台（LUT 条 + 强度 + 导出）；false 就是纯播放器
+    var lutMode by remember(item.stableKey) { mutableStateOf(startInLutMode) }
     var intensity by remember { mutableFloatStateOf(1f) }
     var exporting by remember { mutableStateOf(false) }
     var exportPercent by remember { mutableIntStateOf(0) }
@@ -387,9 +391,20 @@ internal fun VideoLutScreen(
                         fontWeight = FontWeight.Medium
                     )
                     Text(
-                        if (item.formatSet.contains("mov")) "MOV · 还原 LUT 预览" else "视频 · 还原 LUT 预览",
+                        when {
+                            !lutMode -> "视频 · 直接播放"
+                            item.formatSet.contains("mov") -> "MOV · 还原 LUT 预览"
+                            else -> "视频 · 还原 LUT 预览"
+                        },
                         fontSize = 11.sp,
                         color = Color.White.copy(alpha = 0.6f)
+                    )
+                }
+                IconButton(onClick = { lutMode = !lutMode }) {
+                    Icon(
+                        Icons.Rounded.Tune,
+                        contentDescription = if (lutMode) "收起调色" else "打开调色",
+                        tint = if (lutMode) DoukColors.accent else Color.White
                     )
                 }
                 IconButton(onClick = {
@@ -475,6 +490,7 @@ internal fun VideoLutScreen(
                     Text(timeText(durationMs), fontSize = 11.sp, color = Color.White.copy(alpha = 0.7f))
                 }
 
+                if (lutMode) {
                 val currentLut = lutId
                 Text(
                     when {
@@ -564,6 +580,7 @@ internal fun VideoLutScreen(
                         fontWeight = FontWeight.Medium,
                         color = Color.White.copy(alpha = if (exporting) 0.45f else 0.9f)
                     )
+                }
                 }
             }
         }

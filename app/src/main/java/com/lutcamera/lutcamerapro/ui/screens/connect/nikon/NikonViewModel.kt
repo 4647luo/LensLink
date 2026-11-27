@@ -965,6 +965,15 @@ class NikonViewModel : ViewModel() {
     private suspend fun resolveTargetBeforeConnect(context: Context): Boolean {
         val sta = wirelessMode == WirelessSubMode.STA_LAN
         val target = cameraIp.trim()
+        // 相机热点（AP）模式：一次 TCP 探测都不做，地址直接用 192.168.1.1。
+        // 机身 15740 只有一个客户端槽，「建链即关」的探测会被相机记成一次失败连接，
+        // 机身屏幕随即弹「连接失败」，紧接着的正式握手 SYN 会被丢掉。
+        if (!sta) {
+            val ap = target.ifBlank { com.lutcamera.lutcamerapro.network.NikonPtpClient.DEFAULT_NIKON_AP_IP }
+            if (ap != target) cameraIp = ap
+            addLog("相机热点直连：跳过端口探测，直接建立 PTP/IP 会话（$ap:${CameraLanProbe.PTP_PORT}）")
+            return true
+        }
         val known = runCatching {
             com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.knownDevices().map { it.ip }
         }.getOrDefault(emptyList())

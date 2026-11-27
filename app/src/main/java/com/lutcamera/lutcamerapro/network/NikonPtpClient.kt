@@ -51,6 +51,12 @@ class NikonPtpClient {
         private const val HANDSHAKE_SO_TIMEOUT_MS = 4_000
         /** 单条命令的默认 socket 超时，也是 probeCommandAlive 结束后恢复的值。 */
         private const val DEFAULT_OP_TIMEOUT_MS = 12_000L
+        /**
+         * 命令通道 TCP 建链成功后、发 Init_Command_Request 之前必须停一下（毫秒）。
+         * 机身热点侧的 accept 队列要等 TCP 三次握手稳定后才把这条连接交给 PTP/IP 服务线程，
+         * 立刻灌 Init 会被当作半开连接丢掉，表现就是「端口连上了但机身没反应」。
+         */
+        private const val SETTLE_AFTER_TCP_MS = 350L
         private val OP_NIKON_DEVICE_READY = 0x90C8.toShort()
         val defaultInstance = NikonPtpClient()
     }
@@ -106,6 +112,8 @@ class NikonPtpClient {
     }
     private class CameraResponse(val code: Int) : IOException("相机返回 0x${code.toString(16)}")
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    /** 本次会话的连接模式：0x952B 主机注册只在 AP 直连时允许，靠这个字段判定。 */
+    @Volatile private var sessionMode: ConnectionMode = ConnectionMode.CAMERA_AP
     @Volatile private var connection: Connection? = null
     private val lifecycle = Any()
     private var generation = 0L
@@ -241,6 +249,7 @@ class NikonPtpClient {
     fun startNikonWiWatch(context: Context? = null, cameraIp: String = DEFAULT_NIKON_AP_IP,
         listener: NikonEventListener? = null, mode: ConnectionMode = ConnectionMode.CAMERA_AP) {
         stopNikonWatch()
+        sessionMode = mode
         val token = synchronized(lifecycle) { activeListener = listener; generation }
         preferences = context?.applicationContext?.getSharedPreferences("nikon_transport", Context.MODE_PRIVATE)
         hostGuid = runCatching { UUID.fromString(preferences?.getString("hostGuid", null)) }.getOrElse {
@@ -283,17 +292,42 @@ class NikonPtpClient {
                 }
                 require(cameraIp.matches(Regex("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) &&
                     cameraIp.split('.').all { it.toInt() in 0..255 }) { "请输入相机的 IPv4 地址" }
-                // AP 直连时不能只认 192.168.1.1：不同机身/固件的热点网段不一样
-                // （实测有 192.168.1.x、192.168.122.x、192.168.125.x）。用当前 Wi‑Fi 网关
-                // 和用户填的地址并发探一次 15740，谁真能连上就用谁，避免「连上相机 Wi‑Fi
-                // 却握手失败 → 相机自己关热点」这种假连接。
-                var targetIp = cameraIp
+                // AP 直连时**不做任何 15740 端口探测**。
+                // 尼康机身 15740 只留一个客户端槽：探测用的「建链即关」会被相机记成一次
+                // 失败连接（机身屏幕弹「连接失败」），紧接着的正式握手 SYN 会被直接丢弃，
+                // 诊断日志里的形态就是 PREFLIGHT_OK 之后紧跟 4.5s SocketTimeoutException。
+                // 地址只按「用户填的 / Wi‑Fi 网关 / 已知 IP」推断，真正的连接机会留给 PTP/IP。
+                // AP 直连的地址优先级（手动 > 记忆 > 默认 192.168.1.1）在 DoukState.connectSafely 里
+                // 已经解析完，这里只照用，不再改写成固定地址：旧逻辑会把用户手动填的其它网段地址
+                // 直接吃掉（例如 192.168.122.1 被改成 192.168.1.1），和流程图定的规则冲突。
+                val targetIp = cameraIp
+                if (mode == ConnectionMode.CAMERA_AP) {
+                    DoukLog.i("NikonPtp", "AP_TARGET", "ip" to targetIp,
+                        "note" to "手动 > 记忆 > 默认，全程不做 15740 探测")
+                }
+                // AP 直连时，手机接入相机热点后 DHCP 常要 2–5 秒才给 IP（这段时间本机是 169.254.x），
+                // 立刻 connect 会秒失败，用户看到的就是「刚连上 Wi‑Fi 就连不上相机」。
+                // 先等本机真正落到相机网段再建链，最多等 6 秒，超时也继续按当前路由试。
                 if (mode == ConnectionMode.CAMERA_AP && context != null) {
-                    val reachable = CameraLanProbe.resolveReachableTarget(context, cameraIp)
-                    if (reachable != null && reachable != cameraIp) {
-                        targetIp = reachable
-                        DoukLog.i("NikonPtp", "AP_TARGET_SWITCH", "from" to cameraIp, "to" to targetIp)
-                        listener?.onLog("相机热点实际地址为 $targetIp，已自动切换（不是 $cameraIp）")
+                    var waitedMs = 0
+                    while (waitedMs < 6000 &&
+                        runCatching { CameraLanProbe.localIpForSubnet(targetIp) }.getOrNull() == null
+                    ) {
+                        if (waitedMs == 0) {
+                            DoukLog.w("NikonPtp", "DHCP_WAIT", "target" to targetIp,
+                                "nets" to CameraLanProbe.localNetworkSummary())
+                            listener?.onLog("已接入相机热点，等手机拿到这个网段的地址（DHCP）…")
+                        }
+                        delay(300)
+                        waitedMs += 300
+                    }
+                    when {
+                        waitedMs >= 6000 -> {
+                            DoukLog.w("NikonPtp", "DHCP_NOT_READY", "target" to targetIp,
+                                "nets" to CameraLanProbe.localNetworkSummary())
+                            listener?.onLog("6 秒内没拿到相机网段的 IP，继续按当前路由尝试")
+                        }
+                        waitedMs > 0 -> DoukLog.i("NikonPtp", "DHCP_READY", "waitedMs" to waitedMs)
                     }
                 }
                 val address = InetAddress.getByName(targetIp)
@@ -348,6 +382,12 @@ class NikonPtpClient {
                 c.command.connect(InetSocketAddress(address, PTP_PORT), budgetCap(SOCKET_CONNECT_TIMEOUT_MS.toLong()).toInt())
                 trace?.note("${c.label} TCP_COMMAND_CONNECTED local=${c.command.localSocketAddress} remote=${c.command.remoteSocketAddress}")
                 DoukLog.d("NikonPtp", "TCP_CONNECTED", "local" to c.command.localSocketAddress, "remote" to c.command.remoteSocketAddress)
+                // 建链后先停 350ms（实测必需）：让机身把这条连接交给 PTP/IP 服务，
+                // 立刻灌 Init 会被当成半开连接丢掉，机身屏幕直接弹「连接失败」。
+                if (mode == ConnectionMode.CAMERA_AP) {
+                    DoukLog.i("NikonPtp", "AP_SETTLE", "ms" to SETTLE_AFTER_TCP_MS)
+                    delay(SETTLE_AFTER_TCP_MS)
+                }
                 // 端口都通了，网络这一层已经没问题：把预算切到「等用户确认」的长窗口。
                 budgetMs = PAIRING_BUDGET_MS
                 budgetStartedAt = SystemClock.elapsedRealtime()
@@ -374,12 +414,24 @@ class NikonPtpClient {
                 }
                 if (PtpIpWire.type(ack) == 5) {
                     val reason = if (ack.size >= 12) PtpIpWire.le(ack).getInt(8) else -1
-                    // 相机端屏幕上那句「连接失败」就对应这里：机身主动回了 InitFail
+                    // 相机端屏幕上那句「连接失败」就对应这里。reason 必须分开说：
+                    // 1=不认这个身份（重装/清数据），2=机身正忙（别的设备占着槽），
+                    // 3=不接受握手参数（多半是相机向导选错了连接类型），其它按机身主动断开处理。
+                    val hint = when (reason) {
+                        1 -> "相机不认这个配对身份"
+                        2 -> "机身正忙，会话槽被别的设备占着"
+                        3 -> "相机不接受本次握手的参数（向导里的连接类型可能选错）"
+                        0, -1 -> "相机主动断开，未给出原因"
+                        else -> "相机主动断开（reason=$reason）"
+                    }
                     DoukLog.e("NikonPtp", "HANDSHAKE_FAIL", "initFail" to reason, "target" to "$targetIp:$PTP_PORT",
-                        "hint" to if (reason == 1) "相机不认这个配对身份" else "相机主动断开")
-                    throw IOException(if (reason == 1)
-                        "相机拒绝此应用的配对身份 (InitFail 1)。若曾重装或清除应用数据，请从旧日志恢复身份，或在相机上新建配置并重新配对。"
-                    else "相机拒绝握手 (InitFail $reason)。相机一次只允许一台设备连接：请在相机「已配对设备」里删掉除本机以外的记录（包括 SnapBridge 和旧版连镜记录），再重连。")
+                        "hint" to hint)
+                    throw IOException(when (reason) {
+                        1 -> "相机拒绝此应用的配对身份 (InitFail 1)。若曾重装或清除应用数据，请从旧日志恢复身份，或在相机上新建配置并重新配对。"
+                        2 -> "相机正忙，腾不出会话 (InitFail 2)。机身一次只服务一台设备：请在相机「已配对设备」里删掉 SnapBridge / 电脑端 / 旧版连镜的记录，并确认相机没停在别的传输向导里，再重连。"
+                        3 -> "相机不接受本次握手参数 (InitFail 3)。请在相机上把 Connect to smart device › Wi‑Fi connection 的连接类型选成 Camera control（不要 Picture transfer），再回来重试。"
+                        else -> "相机拒绝握手 (InitFail $reason)。相机一次只允许一台设备连接：请在相机「已配对设备」里删掉除本机以外的记录（包括 SnapBridge 和旧版连镜记录），再重连。"
+                    })
                 }
                 if (PtpIpWire.type(ack) != 2 || ack.size < 28) throw IOException("相机握手回复无效")
                 val id = PtpIpWire.le(ack).getInt(8)
@@ -390,6 +442,12 @@ class NikonPtpClient {
                 c.events.soTimeout = budgetCap(HANDSHAKE_SO_TIMEOUT_MS.toLong()).toInt()
                 c.events.connect(InetSocketAddress(address, PTP_PORT), budgetCap(EVENT_CONNECT_TIMEOUT_MS.toLong()).toInt())
                 trace?.note("${c.label} TCP_EVENT_CONNECTED local=${c.events.localSocketAddress} remote=${c.events.remoteSocketAddress}")
+                // 事件通道同样要等 350ms 再发 Init_Event_Request，否则机身会把事件连接当成
+                // 又一次失败的建链，命令通道随后被一起踢掉。
+                if (mode == ConnectionMode.CAMERA_AP) {
+                    DoukLog.i("NikonPtp", "AP_EVENT_SETTLE", "ms" to SETTLE_AFTER_TCP_MS)
+                    delay(SETTLE_AFTER_TCP_MS)
+                }
                 c.send(c.events, "event", PtpIpWire.packet(3, ByteBuffer.allocate(4)
                     .order(ByteOrder.LITTLE_ENDIAN).putInt(id).array()))
                 if (PtpIpWire.type(PtpIpWire.read(c.events.inputStream, trace = c.record("event"))) != 4)
@@ -533,7 +591,9 @@ class NikonPtpClient {
                                 e is java.net.ConnectException ->
                                     "相机 Wi-Fi 已连上（本机 $onCameraNet），但 $cameraIp:$PTP_PORT 没有开放。相机可能已休眠或退出了「连接至智能设备」：在相机上重新进入 Wi-Fi 连接画面，再点重试"
                                 e is java.net.SocketTimeoutException ->
-                                    "相机 Wi-Fi 已连上、端口 $PTP_PORT 也可达，但 ${CONNECT_BUDGET_MS / 1000} 秒内没完成 PTP/IP 握手。多半是相机被别的设备占着（SnapBridge、Imaging Console 或另一台手机）：在相机「已配对设备」里断开它们后再点重试"
+                                    "相机 Wi-Fi 已连上（本机 $onCameraNet），但机身没有接受 $cameraIp:$PTP_PORT 的连接。" +
+                                        "常见两种原因：① 相机还在「连接至智能设备」的等待画面之外，先在相机上回到该画面并选 Camera control；" +
+                                        "② 相机被别的设备占着（SnapBridge / Imaging Console / 另一台手机），在相机「已配对设备」里断开其它设备后点重试"
                                 else -> e.message ?: "连接失败"
                             }
                             DoukLog.e("NikonPtp", "CONNECT_FAIL", "stage" to _connectionStage.value,
@@ -596,8 +656,34 @@ class NikonPtpClient {
             _isLiveViewActive.value = false
             _pairingRequired.value = false
             _hostBusy.value = false
-            connection?.close() // Close synchronously so an old job cannot close a newer connection.
+            val closing = connection
             connection = null
+            // 断链前先发 CloseSession(0x1003)，让机身当场释放 15740 的会话槽再关 socket。
+            // 直接掐 TCP 的话，相机那边还会把这次会话记几秒，紧接着重连就吃 Init_Fail 2。
+            // 400ms 短超时 + 1.2s 总上限：机身不答也不能把「断开」按钮卡住。
+            closing?.let { c ->
+                c.trace?.note("${c.label} CLOSE_SESSION")
+                scope.launch {
+                    // 这里不能走 operation()：它要求 connection === c，而本函数已经把 connection
+                    // 置空、交给更新的会话，直接发原始事务才不会自己把自己挡回去。
+                    runCatching {
+                        withTimeoutOrNull(1200) {
+                            c.mutex.withLock {
+                                withContext(Dispatchers.IO) {
+                                    c.command.soTimeout = 400
+                                    val r = PtpIpWire.transaction(
+                                        c.command.inputStream, c.command.outputStream,
+                                        c.transaction++, 0x1003, intArrayOf(), null, PtpIpWire.MAX_DATA
+                                    )
+                                    DoukLog.i("NikonPtp", "CLOSE_SESSION",
+                                        "code" to "0x%04X".format(r.response.code))
+                                }
+                            }
+                        }
+                    }
+                    c.close()
+                }
+            }
             watchJob?.cancel(); watchJob = null
             liveViewJob?.cancel(); liveViewJob = null
             _liveViewBitmap.value = null
@@ -1549,8 +1635,27 @@ class NikonPtpClient {
     @Volatile private var pairingPreparedAtMs = 0L
     private val pairingSettleMs = 8500L
 
+    /**
+     * 0x952B/0x935A 主机注册只在「手机直连相机热点」这一条链路上成立：
+     * 路由器/手机热点模式里相机已经是局域网里的普通设备，机身也不会为它落 host profile，
+     * 空发注册只会让机身回错误码、把连接状态搅乱。这里直接挡住并给出该走的路。
+     */
+    private fun requireApForHostRegistration() {
+        if (sessionMode == ConnectionMode.CAMERA_AP) return
+        val where = when (sessionMode) {
+            ConnectionMode.ROUTER -> "相机和手机在同一路由器下（局域网模式）"
+            ConnectionMode.PHONE_HOTSPOT -> "手机热点模式"
+            else -> "当前模式"
+        }
+        throw IOException(
+            "主机注册（0x952B）只在手机直连相机热点（AP 模式）时使用；$where 不走配对流程，" +
+                "请在相机上把 Connect to smart device 的连接类型设为 Camera control 后直接重连。"
+        )
+    }
+
     suspend fun beginPairing(version: Long): String {
         val c = sessionFor(version)
+        requireApForHostRegistration()
         // 原来只认「受限会话」才配对，结果相机在「连接至 PC」向导态但操作码表并未被裁到
         // 受限时，配对入口直接被挡死。改为按机身自己公布的能力判定：有 0x952B 就允许发。
         if (!c.restricted && !c.hostRegistration) throw IOException("相机未公布主机注册命令（0x952B），当前模式不支持配对")
@@ -1561,6 +1666,7 @@ class NikonPtpClient {
     }
     suspend fun confirmPairing(version: Long) {
         val c = sessionFor(version)
+        requireApForHostRegistration()
         if (!c.restricted && !c.hostRegistration) throw IOException("配对会话状态已变化")
         // 机身要先落库主机档案再接受确认；确认发得太早会被回绝。等满 8.5s 窗口。
         val waited = System.currentTimeMillis() - pairingPreparedAtMs
@@ -1575,6 +1681,7 @@ class NikonPtpClient {
     // 用当前这条待配对会话直接请求 / 提交配对，不需要外部再传会话版本号
     suspend fun requestPairingNow(): String {
         val c = connection ?: throw IOException("会话已断开，请重新连接相机")
+        requireApForHostRegistration()
         if (!c.restricted && !c.hostRegistration) throw IOException("当前会话已是完整权限，不需要配对")
         val result = operation(0x952b, expected = c)
         if (result.response.code != 0x2001) throw CameraResponse(result.response.code)
@@ -1586,6 +1693,7 @@ class NikonPtpClient {
 
     suspend fun submitPairingNow(): Int {
         val c = connection ?: throw IOException("会话已断开，请重新连接相机")
+        requireApForHostRegistration()
         // 等满 8.5s 落库窗口再提交，避免机身还在写档案时把确认回绝。
         val waited = System.currentTimeMillis() - pairingPreparedAtMs
         if (pairingPreparedAtMs > 0L && waited < pairingSettleMs) {

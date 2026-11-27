@@ -64,7 +64,9 @@ object UltraHdrCodec {
     /** 写入 Ultra HDR 文件；baseJpeg 必须是未再压缩的 SDR 底图字节。 */
     fun encode(baseJpeg: ByteArray, gain: Gain, target: File, gainQuality: Int = 85): Boolean {
         if (!libReady) return false
-        if (Build.VERSION.SDK_INT < 34) return false
+        // libultrahdr 是自带容器的 native 实现，不依赖系统 HDR API：
+        // Android 13 上也必须写真正的 Ultra HDR，否则手机上的导出永远只是 SDR，
+        // 和预览里烘过增益的画面必然两副面孔。
         return runCatching {
             val ok = nativeEncode(
                 baseJpeg, gain.gray, gain.width, gain.height,

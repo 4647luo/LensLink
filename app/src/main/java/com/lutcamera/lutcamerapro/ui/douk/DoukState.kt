@@ -44,6 +44,9 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+/** 上次 AP 直连连成功的目标地址，存在 nikon_transport 同一份 prefs 里。 */
+private const val PREF_LAST_AP_IP = "last_ap_ip"
+
 /** 三种相机连接方式（外加蓝牙用于 GPS 推送）。 */
 enum class ConnectMode(val label: String, val summary: String, val detail: String) {
     WIFI_STA("Wi-Fi STA", "相机连手机热点", "相机菜单 → 连接至智能设备 → 加入手机热点，App 用相机获得的 IP 建立 PTP/IP 连接"),
@@ -1557,8 +1560,35 @@ class DoukState(
      * 尼康在配对提交成功后会把内部服务从「配对服务」切到「正常服务」并重启 Wi-Fi，
      * 期间 15740 会关掉十几秒，一次探测必然判成「IP 不可达」。
      */
+    /**
+     * AP 直连的目标地址：手动填的 > 上次连成功记住的（记忆）> 机身默认 192.168.1.1。
+     * 全程不做 15740 端口探测 —— 尼康机身只给一个客户端槽，探测的建链即关会被记成失败连接。
+     *
+     * 传进来的值等于默认地址时按「用户没手动填」处理，才让记忆地址顶上来；
+     * 填了别的地址就是明确的覆盖，记忆不再参与。
+     */
+    private fun resolveApTarget(context: Context, requested: String): Pair<String, String> {
+        val manual = requested.trim()
+        if (manual.isNotEmpty() && manual != NikonPtpClient.DEFAULT_NIKON_AP_IP) return manual to "手动"
+        val remembered = context.applicationContext
+            .getSharedPreferences("nikon_transport", Context.MODE_PRIVATE)
+            .getString(PREF_LAST_AP_IP, null)
+            ?.trim()
+            ?.takeIf { CameraLanProbe.isValidIpv4(it) }
+        if (!remembered.isNullOrBlank()) return remembered to "记忆"
+        return NikonPtpClient.DEFAULT_NIKON_AP_IP to "默认"
+    }
+
+    /** 连上之后把这次的地址落盘，下次当「记忆 IP」用。 */
+    private fun rememberApTarget(context: Context, ip: String) {
+        if (!CameraLanProbe.isValidIpv4(ip)) return
+        context.applicationContext
+            .getSharedPreferences("nikon_transport", Context.MODE_PRIVATE)
+            .edit().putString(PREF_LAST_AP_IP, ip).apply()
+    }
+
     fun connectSafely(context: Context, ip: String, attempts: Int = 2, skipPreflight: Boolean = false) {
-        val target = ip.trim()
+        var target = ip.trim()
         if (target.isBlank() || !CameraLanProbe.isValidIpv4(target)) {
             lastHint = "请输入合法的相机 IPv4 地址"
             DoukLog.w("Connect", "IP_INVALID", "input" to ip)
@@ -1570,6 +1600,14 @@ class DoukState(
         // 先按真实网关确定手机与相机的 Wi‑Fi 角色，再映射 PTP 网络模式：
         // 否则枚举默认值 WIFI_STA 会把相机热点连成「手机热点」模式。
         refreshWifiRole(context, target)
+        // 地址优先级只对 AP 直连生效；STA / 路由器下相机地址由路由器分配，不能套记忆值。
+        if (detectedWifiRole == ConnectMode.WIFI_AP || connectMode == ConnectMode.WIFI_AP) {
+            val (resolved, source) = resolveApTarget(context, target)
+            if (resolved != target) {
+                DoukLog.i("Connect", "AP_TARGET_PICK", "from" to target, "to" to resolved, "source" to source)
+                target = resolved
+            }
+        }
         applyNetworkMode(target)
         // 自动连接/搜索结果已经用 TCP 15740 探通过，没必要再做一次 1.5 秒预检；
         // 这一步在旧实现里会把每次自动连接都白白拖慢 1.5~4 秒。
@@ -1589,6 +1627,44 @@ class DoukState(
             // 旧实现点一下要先白等 8 秒才进握手，失败后还要再等握手超时，用户看到的就是
             // 长时间没反应。AP 模式把 target、网关、历史 IP 一起并发探一次，
             // 总耗时 ≈ 一个 900ms 窗口；探不到就立刻给结论。
+            // 相机热点（AP）模式：**一次 TCP 探测都不做**。
+            // 尼康机身 15740 只有一个客户端槽，探测的「建链即关」会被相机记成一次失败连接，
+            // 机身屏幕随即弹「连接失败」，紧接着的正式握手 SYN 会被直接丢掉 ——
+            // 诊断日志里的 PREFLIGHT_OK + 4.5s SocketTimeoutException 就是这个形态。
+            // 地址用非侵入方式拿：用户填的地址优先，mDNS（UDP，不占 15740）命中再切换。
+            if (apMode) {
+                val mdns = runCatching {
+                    withContext(Dispatchers.IO) { PtpIpDiscovery.endpoints(context.applicationContext, 900L) }
+                }.getOrDefault(emptyList())
+                val chosen = mdns.firstOrNull { it == target } ?: mdns.firstOrNull() ?: target
+                DoukLog.i("Connect", "AP_DIRECT", "target" to chosen,
+                    "mdns" to mdns.joinToString(","),
+                    "note" to "AP 模式跳过 15740 端口探测，保留唯一连接机会给 PTP/IP")
+                // 第一次失败多半是机身还在复位（上一个客户端槽没回收完）：等 3 秒自动再来，
+                // 不让用户自己算时间点重试。最多 3 次，都失败才把失败原因常驻出来。
+                for (attempt in 0 until 3) {
+                    withContext(Dispatchers.Main) {
+                        if (chosen != target) lastHotIp = chosen
+                        lastHint = if (attempt == 0) "相机热点模式，直接建立 PTP/IP 会话（$chosen）…"
+                        else "相机复位中，第 ${attempt + 1} 次尝试（$chosen）…"
+                        vm.connect(context.applicationContext, chosen, skipPreflight = true)
+                    }
+                    if (awaitConnected(13_000)) {
+                        DoukLog.i("Connect", "AP_CONNECTED", "target" to chosen, "attempt" to attempt + 1)
+                        // 记住这次真正连上的地址，下次手动没填时直接用，不再靠猜默认值。
+                        rememberApTarget(context.applicationContext, chosen)
+                        return@launch
+                    }
+                    if (attempt < 2) {
+                        DoukLog.w("Connect", "AP_RETRY_WAIT", "attempt" to attempt + 1, "waitMs" to 3000)
+                        withContext(Dispatchers.Main) {
+                            lastHint = "这次没连上，等相机复位 3 秒后自动重试（${attempt + 2}/3）…"
+                        }
+                        delay(3_000)
+                    }
+                }
+                return@launch
+            }
             val knownIps = DoukPrefs.knownDevices().map { it.ip }
             val probeIps = CameraLanProbe.priorityTargets(context.applicationContext, listOf(target) + knownIps)
             // 按机身上报过的型号取代际：决定探测窗口和失败提示，未知时按二代保守处理
@@ -1842,6 +1918,15 @@ class DoukState(
      */
     fun confirmPairing(context: Context) {
         if (pairingBusy) return
+        // 相机热点（AP）模式下绝不发 0x952B：这条主机注册命令会让机身把当前 AP 会话踢掉，
+        // 之后十几秒内 15740 不再接受连接，表现就是「连上热点 → 一点匹配 → 相机显示失败」。
+        // AP 模式本来就走「直连 + 机身屏幕确认」，绕开配对即可。
+        if (detectedWifiRole == ConnectMode.WIFI_AP) {
+            DoukLog.w("Pair", "AP_PAIRING_BLOCKED", "note" to "0x952B skipped in camera AP mode")
+            Toast.makeText(context, "相机热点模式下不需要主机配对，已跳过（配对命令会让机身在十几秒内断开）。请直接点「重试」",
+                Toast.LENGTH_LONG).show()
+            return
+        }
         pairingBusy = true
         pairingCode = null
         DoukLog.i("Pair", "AUTO_BEGIN", "stage" to vm.connectionStage.value)

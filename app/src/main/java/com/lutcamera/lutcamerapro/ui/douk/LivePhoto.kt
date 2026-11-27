@@ -20,6 +20,12 @@ import java.util.Collections
 internal object LivePhoto {
     private val cache: MutableMap<String, Boolean> = Collections.synchronizedMap(HashMap())
 
+    /** 已经切出来的尾部视频，进图时预抽一次，长按就不用再等 */
+    private val videoCache: MutableMap<String, File> = Collections.synchronizedMap(HashMap())
+
+    fun cachedVideo(key: String): File? =
+        videoCache[key]?.takeIf { it.isFile && it.length() > 0 }
+
     /** XMP 里常见的动图标记，大小写不统一，统一按小写比较 */
     private val markers = arrayOf(
         "motionphoto",
@@ -56,6 +62,7 @@ internal object LivePhoto {
      * 从它前面 4 字节的 box size 开始截到文件结尾，再用 MediaMetadataRetriever 验时长。
      */
     suspend fun extractVideo(context: Context, item: GalleryItem): File? = withContext(Dispatchers.IO) {
+        cachedVideo(item.stableKey)?.let { return@withContext it }
         runCatching {
             val source = when (item.origin) {
                 "app" -> GalleryFileOps.locateAppFile(item.fileName)
@@ -63,12 +70,27 @@ internal object LivePhoto {
                 else -> null
             } ?: return@runCatching null
             if (source.length() > 200L * 1024 * 1024) return@runCatching null
-            val bytes = source.readBytes()
+            val out = File(context.cacheDir, "live-${item.key}.mp4")
+            // 视频永远在文件尾部：只读最后 12MB 找 ftyp box，
+            // 整张图动辄十几 MB，全量 readBytes + 逐字节扫要几百毫秒，长按就会"停一下"。
+            val tailLimit = 12L * 1024 * 1024
+            val from = maxOf(0L, source.length() - tailLimit)
+            val bytes: ByteArray? = java.io.RandomAccessFile(source, "r").use { raf ->
+                raf.seek(from)
+                val buf = ByteArray((source.length() - from).toInt())
+                var n = 0
+                while (n < buf.size) {
+                    val r = raf.read(buf, n, buf.size - n)
+                    if (r <= 0) break
+                    n += r
+                }
+                if (n <= 0) null else buf.copyOf(n)
+            }
+            if (bytes == null) return@runCatching null
             val idx = lastIndexOfAscii(bytes, "ftyp")
             if (idx < 4) return@runCatching null
             val start = idx - 4
             if (start >= bytes.size - 8) return@runCatching null
-            val out = File(context.cacheDir, "live-${item.key}.mp4")
             out.outputStream().use { o -> o.write(bytes, start, bytes.size - start) }
             val retriever = MediaMetadataRetriever()
             val ok = runCatching {
@@ -76,7 +98,10 @@ internal object LivePhoto {
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             }.getOrDefault(0L) > 0L
             runCatching { retriever.release() }
-            if (ok) out else {
+            if (ok) {
+                videoCache[item.stableKey] = out
+                out
+            } else {
                 out.delete()
                 null
             }

@@ -124,6 +124,31 @@ object CameraLanProbe {
         return probeCandidates(context, ips, timeoutMs, nets).firstOrNull()?.ip
     }
 
+    /**
+     * AP 直连时的地址推断：只看当前 Wi‑Fi 网关 / DHCP 服务器与机身默认地址，**不做任何 TCP 连接**。
+     *
+     * 尼康机身 15740 只留一个客户端槽：探测用的「建链即关」会被相机记成一次失败连接
+     * （机身屏幕弹「连接失败」，随后几秒内新 SYN 直接被丢弃）。诊断日志里
+     * PREFLIGHT_OK 之后紧跟 4.5 秒 SocketTimeoutException 就是这种症状。
+     * 所以 AP 模式一律走这个入口，把唯一的连接机会留给真正的 PTP/IP 握手。
+     */
+    fun addressCandidates(
+        context: Context,
+        preferred: String,
+        known: List<String> = emptyList()
+    ): List<String> {
+        val selfIps = activeLanNetworks(context).map { it.ip }
+        val out = LinkedHashSet<String>()
+        out.add(preferred.trim())
+        gatewayAddresses(context).forEach { out.add(it) }
+        known.map { it.trim() }.filter { it.isNotEmpty() }.forEach { out.add(it) }
+        NIKON_AP_CANDIDATES.forEach { out.add(it) }
+        return out.filter { isValidIpv4(it) && it !in selfIps }
+    }
+
+    /** 当前 Wi‑Fi / 有线的默认网关与 DHCP 服务器地址（纯读取 LinkProperties，不发任何包）。 */
+    fun gatewayCandidates(context: Context): List<String> = gatewayAddresses(context.applicationContext)
+
     /** 指定网络上报的 IPv4 网关 / DHCP 服务器；取不到返回 null。 */
     fun gatewayFor(context: Context, net: LanNet): String? {
         val network = net.network ?: return null

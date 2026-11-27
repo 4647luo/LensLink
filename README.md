@@ -34,7 +34,7 @@
 
 ## 安装
 
-1. 在 [Releases](https://github.com/4647luo/lianjing/releases/latest) 下载 `lianjing-1.2.0.apk`。
+1. 在 [Releases](https://github.com/4647luo/lianjing/releases/latest) 下载 `lianjing-1.2.1.apk`。
 2. 在 Android 手机上允许「安装未知来源应用」。
 3. 安装后打开连镜，按提示授予照片、附近设备、定位等权限。
 
@@ -168,6 +168,12 @@
 - 反馈邮箱：`lianjingup@outlook.com`
 
 ---
+
+## 版本 1.2.1
+
+- Wi‑Fi AP 连接改为零探测直连：固定 `192.168.1.1`，地址取「手动 > 记忆 > 默认」，拿到 IPv4 后静置 350ms 再握手，失败自动重试，总预算 3 秒。
+- SDR→HDR 底层重做：预览走自研增益图合成，导出由 libultrahdr 写 Ultra HDR 容器，HDR 质感收敛成一条滑杆且实时生效。
+- Live 图播放修复：长按即播不用等松手；横竖版都与静帧对齐；打开时不再叠出两张画面。
 
 ## 版本 1.2.0
 

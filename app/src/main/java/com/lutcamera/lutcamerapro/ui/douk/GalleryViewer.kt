@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import android.net.Uri
 import android.provider.MediaStore
 import com.lutcamera.lutcamerapro.log.DoukHttp
@@ -48,6 +49,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -102,10 +104,12 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import android.content.ContextWrapper
@@ -223,6 +227,8 @@ internal fun PhotoViewerScreen(
     var editing by remember { mutableStateOf(false) }
     // 视频单独走「播放 + 套 LUT 导出」页，图片编辑仍然走 PhotoEditor
     var videoOpen by remember { mutableStateOf(false) }
+    // 视频页默认是「播放器」，只有从操作条的「视频 LUT」进来才展开调色面板
+    var videoLutMode by remember { mutableStateOf(false) }
     // 网格里的是 320–400px 的缩略图，全屏要单独加载一张大的，否则放大就糊
     var hd by remember { mutableStateOf<ImageBitmap?>(null) }
     // 当前这张和前后各一张的大图缓存：左右滑时直接拿大图上屏，不再先显示缩略图。
@@ -296,16 +302,27 @@ internal fun PhotoViewerScreen(
     var isLive by remember { mutableStateOf(false) }
     var liveOpen by remember { mutableStateOf(false) }
     var liveFile by remember { mutableStateOf<File?>(null) }
+    // 视频真实显示尺寸（转正后），长按播放层按它 fit，避免比例不一致时被裁边
+    var liveVideoW by remember(item.stableKey) { mutableStateOf(0) }
+    var liveVideoH by remember(item.stableKey) { mutableStateOf(0) }
     var liveBusy by remember { mutableStateOf(false) }
+    // 播放层实例的引用：长按要立刻 warmStart()，不能等 AndroidView 的 update lambda
+    // （那个 lambda 不在 @Composable 作用域里，读 liveOpen 不会订阅状态，只能碰运气碰上下一次重组）
+    val liveClipRef = remember { arrayOfNulls<LiveClipView>(1) }
+    // pointerInput 的 block 在 key 不变时不会更新闭包，直接读 liveOpen 会永远拿到 false
+    val liveOpenNow by androidx.compose.runtime.rememberUpdatedState(liveOpen)
 
     /**
      * 视频改成应用内播放：MOV / HEVC 10-bit / N-Log 这些系统播放器经常直接拒播，
      * 这里用 MediaPlayer + GL 自己上屏，还能当场套还原 LUT。
      * 相机内还没落盘的先提示保存，避免点了没反应。
      */
-    fun playVideo() {
+    fun playVideo(lutMode: Boolean = false) {
         when (item.origin) {
-            "phone", "app" -> videoOpen = true
+            "phone", "app" -> {
+                videoLutMode = lutMode
+                videoOpen = true
+            }
             else -> message = "相机内视频请先点「保存」存到手机，再播放"
         }
     }
@@ -313,6 +330,11 @@ internal fun PhotoViewerScreen(
     /** 点击 LIVE 胶囊或长按照片都走这里，避免两套抽取逻辑。 */
     fun playLive() {
         if (!isLive || item.isVideo || liveBusy) return
+        // 进图时已经预抽好：直接开播，长按不用再等切视频那一两百毫秒
+        liveFile?.let {
+            liveOpen = true
+            return
+        }
         liveBusy = true
         scope.launch {
             val f = withContext(Dispatchers.IO) { LivePhoto.extractVideo(context, item) }
@@ -341,9 +363,11 @@ internal fun PhotoViewerScreen(
         scale = 1f; offsetX = 0f; offsetY = 0f; rotation = 0f
         dragX = 0f
         uiHidden = false; more = false; detail = false; editing = false; videoOpen = false
+        videoLutMode = false
         wantOriginal = false
         originalLoaded = false
         liveOpen = false; liveFile = null; liveBusy = false
+        liveVideoW = 0; liveVideoH = 0
         favorite = item.stableKey in GalleryFavorites.all(context)
         // 先把网格里已经解码好的缩略图直接铺上，用户点开就是有画面的；
         // 高清图再在后台替换。以前这里先 hd=null 等 decode，5120 万像素的
@@ -392,6 +416,14 @@ internal fun PhotoViewerScreen(
         }
         // Live 图探测：只读文件头，几十毫秒；真正播放再抽视频
         isLive = withContext(Dispatchers.IO) { LivePhoto.probe(context, item) }
+        if (isLive) {
+            // 预抽尾部视频：长按时只差一次 start()，不再"停一下"。
+            // 放到后台并行，别挡住后面 HDR 大图的解码。
+            scope.launch {
+                val f = withContext(Dispatchers.IO) { LivePhoto.extractVideo(context, item) }
+                if (f != null && hdKey == item.stableKey) liveFile = f
+            }
+        }
 
         // 真 HDR：只有确实带 gainmap / PQ 的图才走这条，普通 SDR 图不折腾
         if (isHdr && hdrFile != null) {
@@ -535,26 +567,40 @@ internal fun PhotoViewerScreen(
                 w.setElevation(0f)
                 // 关键：Compose Dialog 仍会带 NAVIGATION_BARS 的 fitInsetsTypes，
                 // 系统因此把窗口压到 2780 高，底部 100px 露出底层图库。
-                // 清空 fitInsetsTypes 后再 MATCH_PARENT，窗口才会铺满 2880。
+                // 清空 fitInsetsTypes（以及 fitInsetsSides）后再 MATCH_PARENT，窗口才会铺满 2880。
                 if (android.os.Build.VERSION.SDK_INT >= 30) {
                     val attrs = w.attributes
                     attrs.fitInsetsTypes = 0
+                    attrs.fitInsetsSides = 0
                     w.attributes = attrs
                 }
-                val real = android.util.DisplayMetrics()
-                w.context.getSystemService(android.hardware.display.DisplayManager::class.java)
-                    ?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
-                    ?.getRealMetrics(real)
-                val fullW = if (real.widthPixels > 0) real.widthPixels else w.attributes.width
-                val fullH = if (real.heightPixels > 0) real.heightPixels else w.attributes.height
                 w.setGravity(android.view.Gravity.TOP or android.view.Gravity.START)
+                // 用物理屏尺寸，而不是 MATCH_PARENT：部分 ROM（含 MIUI）会把
+                // Dialog 的 MATCH_PARENT 按「可用区」再削一次，底边正好差出导航栏那一条，
+                // 于是看图页最下面会透出图库的底部 tab。
+                val fullW: Int
+                val fullH: Int
+                run {
+                    val m = android.util.DisplayMetrics()
+                    w.windowManager?.defaultDisplay?.getRealMetrics(m)
+                    fullW = (m.widthPixels.takeIf { it > 0 } ?: 0)
+                    fullH = (m.heightPixels.takeIf { it > 0 } ?: 0)
+                }
+                // MIUI 会在 setLayout 之后再把可用高度按「底部手势区」削掉一截（3200 的屏只留给
+                // 内容 2955），底部操作条于是永远差 65dp 贴不到底。这里主动多要 260px：
+                // 削完之后内容正好铺到物理屏底，多出来的部分落在屏幕外、被显示裁掉。
+                val wantH = if (fullH > 0) fullH + 260 else android.view.ViewGroup.LayoutParams.MATCH_PARENT
                 w.setLayout(
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    if (fullW > 0) fullW else android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    wantH
                 )
-                // Compose 的 DialogLayout 会在首帧 measure 时把窗口重新压回 2780，
-                // 所以等它布局完再按真实屏幕尺寸补一次，才能盖住导航栏。
-                w.decorView.post { w.setLayout(fullW, fullH) }
+                w.decorView.post {
+                    // dismiss/keyboard 等会让系统再做一次 relayout，再补一枪更稳。
+                    w.setLayout(
+                        if (fullW > 0) fullW else android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        wantH
+                    )
+                }
                 w.attributes?.let { attrs ->
                     attrs.layoutInDisplayCutoutMode =
                         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -569,7 +615,16 @@ internal fun PhotoViewerScreen(
             }
             controller?.isAppearanceLightStatusBars = false
             controller?.isAppearanceLightNavigationBars = false
+            // 不再隐藏导航栏：MIUI 一旦把 navigationBars 藏起来，就会把 Dialog 的可用高度
+            // 再削掉一条（3200 的屏只给 2955），底部操作条因此永远差一截贴不到屏幕底。
+            // 手势条本身是半透明的，纯黑看图页底下留着它不影响沉浸感。
+            runCatching {
+                controller?.systemBarsBehavior =
+                    androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller?.show(WindowInsetsCompat.Type.navigationBars())
+            }
             onDispose {
+                runCatching { controller?.show(WindowInsetsCompat.Type.navigationBars()) }
                 oldStatus?.let { window?.statusBarColor = it }
                 oldNav?.let { window?.navigationBarColor = it }
                 oldLightStatus?.let { controller?.isAppearanceLightStatusBars = it }
@@ -587,22 +642,45 @@ internal fun PhotoViewerScreen(
                 c.isAppearanceLightNavigationBars = EditorChrome.open
             }
         }
+        // 部分 ROM（MIUI）会把 Dialog 的窗口高度压掉一个导航栏（实测 3200 的屏只给 2864），
+        // 窗口内的内容就在这 2864 里居中 —— 于是图片在整屏里看起来整体偏上。
+        // 这里量出「物理屏高 - 实际内容高」这个缺口，把图片层按缺口上边留白，
+        // 图片中心就落回物理屏中心。
+        var viewerGapPx by remember { mutableStateOf(0) }
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .onSizeChanged { sz ->
+                    val m = android.util.DisplayMetrics()
+                    @Suppress("DEPRECATION")
+                    val dm = context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                        ?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+                    dm?.getRealMetrics(m)
+                    val realH = m.heightPixels
+                    if (realH > 0 && sz.height > 0) {
+                        val g = (realH - sz.height).coerceIn(0, realH / 6)
+                        if (g != viewerGapPx) {
+                            viewerGapPx = g
+                            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                                "HdrViewer", "VIEWER_GEO",
+                                "realH" to realH, "contentH" to sz.height, "gap" to g
+                            )
+                        }
+                    }
+                }
                 .background(if (EditorChrome.open) Color(0xFFEFEAE2) else Color.Black)
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     // 一个手势状态机管完：双指缩放、单指横滑换图、单指上滑分享、单击收 UI、双击放大
-                    .pointerInput(item.stableKey, isLive, liveOpen) {
+                    .pointerInput(item.stableKey, isLive) {
                         coroutineScope {
                         awaitEachGesture {
                             awaitFirstDown(requireUnconsumed = false)
                             // Live 正在原图上播：这一手完全交给播放层（轻点结束），
                             // 不参与横滑换图/缩放，否则播到一半画面会被滑走。
-                            if (liveOpen) {
+                            if (liveOpenNow) {
                                 var up = false
                                 while (!up) {
                                     val ev = awaitPointerEvent()
@@ -621,13 +699,18 @@ internal fun PhotoViewerScreen(
                             // Live 图长按：手指按住 500ms 不动就播尾部视频；
                             // 移动、第二根手指或已经放大都会取消，不抢横滑/缩放。
                             val longPressJob = if (isLive && !item.isVideo) launch {
-                                kotlinx.coroutines.delay(500)
+                                // 手指刚按下就让解码器跑起来（画面还是透明的），
+                                // 判定通过的那一刻直接「打开看」，不用再等一次 start() 解首帧
+                                liveClipRef[0]?.warmStart()
+                                kotlinx.coroutines.delay(300)
                                 if (!moved && !zoomed && pointers == 1 && scale <= 1.01f) {
                                     longPressed = true
                                     dialogView.performHapticFeedback(
                                         android.view.HapticFeedbackConstants.LONG_PRESS
                                     )
                                     playLive()
+                                } else {
+                                    liveClipRef[0]?.rewind()
                                 }
                             } else null
                             while (true) {
@@ -680,6 +763,8 @@ internal fun PhotoViewerScreen(
                                 if (!event.changes.any { it.pressed }) break
                             }
                             longPressJob?.cancel()
+                            // 没判定成长按（轻点 / 滑走）：把提前跑起来的解码器停回第 0 帧
+                            if (!longPressed) liveClipRef[0]?.rewind()
                             if (longPressed) return@awaitEachGesture
                             val elapsed = System.currentTimeMillis() - downAt
                             val horizontal = kotlin.math.abs(totalX)
@@ -753,9 +838,12 @@ internal fun PhotoViewerScreen(
                 contentAlignment = Alignment.Center
             ) {
                 // 图片这一层做模糊源：底部操作条压在它上面，才能糊到这张图本身
+                // 窗口比物理屏少一截时，整层向下补半个缺口，图片中心才落在整屏中心。
+                // 只平移不改尺寸：图片本身的大小、缩放/平移手势的基准都不动。
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .offset(y = with(density) { (viewerGapPx / 2).toDp() })
                         .hazeSource(viewerHaze),
                     contentAlignment = Alignment.Center
                 ) {
@@ -772,10 +860,14 @@ internal fun PhotoViewerScreen(
                 val hdrDialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
                 // 系统只有在 HDR 窗口里才会把 Gainmap 和底图合成；不设这个模式，
                 // 标准 ImageView 也只会画出 SDR 底图，看起来就是“HDR 没了”。
-                androidx.compose.runtime.LaunchedEffect(hasHdr, item.stableKey) {
+                androidx.compose.runtime.LaunchedEffect(hasHdr, item.stableKey, liveOpen) {
                     if (Build.VERSION.SDK_INT >= 34) {
-                        hdrDialogWindow?.colorMode = if (hasHdr) ActivityInfo.COLOR_MODE_HDR
-                        else ActivityInfo.COLOR_MODE_DEFAULT
+                        // Live 片段是 SDR 视频，而静帧是 Gainmap HDR 图。窗口停在 HDR 模式时，
+                        // 这层 SDR 视频会被当成 HDR 内容做一次色调映射，长按瞬间整屏明显变暗。
+                        // 播放期间切回 SDR，视频和底下的 SDR 静帧就落在同一条亮度基线上。
+                        hdrDialogWindow?.colorMode =
+                            if (hasHdr && !liveOpen) ActivityInfo.COLOR_MODE_HDR
+                            else ActivityInfo.COLOR_MODE_DEFAULT
                     }
                 }
                 val hdrFrameReady = hdrFrameKey == item.stableKey
@@ -921,48 +1013,71 @@ internal fun PhotoViewerScreen(
                         )
                     }
                 }
-                }
-            }
 
-            // Live 播放层：盖在原图同一块位置上播，不另开全屏窗口。
-            // 以前用 Dialog 会先黑一屏再跳回来，长按的瞬间观感很差。
-            if (liveOpen && liveFile != null) {
-                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                    val quarter = (rotation % 180f) != 0f
-                    val rawW = (bitmap?.width ?: item.width ?: 1).toFloat()
-                    val rawH = (bitmap?.height ?: item.height ?: 1).toFloat()
-                    val aspect = if (quarter && rawW > 0f) rawH / rawW else rawW / rawH
-                    val availW = maxWidth
-                    val availH = maxHeight
-                    val viewAspect = if (availH.value > 0f) availW.value / availH.value else 1f
-                    val fitW = if (aspect > viewAspect) availW else availH * aspect
-                    val fitH = if (aspect > viewAspect) availW / aspect else availH
-                    AndroidView(
-                        factory = { ctx ->
-                            LiveClipView(ctx).apply {
-                                // 首帧上屏后才淡入，静帧与视频之间没有黑场
-                                onFinished = { liveOpen = false }
-                                onError = {
-                                    liveOpen = false
-                                    message = "这段 Live 视频播不出来，可能编码不被支持"
+                // Live 播放层：就长在静帧这块矩形里，和静帧共用同一个居中 + 缺口补偿，
+                // 长按不会有尺度跳变，也不会像以前那样在窗口里另居中一块。
+                // 只要片段已经预抽就常驻：进图时先 prepare，长按只调 start()，
+                // 不然每次长按都要等 MediaPlayer 重新解析一遍才出画面。
+                if (liveFile != null) {
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                        val quarter = (rotation % 180f) != 0f
+                        val boxW = if (quarter) maxHeight else maxWidth
+                        val boxH = if (quarter) maxWidth else maxHeight
+                        // 基准取「当前真正画在屏幕上的那张位图」(shown)，而不是缩略图或条目宽高：
+                        // 静帧就是 ContentScale.Fit 于这张位图，照同一套算出来的矩形必然重合。
+                        val bw = (shown?.width?.takeIf { it > 0 }
+                            ?: bitmap?.width?.takeIf { it > 0 } ?: 1)
+                        val bh = (shown?.height?.takeIf { it > 0 }
+                            ?: bitmap?.height?.takeIf { it > 0 } ?: 1)
+                        val fit = kotlin.math.min(boxW.value / bw, boxH.value / bh)
+                        val fitW = (bw * fit).dp
+                        val fitH = (bh * fit).dp
+                        com.lutcamera.lutcamerapro.log.DoukLog.i(
+                            "HdrViewer", "LIVE_GEO",
+                            "bmp" to "${bw}x$bh",
+                            "box" to "${boxW.value}x${boxH.value}",
+                            "fit" to "${fitW.value}x${fitH.value}"
+                        )
+                        AndroidView(
+                            factory = { ctx ->
+                                LiveClipView(ctx).apply {
+                                    // 只 prepare，不显示：什么时候播由下面的 LaunchedEffect 决定
+                                    liveClipRef[0] = this
+                                    // 首帧上屏后才淡入，静帧与视频之间没有黑场
+                                    onFinished = { liveOpen = false }
+                                    onError = {
+                                        liveOpen = false
+                                        message = "这段 Live 视频播不出来，可能编码不被支持"
+                                    }
+                                    // 视频真实比例回来后再重算矩阵
+                                    onVideoSize = { vw, vh ->
+                                        liveVideoW = vw
+                                        liveVideoH = vh
+                                    }
                                 }
-                            }
-                        },
-                        update = { view ->
-                            // 同一个片段只 play 一次，重组时不重新起播
-                            if (view.tag != liveFile) {
-                                view.tag = liveFile
-                                liveFile?.let { view.play(it) }
-                            }
-                        },
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .size(fitW, fitH)
-                            .clickable(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null
-                            ) { liveOpen = false }
-                    )
+                            },
+                            update = { view ->
+                                val f = liveFile
+                                if (f != null && view.tag != f) {
+                                    view.tag = f
+                                    view.prepare(f)
+                                }
+                            },
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(fitW, fitH)
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) { liveOpen = false }
+                        )
+                        // liveOpen 一旦翻转就立刻驱动播放层，不等 AndroidView 的 update 被别的原因带着跑
+                        androidx.compose.runtime.LaunchedEffect(liveOpen, liveFile) {
+                            val v = liveClipRef[0] ?: return@LaunchedEffect
+                            if (liveOpen) v.startNow() else v.rewind()
+                        }
+                    }
+                }
                 }
             }
 
@@ -1087,13 +1202,27 @@ internal fun PhotoViewerScreen(
             }
 
             // 底部浮起的操作条：发送 / 收藏（星星） / 编辑 / 删除 / 更多
+            //
+            // 位置要求：条子必须贴着手机底边。但这个查看器住在一个 Dialog 窗口里，
+            // Android 15 起 Dialog 的窗口高度被系统锁在 appBounds（3200 的屏只给到 2955），
+            // setLayout、FLAG_LAYOUT_NO_LIMITS、fitInsetsTypes=0 全试过都突破不了 —— 也就是说
+            // 在窗口里怎么摆，最低也只能到 2955，下面还差 245px。
+            // 唯一能画到窗口外的途径是再开一层窗口：这里用 Popup（clippingEnabled=false），
+            // 以整个页面为锚点向下偏移 viewerGapPx，条子就落回物理屏底。
             if (!uiHidden) {
+                androidx.compose.ui.window.Popup(
+                    alignment = Alignment.BottomCenter,
+                    offset = IntOffset(0, viewerGapPx),
+                    properties = androidx.compose.ui.window.PopupProperties(
+                        focusable = false,
+                        clippingEnabled = false
+                    )
+                ) {
                 Column(
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .navigationBarsPadding()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .width((androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp).dp)
+                        .padding(horizontal = 12.dp)
+                        .padding(top = 8.dp, bottom = 22.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Row(
@@ -1121,6 +1250,7 @@ internal fun PhotoViewerScreen(
                             label = if (item.isVideo) "视频 LUT" else "编辑",
                             onClick = {
                                 if (item.isVideo) {
+                                    videoLutMode = true
                                     videoOpen = true
                                 } else {
                                     // 编辑器还要再解一张 4096 的图，先把 HDR 那两张放掉腾内存
@@ -1145,6 +1275,7 @@ internal fun PhotoViewerScreen(
                         )
                     }
                 }
+                }
             }
 
             // 提示条独立浮在操作条上方，避免和 pill 抢同一块布局打架
@@ -1156,8 +1287,7 @@ internal fun PhotoViewerScreen(
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .navigationBarsPadding()
-                        .padding(bottom = 132.dp, start = 24.dp, end = 24.dp)
+                        .padding(bottom = 104.dp, start = 24.dp, end = 24.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .background(Color.Black.copy(alpha = 0.66f))
                         .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -1286,6 +1416,7 @@ internal fun PhotoViewerScreen(
         ) {
             VideoLutScreen(
                 item = item,
+                startInLutMode = videoLutMode,
                 onDismiss = { videoOpen = false },
                 onExported = { name ->
                     videoOpen = false

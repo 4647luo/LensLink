@@ -461,17 +461,9 @@ fun DoukRoot() {
             // 看图页打开时，Dialog 窗口在部分 ROM 上无法真正铺进状态栏；
             // 在根布局最上层补色，盖住透出的图库浅灰，也让日期渐变看起来从屏幕最顶部开始。
             // 编辑器是浅色界面，用编辑器自己的浅色底盖住，避免白图标压黑底。
-            if (ViewerChrome.open || EditorChrome.open || DetailChrome.open) {
-                val chromeTopColor = when {
-                    DetailChrome.open -> Color.White
-                    EditorChrome.open -> Color(0xFFEFEAE2)
-                    else -> Color.Black
-                }
-                val chromeBottomColor = when {
-                    DetailChrome.open -> Color.White
-                    EditorChrome.open -> Color(0xFFFFFDF9)
-                    else -> Color.Black
-                }
+            if (ViewerChrome.open || EditorChrome.open) {
+                val chromeTopColor = if (EditorChrome.open) Color(0xFFEFEAE2) else Color.Black
+                val chromeBottomColor = if (EditorChrome.open) Color(0xFFFFFDF9) else Color.Black
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -479,13 +471,14 @@ fun DoukRoot() {
                         .height(WindowInsets.statusBars.asPaddingValues().calculateTopPadding())
                         .background(chromeTopColor)
                 )
-                // 部分 ROM 上 navigationBars inset 会是 0，Dialog 又会停在 2780，
-                // 底部仍露出图库页。这里固定铺够 56dp，视觉上直接和 Dialog 拼齐。
+                // 部分 ROM 上 navigationBars inset 会是 0，Dialog / Activity 窗口都会在
+                // 手势条那里少掉一截，底部仍露出图库的缩略图。这里固定铺够 120dp，
+                // 把「窗口底边到屏幕底边」这一整段直接压成纯色。
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .height(56.dp)
+                        .height(120.dp)
                         .background(chromeBottomColor)
                 )
             }

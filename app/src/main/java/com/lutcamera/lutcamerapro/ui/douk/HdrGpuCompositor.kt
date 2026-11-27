@@ -40,7 +40,9 @@ internal object HdrGpuCompositor {
         val epsSdr: Float,
         val epsHdr: Float,
         val strength: Float,
-        val highlight: Float
+        val highlight: Float,
+        /** 高光肩部的膝点（0.75–0.92）。越低压缩越早、高光层次越多，越接近导出的 HDR 观感。 */
+        val knee: Float = 0.84f
     )
 
     data class GradeParams(
@@ -126,6 +128,7 @@ internal object HdrGpuCompositor {
         uniform float uEpsHdr;
         uniform float uStrength;
         uniform float uHighlight;
+        uniform float uKnee;
         varying vec2 vTex;
 
         void main() {
@@ -137,21 +140,26 @@ internal object HdrGpuCompositor {
             float gv = (gc.r + gc.g + gc.b) / 3.0;
             float boost = exp(uLogMin + (uLogMax - uLogMin) * pow(gv, uGamma));
             float baseLum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            float liftWeight = step01(0.02, 0.42, baseLum) * (1.0 - step01(0.45, 0.82, baseLum));
-            float exposure = 1.0 + (0.66 + 0.58 * uHighlight) * uStrength * liftWeight;
-            float gainWeight = 0.75 * step01(0.02, 0.45, baseLum) *
-                (1.0 - 0.7 * step01(0.55, 0.95, baseLum));
-            float expanded = (baseLum + uEpsSdr) * exposure *
-                (1.0 + (boost - 1.0) * gainWeight) - uEpsHdr;
-            float toned = contrastCurve(acesFilmic(expanded), 0.40 * uStrength);
-            float displayLum = baseLum > 0.72 ? min(toned, baseLum) : max(baseLum * 0.90, toned);
-            float scale = baseLum > 1e-5 ? clamp(displayLum / baseLum, 0.90, 2.40) : 1.0;
-            float whiteGuard = step01(0.78, 0.96, baseLum);
-            float effScale = scale + (1.0 - scale) * whiteGuard;
-            float saturation = 1.0 + 0.22 * uStrength * step01(0.30, 0.90, baseLum);
-            float outR = clamp((baseLum + (r - baseLum) * saturation) * effScale, 0.0, 1.0);
-            float outG = clamp((baseLum + (g - baseLum) * saturation) * effScale, 0.0, 1.0);
-            float outB = clamp((baseLum + (b - baseLum) * saturation) * effScale, 0.0, 1.0);
+            // 增益覆盖全亮度，阴影只给三成：真 HDR 不是只抬高光，
+            // 但暗部权重太高会把噪点一起抬起来。
+            float gainWeight = 0.28 + 0.72 * step01(0.02, 0.50, baseLum);
+            float expanded = (baseLum + uEpsSdr) * (1.0 + (boost - 1.0) * gainWeight) - uEpsHdr;
+            // 高光肩部：膝点以下原样保留（中间调不变亮不变暗），
+            // 膝点以上指数滚降到 1，只压不切。旧实现先把中间调抬 0.66–1.24 倍再 ACES 折叠，
+            // 亮部一路顶到 255，细节全丢——这正是「预览过曝、导出更好」的来源。
+            float knee = clamp(uKnee, 0.45, 0.95);
+            float knee1 = 1.0 - knee;
+            float shoulder = expanded <= knee
+                ? expanded
+                : knee + knee1 * (1.0 - exp(-(expanded - knee) / max(knee1, 1e-4)));
+            // 轻微 S 曲线只补一点反差，不参与高光抬升。
+            float toned = 0.45 + (shoulder - 0.45) * (1.0 + 0.18 * uStrength);
+            toned = clamp(toned, 0.0, 1.0);
+            float scale = baseLum > 1e-5 ? clamp(toned / baseLum, 0.80, 2.20) : 1.0;
+            float saturation = 1.0 + 0.12 * uStrength * step01(0.30, 0.90, baseLum);
+            float outR = clamp((baseLum + (r - baseLum) * saturation) * scale, 0.0, 1.0);
+            float outG = clamp((baseLum + (g - baseLum) * saturation) * scale, 0.0, 1.0);
+            float outB = clamp((baseLum + (b - baseLum) * saturation) * scale, 0.0, 1.0);
             gl_FragColor = vec4(linearToSrgb(outR), linearToSrgb(outG), linearToSrgb(outB), 1.0);
         }
     """
@@ -165,6 +173,41 @@ internal object HdrGpuCompositor {
 
         void main() {
             gl_FragColor = vec4(gradePixel(texture2D(uBase, vTex).rgb, uShadow, uColor, uWarmth), 1.0);
+        }
+    """
+
+    /**
+     * 调色 + 「HDR 强度在 SDR 底图上的可见分量」合成到一个 pass。
+     *
+     * 这两步原来一个是 GPU（grade）、一个是 Kotlin 逐像素 LUT（applyHdrSdrLook）。
+     * 2048 档的底图有 220 万像素，那条 CPU 循环要 getPixels / 循环 / setPixels 三趟，
+     * 一次十几到上百毫秒——拖强度滑杆时就是它把帧率拖下去的。合并进 shader 后
+     * 整帧只剩一次 GPU 提交，数学与 CPU 版逐项对齐。
+     */
+    private const val GRADE_LOOK_FS = "precision highp float;\n" + FUNCS + """
+        uniform sampler2D uBase;
+        uniform float uShadow;
+        uniform float uColor;
+        uniform float uWarmth;
+        uniform float uLook;
+        varying vec2 vTex;
+
+        float lookChannel(float x, float l) {
+            if (l <= 0.002) { return x; }
+            // 与 applyHdrSdrLook 的 LUT 同式：中间调轻压反差的另一面 + 暗部抬升，高光不动
+            float y = 0.5 + (x - 0.5) * (1.0 + 0.10 * l);
+            y += 0.14 * l * (1.0 - x) * (1.0 - x);
+            return clamp(y, 0.0, 1.0);
+        }
+
+        void main() {
+            vec3 c = gradePixel(texture2D(uBase, vTex).rgb, uShadow, uColor, uWarmth);
+            gl_FragColor = vec4(
+                lookChannel(c.r, uLook),
+                lookChannel(c.g, uLook),
+                lookChannel(c.b, uLook),
+                1.0
+            );
         }
     """
 
@@ -186,7 +229,8 @@ internal object HdrGpuCompositor {
                     "uEpsSdr" to p.epsSdr,
                     "uEpsHdr" to p.epsHdr,
                     "uStrength" to p.strength,
-                    "uHighlight" to p.highlight
+                    "uHighlight" to p.highlight,
+                    "uKnee" to p.knee
                 )
             )
             if (out != null) {
@@ -213,6 +257,80 @@ internal object HdrGpuCompositor {
         }
     }
 
+    fun gradeAndLook(src: Bitmap, p: GradeParams, look01: Float): Bitmap? {
+        if (src.isRecycled) return null
+        val start = SystemClock.elapsedRealtime()
+        val out = try {
+            render(
+                src, null, GRADE_LOOK_FS,
+                floatUniforms = mapOf(
+                    "uShadow" to p.shadow,
+                    "uColor" to p.color,
+                    "uWarmth" to p.warmth,
+                    "uLook" to look01.coerceIn(0f, 1f)
+                )
+            )
+        } catch (e: Throwable) {
+            com.lutcamera.lutcamerapro.log.DoukLog.w(
+                "PhotoEditor", "HDR_GPU_LOOK_FAIL", "msg" to (e.message ?: e.javaClass.simpleName)
+            )
+            null
+        }
+        if (out != null) {
+            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                "PhotoEditor", "HDR_GPU_LOOK",
+                "px" to (src.width * src.height),
+                "look" to look01,
+                "ms" to (SystemClock.elapsedRealtime() - start)
+            )
+        }
+        return out
+    }
+
+    /**
+     * 只做「强度可见分量」（applyHdrSdrLook 的 GPU 版）。
+     * 导出时底图已经过一次 grade，不能再用 GRADE_LOOK_FS 把调色叠两遍。
+     */
+    private const val LOOK_FS = "precision highp float;\n" + """
+        precision highp float;
+        uniform sampler2D uBase;
+        uniform float uLook;
+        varying vec2 vTex;
+
+        float lookChannel(float x, float l) {
+            if (l <= 0.002) { return x; }
+            float y = 0.5 + (x - 0.5) * (1.0 + 0.10 * l);
+            y += 0.14 * l * (1.0 - x) * (1.0 - x);
+            return clamp(y, 0.0, 1.0);
+        }
+
+        void main() {
+            vec3 c = texture2D(uBase, vTex).rgb;
+            gl_FragColor = vec4(
+                lookChannel(c.r, uLook),
+                lookChannel(c.g, uLook),
+                lookChannel(c.b, uLook),
+                1.0
+            );
+        }
+    """
+
+    fun look(src: Bitmap, look01: Float): Bitmap? {
+        if (src.isRecycled) return null
+        if (look01 <= 0.002f) return src
+        return try {
+            render(
+                src, null, LOOK_FS,
+                floatUniforms = mapOf("uLook" to look01.coerceIn(0f, 1f))
+            )
+        } catch (e: Throwable) {
+            com.lutcamera.lutcamerapro.log.DoukLog.w(
+                "PhotoEditor", "HDR_GPU_LOOK_ONLY_FAIL", "msg" to (e.message ?: e.javaClass.simpleName)
+            )
+            null
+        }
+    }
+
     fun grade(src: Bitmap, p: GradeParams): Bitmap? {
         if (src.isRecycled) return null
         return try {
@@ -234,23 +352,35 @@ internal object HdrGpuCompositor {
 
     // ---------------------------------------------------------------- GL 渲染
 
-    private fun render(
-        base: Bitmap,
-        gain: Bitmap?,
-        fragmentSrc: String,
-        floatUniforms: Map<String, Float>
-    ): Bitmap? {
-        val w = base.width
-        val h = base.height
-        var eglDisplay: EGLDisplay? = null
-        var eglContext: EGLContext? = null
-        var eglSurface: EGLSurface? = null
-        return try {
-            val egl = EGLContext.getEGL() as EGL10
-            eglDisplay = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY)
-            val version = IntArray(2)
-            if (!egl.eglInitialize(eglDisplay, version)) return null
-            val configAttrs = intArrayOf(
+    /**
+     * 每个渲染线程保留一套 EGL 上下文 + 已编译的 program。
+     *
+     * 之前每次 render 都 eglInitialize → chooseConfig → createContext → 编译 shader →
+     * terminate，实测不管图多大都要 30ms 上下（2048 与 640 只差几毫秒，说明耗时几乎全是这段
+     * 固定开销）。缓存之后一帧只剩「上传纹理 + 画一个 quad + readPixels」。
+     * 上下文是线程绑定的，预览跑在 Dispatchers.Default 上，所以用 ThreadLocal。
+     */
+    private class GlCtx {
+        var egl: EGL10? = null
+        var display: EGLDisplay? = null
+        var config: EGLConfig? = null
+        var context: EGLContext? = null
+        var surface: EGLSurface? = null
+        var width = 0
+        var height = 0
+        val programs = HashMap<String, Int>()
+    }
+
+    private val glCtx = object : ThreadLocal<GlCtx>() {
+        override fun initialValue(): GlCtx = GlCtx()
+    }
+
+    private fun ensureCurrent(c: GlCtx, w: Int, h: Int): Boolean {
+        val egl = EGLContext.getEGL() as EGL10
+        if (c.display == null) {
+            val d = egl.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY)
+            if (!egl.eglInitialize(d, IntArray(2))) return false
+            val attrs = intArrayOf(
                 EGL10.EGL_RED_SIZE, 8,
                 EGL10.EGL_GREEN_SIZE, 8,
                 EGL10.EGL_BLUE_SIZE, 8,
@@ -261,24 +391,57 @@ internal object HdrGpuCompositor {
             )
             val configs = arrayOfNulls<EGLConfig>(1)
             val num = IntArray(1)
-            if (!egl.eglChooseConfig(eglDisplay, configAttrs, configs, 1, num) || num[0] <= 0) return null
-            val config = configs[0] ?: return null
-            eglContext = egl.eglCreateContext(
-                eglDisplay, config, EGL10.EGL_NO_CONTEXT,
+            if (!egl.eglChooseConfig(d, attrs, configs, 1, num) || num[0] <= 0) return false
+            val cfg = configs[0] ?: return false
+            val ctx = egl.eglCreateContext(
+                d, cfg, EGL10.EGL_NO_CONTEXT,
                 intArrayOf(EGL_CONTEXT_CLIENT_VERSION, 2, EGL10.EGL_NONE)
-            )
-            eglSurface = egl.eglCreatePbufferSurface(
-                eglDisplay, config,
+            ) ?: return false
+            c.egl = egl; c.display = d; c.config = cfg; c.context = ctx
+        }
+        val egl2 = c.egl ?: return false
+        val d = c.display ?: return false
+        if (c.surface == null || c.width != w || c.height != h) {
+            c.surface?.let { runCatching { egl2.eglDestroySurface(d, it) } }
+            c.surface = egl2.eglCreatePbufferSurface(
+                d, c.config,
                 intArrayOf(EGL10.EGL_WIDTH, w, EGL10.EGL_HEIGHT, h, EGL10.EGL_NONE)
             )
-            if (eglContext == null || eglSurface == null) return null
-            if (!egl.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return null
+            if (c.surface == null) return false
+            c.width = w
+            c.height = h
+        }
+        return egl2.eglMakeCurrent(d, c.surface, c.surface, c.context)
+    }
 
-            val program = buildProgram(fragmentSrc)
+    private fun cachedProgram(c: GlCtx, src: String): Int {
+        c.programs[src]?.let { if (it != 0) return it }
+        val p = buildProgram(src)
+        if (p != 0) c.programs[src] = p
+        return p
+    }
+
+    private fun render(
+        base: Bitmap,
+        gain: Bitmap?,
+        fragmentSrc: String,
+        floatUniforms: Map<String, Float>
+    ): Bitmap? {
+        val w = base.width
+        val h = base.height
+        if (w < 2 || h < 2) return null
+        val c = glCtx.get()
+        val start = SystemClock.elapsedRealtime()
+        var baseTex = 0
+        var gainTex = 0
+        return try {
+            if (!ensureCurrent(c, w, h)) return null
+            val program = cachedProgram(c, fragmentSrc)
             if (program == 0) return null
+            GLES20.glViewport(0, 0, w, h)
             GLES20.glUseProgram(program)
-            val baseTex = uploadTexture(base)
-            val gainTex = gain?.let { uploadTexture(it) } ?: 0
+            baseTex = uploadTexture(base)
+            gainTex = gain?.let { uploadTexture(it) } ?: 0
 
             GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uBase"), 0)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -302,6 +465,16 @@ internal object HdrGpuCompositor {
             buffer.rewind()
             out.copyPixelsFromBuffer(buffer)
             out.density = Bitmap.DENSITY_NONE
+            // 源图是 Display P3 时，像素值就是 P3 数值；不把这个 profile 带过去，
+            // 系统会按 sRGB 解释同一批数值，画面立刻掉饱和度、发灰。
+            runCatching { out.setColorSpace(base.colorSpace ?: android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB)) }
+            if (frameCount.incrementAndGet() <= 24) {
+                com.lutcamera.lutcamerapro.log.DoukLog.i(
+                    "PhotoEditor", "HDR_GPU_FRAME",
+                    "px" to (w * h),
+                    "ms" to (SystemClock.elapsedRealtime() - start)
+                )
+            }
             out
         } catch (e: Throwable) {
             com.lutcamera.lutcamerapro.log.DoukLog.w(
@@ -310,13 +483,8 @@ internal object HdrGpuCompositor {
             null
         } finally {
             runCatching {
-                val egl = EGLContext.getEGL() as EGL10
-                if (eglDisplay != null) {
-                    egl.eglMakeCurrent(eglDisplay, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_SURFACE, EGL10.EGL_NO_CONTEXT)
-                    eglSurface?.let { egl.eglDestroySurface(eglDisplay, it) }
-                    eglContext?.let { egl.eglDestroyContext(eglDisplay, it) }
-                    egl.eglTerminate(eglDisplay)
-                }
+                if (baseTex != 0) GLES20.glDeleteTextures(1, intArrayOf(baseTex), 0)
+                if (gainTex != 0) GLES20.glDeleteTextures(1, intArrayOf(gainTex), 0)
             }
         }
     }
@@ -448,4 +616,5 @@ internal object HdrGpuCompositor {
     private const val EGL_OPENGL_ES2_BIT_VALUE = 4
 
     private val callCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val frameCount = java.util.concurrent.atomic.AtomicInteger(0)
 }

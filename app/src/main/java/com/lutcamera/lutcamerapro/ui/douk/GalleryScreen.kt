@@ -129,8 +129,7 @@ private val GalleryDecodeGate = Semaphore(3)
  * 网格缩略图只保留最近 48 张、按 cell 尺寸解码（420px）。
  * 之前按 960px 解码且永不回收，滚动几百张就会把几百 MB 留在内存里。
  */
-private const val MAX_GALLERY_THUMBS = 48
-private const val GALLERY_THUMB_SIDE = 420
+private const val GALLERY_THUMB_SIDE = GalleryThumbCache.THUMB_SIDE
 
 internal enum class GallerySource(val label: String, val hint: String) {
     CAMERA("相机内", "机身存储，经 USB 或 Wi-Fi 读取"),
@@ -335,8 +334,8 @@ fun GalleryScreen(
         }
     }
 
-    // 缩略图缓存按「来源:键」存，避免相机 handle 与相册 id 撞号后串图
-    val thumbs = remember { mutableStateMapOf<String, ImageBitmap>() }
+    // 缩略图缓存按「来源:键」存，避免相机 handle 与相册 id 撞号后串图。
+    // 具体的 LRU 与每格状态在 GalleryThumbCache 里，这里不再持有 map（见该文件注释）。
 
     // 多选：长按进选择模式，顶部换成「取消 / 已选择 N 项 / 全选」，底部出操作条
     var selecting by remember { mutableStateOf(false) }
@@ -355,7 +354,7 @@ fun GalleryScreen(
         resetSelection()
         albumFilter = null
         // 切换来源必须清缓存，否则相机 handle 与相册 id 混在一起会串图，也会一直占内存。
-        thumbs.clear()
+        GalleryThumbCache.clear()
     }
 
     // 多选态下按返回键只退出选择模式，不离开图库页（和系统相册一致）
@@ -388,7 +387,7 @@ fun GalleryScreen(
                         val handles = listOf(target.key to target.fileName) + target.extraHandles
                         // 先把整批任务写进持久化队列：中途被杀进程，下次连上相机也能接着传。
                         if (!target.fromUsb) {
-                            val thumb = thumbs[target.stableKey]
+                            val thumb = GalleryThumbCache.peek(target.stableKey)
                             handles.forEach { (handle, _) ->
                                 val transferId = state.vm.enqueueTransfer(handle)
                                 if (transferId != null) TransferCenter.putThumbnail(transferId, thumb)
@@ -609,8 +608,7 @@ fun GalleryScreen(
             } else when (source) {
             GallerySource.CAMERA -> CameraGallery(
                 state = state,
-                thumbs = thumbs,
-                selected = selected,
+                                selected = selected,
                 filter = filter,
                 albumFilter = albumFilter,
                 onOpen = { previewItem = it },
@@ -631,8 +629,7 @@ fun GalleryScreen(
             )
 
             GallerySource.APP -> AppGallery(
-                thumbs = thumbs,
-                refreshTick = state.galleryRefreshTick,
+                                refreshTick = state.galleryRefreshTick,
                 albumFilter = albumFilter,
                 filter = filter,
                 selected = selected,
@@ -654,8 +651,7 @@ fun GalleryScreen(
             )
 
             GallerySource.PHONE -> PhoneGallery(
-                thumbs = thumbs,
-                albumFilter = albumFilter,
+                                albumFilter = albumFilter,
                 filter = filter,
                 selected = selected,
                 onOpen = { previewItem = it },
@@ -786,13 +782,14 @@ fun GalleryScreen(
         val nextOf = if (idx >= 0 && idx + 1 < list.size) list[idx + 1] else null
         PhotoViewerScreen(
             item = item,
-            bitmap = thumbs[item.stableKey],
+            // 读状态而不是 peek：缩略图后到（或刚被加载完）时查看器能跟着更新，不会一直灰着
+            bitmap = GalleryThumbCache.stateOf(item.stableKey).value,
             state = state,
             showOriginal = showOriginal,
             prevItem = prevOf,
             nextItem = nextOf,
-            prevBitmap = prevOf?.let { thumbs[it.stableKey] },
-            nextBitmap = nextOf?.let { thumbs[it.stableKey] },
+            prevBitmap = prevOf?.let { GalleryThumbCache.stateOf(it.stableKey).value },
+            nextBitmap = nextOf?.let { GalleryThumbCache.stateOf(it.stableKey).value },
             // 左右滑动换图：在当前来源、当前筛选结果里按顺序取下一张，到头就停
             onSwipe = { dir ->
                 val list = currentItems
@@ -927,7 +924,6 @@ private fun mergePairedFormats(
 @Composable
 private fun CameraGallery(
     state: DoukState,
-    thumbs: MutableMap<String, ImageBitmap>,
     selected: Set<String>,
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
@@ -1035,8 +1031,7 @@ private fun CameraGallery(
 
     PhotoGrid(
         items = displayed,
-        thumbs = thumbs,
-        selected = selected,
+                selected = selected,
         headerOverride = "机身照片 ${visibleItems.size} 张（${if (usbMode) "USB PTP" else "Wi‑Fi PTP"}）",
         onOpen = onOpen,
         onLongPress = onLongPress,
@@ -1063,7 +1058,6 @@ private fun CameraGallery(
 /** 应用内：App 自己下载到 Pictures/连镜、DCIM/连镜 的照片。 */
 @Composable
 private fun AppGallery(
-    thumbs: MutableMap<String, ImageBitmap>,
     refreshTick: Int,
     selected: Set<String>,
     onOpen: (GalleryItem) -> Unit,
@@ -1081,9 +1075,15 @@ private fun AppGallery(
 
     val ctx = LocalContext.current
     LaunchedEffect(refreshTick) {
+        // 先读索引：文件没变的话，宽高直接命中，不用再 decode 一遍
+        withContext(Dispatchers.IO) { AppMediaIndex.ensureLoaded(ctx) }
         val groups = withContext(Dispatchers.IO) { groupAppFiles(scanAppImages()) }
         files = groups.flatMap { listOf(it.main) + it.extras }
-        // 先把列表铺出来：宽高（构图筛选才用到）放到后台慢慢补，
+        val cachedBounds = HashMap<Int, Pair<Int, Int>>(groups.size)
+        groups.forEachIndexed { index, group ->
+            AppMediaIndex.cached(group.main)?.let { cachedBounds[index] = it }
+        }
+        // 先把列表铺出来：缓存没命中的宽高（构图筛选才用到）放到后台慢慢补，
         // 否则照片一多，readImageBounds 会把首屏一直卡在「正在扫描…」。
         val baseItems = groups.mapIndexed { index, group ->
             val mainExt = group.main.name.substringAfterLast('.', "").lowercase()
@@ -1099,7 +1099,9 @@ private fun AppGallery(
                 album = group.main.parentFile?.name,
                 isVideo = mainExt in APP_VIDEO_EXTS,
                 formats = (listOf(mainExt) + extraExts).filter { it.isNotBlank() },
-                extraFiles = group.extras.map { it.name }
+                extraFiles = group.extras.map { it.name },
+                width = cachedBounds[index]?.first ?: 0,
+                height = cachedBounds[index]?.second ?: 0
             )
         }
         items = baseItems
@@ -1116,7 +1118,11 @@ private fun AppGallery(
         launch(Dispatchers.IO) {
             val bounds = HashMap<Int, Pair<Int, Int>>(groups.size)
             groups.forEachIndexed { index, group ->
-                readImageBounds(group.main)?.let { bounds[index] = it }
+                // 缓存里已经有的就不用再开文件了
+                if (index in cachedBounds) return@forEachIndexed
+                val read = readImageBounds(group.main) ?: return@forEachIndexed
+                bounds[index] = read
+                AppMediaIndex.put(group.main, read.first, read.second)
                 if (index > 0 && index % 24 == 0) {
                     val snapshot = HashMap(bounds)
                     withContext(Dispatchers.Main) {
@@ -1134,6 +1140,9 @@ private fun AppGallery(
                     }
                 }
             }
+            // 删掉的图顺手清出索引，避免 JSON 越滚越大
+            AppMediaIndex.prune(groups.map { it.main.absolutePath }.toSet())
+            AppMediaIndex.save(ctx)
         }
     }
 
@@ -1167,8 +1176,7 @@ private fun AppGallery(
 
     PhotoGrid(
         items = visible,
-        thumbs = thumbs,
-        selected = selected,
+                selected = selected,
         headerOverride = "应用内 ${visible.size} 张",
         onOpen = onOpen,
         onLongPress = onLongPress,
@@ -1195,7 +1203,6 @@ private fun AppGallery(
 /** 手机内：MediaStore 真实相册。 */
 @Composable
 private fun PhoneGallery(
-    thumbs: MutableMap<String, ImageBitmap>,
     selected: Set<String>,
     onOpen: (GalleryItem) -> Unit,
     onLongPress: (GalleryItem) -> Unit,
@@ -1398,8 +1405,7 @@ private fun PhoneGallery(
 
     PhotoGrid(
         items = visible,
-        thumbs = thumbs,
-        selected = selected,
+                selected = selected,
         headerOverride = "手机相册 ${visible.size} 张",
         onOpen = onOpen,
         onLongPress = onLongPress,
@@ -1437,7 +1443,6 @@ private fun PhoneGallery(
 @Composable
 private fun PhotoGrid(
     items: List<GalleryItem>,
-    thumbs: MutableMap<String, ImageBitmap>,
     selected: Set<String>,
     headerOverride: String? = null,
     onOpen: (GalleryItem) -> Unit,
@@ -1581,8 +1586,7 @@ private fun PhotoGrid(
             items(section.items, key = { it.stableKey }, contentType = { "thumb" }) { item ->
                 ThumbCell(
                     item = item,
-                    thumbs = thumbs,
-                    selected = item.stableKey in selected,
+                                        selected = item.stableKey in selected,
                     selectionMode = selectionMode,
                     onClick = { if (selectionMode) onToggle(item) else onOpen(item) },
                     onLongPress = { onLongPress(item) },
@@ -1618,7 +1622,6 @@ private fun PhotoGrid(
 @Composable
 private fun ThumbCell(
     item: GalleryItem,
-    thumbs: MutableMap<String, ImageBitmap>,
     selected: Boolean,
     selectionMode: Boolean,
     onClick: () -> Unit,
@@ -1629,15 +1632,12 @@ private fun ThumbCell(
     /** 拖动过程中滑到的位置（根坐标），一次跟手可以扫过一整排 */
     dragHit: ((Offset) -> Unit)? = null
 ) {
-    LaunchedEffect(item.stableKey) {
-        if (!thumbs.containsKey(item.stableKey)) {
-            GalleryDecodeGate.withPermit { loader() }?.let { bitmap ->
-                thumbs[item.stableKey] = bitmap
-                // 只保留最近 48 张。Remove 一个不在当前格子的旧 key，避免把刚加载的图删掉。
-                if (thumbs.size > MAX_GALLERY_THUMBS) {
-                    thumbs.keys.firstOrNull { it != item.stableKey }?.let { thumbs.remove(it) }
-                }
-            }
+    // 每格只观察自己那份状态：别的格子加载完不会让这一格重组。
+    // 缩略图被 LRU 淘汰时状态会变回 null，这里跟着重新拉一次。
+    val bitmap = GalleryThumbCache.stateOf(item.stableKey).value
+    LaunchedEffect(item.stableKey, bitmap != null) {
+        if (bitmap == null) {
+            GalleryDecodeGate.withPermit { loader() }?.let { GalleryThumbCache.put(item.stableKey, it) }
         }
     }
     // Live 图角标：探测只读文件头 128KB，结果会被 LivePhoto 缓存，滚动复用不会重复读
@@ -1646,7 +1646,6 @@ private fun ThumbCell(
     LaunchedEffect(item.stableKey) {
         if (!isLive && !item.isVideo) isLive = LivePhoto.probe(context, item)
     }
-    val bitmap = thumbs[item.stableKey]
     var cellCoords by remember { mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
     // 手势协程要长期活着，回调必须是「最新值」而不是创建时那一份
     val startRef = androidx.compose.runtime.rememberUpdatedState(dragStart)
@@ -1806,6 +1805,76 @@ private data class AppGroup(
     val extras: List<File>,
     val dateMillis: Long
 )
+
+/**
+ * 应用内图库的元数据索引。
+ *
+ * 应用图库每次刷新都要遍历 7 个目录、对每组照片 decode bounds（RAW/视频还要开
+ * MediaMetadataRetriever）。文件没变就没必要重读，这里按「路径 + mtime + size」
+ * 记住宽高，命中就跳过解码；索引落盘成一个小 JSON，冷启动也能直接用。
+ */
+private data class AppMeta(
+    val mtime: Long = 0L,
+    val size: Long = 0L,
+    val w: Int = 0,
+    val h: Int = 0
+)
+
+private object AppMediaIndex {
+    private val map = HashMap<String, AppMeta>()
+    private var loadedPath: String? = null
+    private var dirty = false
+
+    @Synchronized
+    fun ensureLoaded(ctx: android.content.Context) {
+        val path = File(ctx.filesDir, "app_gallery_index.json").absolutePath
+        if (loadedPath == path) return
+        loadedPath = path
+        runCatching {
+            val f = File(path)
+            if (!f.exists()) return
+            val type = object : com.google.gson.reflect.TypeToken<Map<String, AppMeta>>() {}.type
+            val parsed: Map<String, AppMeta> =
+                com.google.gson.Gson().fromJson(f.readText(), type) ?: emptyMap()
+            map.putAll(parsed)
+        }
+    }
+
+    /** 文件没被改过、且缓存里有宽高才算命中。 */
+    @Synchronized
+    fun cached(file: File): Pair<Int, Int>? {
+        val meta = map[file.absolutePath] ?: return null
+        if (meta.w <= 0 || meta.h <= 0) return null
+        if (meta.mtime != file.lastModified() || meta.size != file.length()) return null
+        return meta.w to meta.h
+    }
+
+    @Synchronized
+    fun put(file: File, w: Int, h: Int) {
+        val old = map[file.absolutePath]
+        val meta = AppMeta(file.lastModified(), file.length(), w, h)
+        if (old != meta) {
+            map[file.absolutePath] = meta
+            dirty = true
+        }
+    }
+
+    @Synchronized
+    fun prune(valid: Set<String>) {
+        if (map.keys.retainAll(valid)) dirty = true
+    }
+
+    fun save(ctx: android.content.Context) {
+        val json: String?
+        synchronized(this) {
+            if (!dirty) return
+            dirty = false
+            json = runCatching { com.google.gson.Gson().toJson(map) }.getOrNull()
+        }
+        if (json == null) return
+        runCatching { File(ctx.filesDir, "app_gallery_index.json").writeText(json) }
+    }
+}
 
 private fun appFileBaseName(name: String): String =
     name.substringBeforeLast('.', name)

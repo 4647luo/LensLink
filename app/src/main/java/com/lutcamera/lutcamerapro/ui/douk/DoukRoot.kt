@@ -156,19 +156,9 @@ fun DoukRoot() {
     var showCameraGallery by remember { mutableStateOf(false) }
     // 在图库页再点一次底部「图库」，就把「照片 / 相册」条从底部弹出来
     var gallerySwitchTick by remember { mutableStateOf(0) }
-    // 在设备页再点一次底部「设备」，就在 Douk 栏上方弹出「蓝牙 / Wi‑Fi|USB」两个按钮
-    var showDeviceServiceBar by remember { mutableStateOf(false) }
+    // 设备页显示哪一组服务卡片：蓝牙 / Wi‑Fi|USB。
+    // 切换入口在相机照片右上角的小胶囊上，不再靠「再点一次设备」弹浮层。
     var deviceServiceMode by remember { mutableStateOf("wifi") }
-    // 一旦用户切过服务页，内容就和切换条解绑：收起切换条只是藏掉两个按钮，
-    // 当前页（蓝牙卡片 / Wi‑Fi|USB 卡片）继续显示，不再弹回初始设备页。
-    var deviceServicePinned by remember { mutableStateOf(false) }
-    // 离开设备页只收起切换条，不再复位服务模式：
-    // 用户点了「蓝牙」后，下次回到设备页仍应停在蓝牙卡片，而不是被强行拉回 Wi‑Fi|USB。
-    LaunchedEffect(currentRoute) {
-        if (currentRoute != "device") {
-            showDeviceServiceBar = false
-        }
-    }
     // 运行日志落盘需要 Context；Application 已安装，这里只作为兜底（重复调用无副作用）
     LaunchedEffect(Unit) { DoukLog.install(context) }
 
@@ -338,8 +328,8 @@ fun DoukRoot() {
                                     state = state,
                                     onAddDevice = { showAddDevice = true },
                                     onOpenControl = { nav.navigate("control") { launchSingleTop = true } },
-                                    serviceMode = if (showDeviceServiceBar || deviceServicePinned) deviceServiceMode else null,
-                                    serviceBarVisible = showDeviceServiceBar
+                                    serviceMode = deviceServiceMode,
+                                    onServiceSelect = { deviceServiceMode = it }
                                 )
                             }
                             composable("control") {
@@ -371,18 +361,6 @@ fun DoukRoot() {
                                 .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
                         ) {
-                            androidx.compose.animation.AnimatedVisibility(
-                                visible = showDeviceServiceBar
-                            ) {
-                                DeviceServiceSwitcher(
-                                    mode = deviceServiceMode,
-                                    onSelect = {
-                                        deviceServiceMode = it
-                                        // 记下用户这次选的服务页；之后即使收起切换条也保持不跳页
-                                        deviceServicePinned = true
-                                    }
-                                )
-                            }
                             // 图库多选的批量操作卡：贴在底栏正上方（不再塞在图库页底部）
                             if (state.gallerySelCount > 0 && state.gallerySelKind.isNotBlank()) {
                                 val pill = RoundedCornerShape(percent = 50)
@@ -421,13 +399,6 @@ fun DoukRoot() {
                                 nav = nav,
                                 state = state,
                                 onGalleryReselect = { gallerySwitchTick++ },
-                                onDeviceReselect = {
-                                    // 再点一次设备是开关：显示时收起，收起时显示。
-                                    // 收起时保留当前服务模式，避免用户刚切到蓝牙又被拉回 Wi‑Fi|USB。
-                                    if (currentRoute == "device") {
-                                        showDeviceServiceBar = !showDeviceServiceBar
-                                    }
-                                },
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
@@ -523,93 +494,12 @@ fun DoukRoot() {
     }
 }
 
-/**
- * 设备页再次点底部「设备」后浮在 Douk 栏上方的两段切换：
- * 蓝牙 = GPS 推送与相机遥控；Wi‑Fi|USB = 电量/储存与当前链路状态。
- * 相机实物照片不参与切换，两种界面都固定显示在顶部。
- */
-@Composable
-private fun DeviceServiceSwitcher(
-    mode: String,
-    onSelect: (String) -> Unit
-) {
-    val pill = RoundedCornerShape(percent = 50)
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 4.dp)
-            .clip(pill)
-            .doukCardSurface(pill)
-            .padding(6.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        ServiceSwitchSegment(
-            label = "蓝牙",
-            icon = Icons.Rounded.Bluetooth,
-            selected = mode == "bluetooth",
-            modifier = Modifier.weight(1f),
-            onClick = { onSelect("bluetooth") }
-        )
-        ServiceSwitchSegment(
-            label = "Wi‑Fi | USB",
-            icon = Icons.Rounded.Wifi,
-            selected = mode == "wifi",
-            modifier = Modifier.weight(1f),
-            onClick = { onSelect("wifi") }
-        )
-    }
-}
-
-@Composable
-private fun ServiceSwitchSegment(
-    label: String,
-    icon: ImageVector,
-    selected: Boolean,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    val pill = RoundedCornerShape(percent = 50)
-    Row(
-        modifier = modifier
-            .clip(pill)
-            .then(
-                if (selected) Modifier
-                    .background(DoukColors.accent.copy(alpha = if (DoukColors.glass) 0.16f else 0.10f), pill)
-                    .border(1.dp, DoukColors.accent.copy(alpha = 0.26f), pill)
-                else Modifier
-            )
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick
-            )
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center
-    ) {
-        Icon(
-            icon,
-            contentDescription = label,
-            tint = if (selected) DoukColors.accent else DoukColors.textSecondary,
-            modifier = Modifier.size(17.dp)
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            label,
-            style = DoukType.title,
-            color = if (selected) DoukColors.accent else DoukColors.textPrimary,
-            maxLines = 1
-        )
-    }
-}
-
 @Composable
 private fun DoukBottomBar(
     nav: androidx.navigation.NavHostController,
     state: DoukState,
     modifier: Modifier = Modifier,
-    onGalleryReselect: () -> Unit = {},
-    onDeviceReselect: () -> Unit = {}
+    onGalleryReselect: () -> Unit = {}
 ) {
     val tabs = listOf(
         DoukTab("设备", "device", Icons.Rounded.CameraAlt),
@@ -685,8 +575,7 @@ private fun DoukBottomBar(
                             if (selected && tab.route == "gallery") {
                                 onGalleryReselect()
                             } else if (selected && tab.route == "device") {
-                                // 再点一次设备：在 Douk 栏上方切换「蓝牙 / Wi‑Fi|USB」
-                                onDeviceReselect()
+                                // 设备页的服务切换已经挪到照片角标，底栏再点保持原样不动作
                             } else if (tab.route == "device") {
                                 // 「设备」是起始页：如果 restoreState，会把上次停在 control 的状态一起还原，
                                 // 表现就是点设备标签却回到控制页（有时像“设备页打不开”）。

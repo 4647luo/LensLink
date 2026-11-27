@@ -4,6 +4,7 @@ import java.util.Properties
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.jetbrains.kotlin.android)
+    alias(libs.plugins.compose.compiler)
 }
 
 // Release 签名配置从仓库外的 signing/ 目录读取；仓库（含根目录）不再保留任何明文口令。
@@ -39,7 +40,7 @@ fun signingProp(name: String): String =
 android {
     namespace = "com.lutcamera.lutcamerapro"
     // 回退到 34，与你的 Gradle 插件 8.5.1 完美匹配
-    compileSdk = 34
+    compileSdk = 35
     // LibRaw master 用 NDK r28 的 clang 编译；本机 SDK 里固定使用这个版本。
     ndkVersion = "28.2.13676358"
 
@@ -48,8 +49,8 @@ android {
         minSdk = 29
         // 回退到 34
         targetSdk = 34
-        versionCode = 115
-        versionName = "1.1.5"
+        versionCode = 140
+        versionName = "1.2.0"
 
         // 手机端只打包 arm64；LibRaw 静态库按 ABI 单独编译，减少构建时间和包体。
         ndk {
@@ -104,17 +105,11 @@ android {
     }
     kotlinOptions {
         jvmTarget = "1.8"
-        // Haze 1.2.0 用 Kotlin 2.1 编译；项目 Kotlin 仍是 1.9，读它的 metadata 需要跳过版本检查。
-        // 只影响编译期读取，不改变项目自身的 Kotlin 版本。
-        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
     buildFeatures {
         compose = true
         // ACRA 需要读取 BuildConfig 里的版本号/包名
         buildConfig = true
-    }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.1"
     }
     packaging {
         resources {
@@ -172,8 +167,8 @@ dependencies {
 
     // 图库缩略图与细节查看。
     // Telephoto 0.13.0 的 zoomable-image-coil 自带 coil-compose 2.6.0，编译版本是
-    // Kotlin 1.9.24 / Compose 1.6.7 / compileSdk 34，和本项目现有构建链同一档；
-    // 再往上的 0.15+ 已经要求 Kotlin 2.1 + compileSdk 35，不跟着升。
+    // Kotlin 1.9.24 / Compose 1.6.7 / compileSdk 34，metadata 与 Kotlin 2.1 运行时兼容；
+    // 再往上的 0.15+ 已经要求更新的 Compose / compileSdk 档，不跟着升。
     implementation("io.coil-kt:coil-compose:2.6.0")
     implementation("me.saket.telephoto:zoomable-image-coil:0.13.0")
 

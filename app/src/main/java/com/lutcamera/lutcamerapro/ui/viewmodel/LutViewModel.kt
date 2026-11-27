@@ -30,6 +30,7 @@ import java.net.URLDecoder
 
 import com.lutcamera.lutcamerapro.lut.XmpData
 import com.lutcamera.lutcamerapro.lut.XmpParser
+import com.lutcamera.lutcamerapro.log.DoukLog
 
 data class XmpItem(
     val id: String = java.util.UUID.randomUUID().toString(),
@@ -45,7 +46,11 @@ data class LutItem(
     var isFavorite: Boolean = false,
     val lutData: LutData,
     val thumbnailBitmap: Bitmap,
-    val localFilePath: String? = null
+    val localFilePath: String? = null,
+    /** 停用后不出现在相机/监看/编辑器的滤镜条里，只在 LUT 库中保留。 */
+    var isEnabled: Boolean = true,
+    /** 这条 LUT 自己的强度，套用时自动带到预览上。 */
+    var strength: Float = 0.7f
 )
 
 class LutViewModel(application: Application) : AndroidViewModel(application) {
@@ -57,6 +62,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
         private const val KEY_IMPORTED_LUTS_JSON = "key_imported_luts_json"
         private const val KEY_LAST_LUT_ID = "key_last_lut_id"
         private const val KEY_LAST_LUT_INTENSITY = "key_last_lut_intensity"
+        private const val KEY_LUT_META_JSON = "key_lut_meta_json"
     }
 
     private var isInitialized = false
@@ -165,19 +171,24 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    DoukLog.w("LutVM", "LIST_LOAD_FAIL", "error" to (e.message ?: "?"))
                 }
             }
 
-            val fullList = defaultPresetList + customItems
+            val meta = readLutMeta(prefs)
+            val fullList = (defaultPresetList + customItems).map { item ->
+                meta[item.id]?.let { (enabled, strength) ->
+                    item.copy(isEnabled = enabled, strength = strength)
+                } ?: item
+            }
             val savedLutId = prefs.getString(KEY_LAST_LUT_ID, "preset_identity")
             val savedIntensity = prefs.getFloat(KEY_LAST_LUT_INTENSITY, 0.7f)
 
-            val matchedItem = fullList.find { it.id == savedLutId } ?: defaultPresetList.first()
+            val matchedItem = fullList.find { it.id == savedLutId } ?: fullList.first()
 
             withContext(Dispatchers.Main) {
                 lutLibraryList.value = fullList
-                lutIntensity = savedIntensity
+                lutIntensity = meta[matchedItem.id]?.second ?: savedIntensity
                 currentLutId = matchedItem.id
                 currentLutName = matchedItem.name
                 currentLutData = matchedItem.lutData
@@ -196,6 +207,11 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateIntensity(intensity: Float) {
         lutIntensity = intensity
+        // 强度是每条 LUT 自己的属性，当前套用项跟着一起记下来
+        lutLibraryList.value = lutLibraryList.value.map {
+            if (it.id == currentLutId) it.copy(strength = intensity) else it
+        }
+        saveLutMeta()
         saveLastSelectedState()
     }
 
@@ -209,6 +225,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
         currentLutId = item.id
         currentLutName = item.name
         currentLutData = item.lutData
+        lutIntensity = item.strength
         saveLastSelectedState()
     }
 
@@ -217,7 +234,37 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
         currentLutId = matched?.id ?: "preset_identity"
         currentLutName = name
         currentLutData = lutData
+        matched?.let { lutIntensity = it.strength }
         saveLastSelectedState()
+    }
+
+    /** 已启用的 LUT，滤镜条只显示这些。 */
+    val enabledLuts: List<LutItem>
+        get() = lutLibraryList.value.filter { it.isEnabled }
+
+    fun setLutEnabled(lutId: String, enabled: Boolean) {
+        lutLibraryList.value = lutLibraryList.value.map {
+            if (it.id == lutId) it.copy(isEnabled = enabled) else it
+        }
+        saveLutMeta()
+    }
+
+    fun toggleLutEnabled(lutId: String) {
+        val item = lutLibraryList.value.find { it.id == lutId } ?: return
+        setLutEnabled(lutId, !item.isEnabled)
+    }
+
+    /** 单独调某条 LUT 的强度；若正是当前套用项，预览强度跟着变。 */
+    fun setLutStrength(lutId: String, strength: Float) {
+        val value = strength.coerceIn(0f, 1f)
+        lutLibraryList.value = lutLibraryList.value.map {
+            if (it.id == lutId) it.copy(strength = value) else it
+        }
+        if (currentLutId == lutId) {
+            lutIntensity = value
+            saveLastSelectedState()
+        }
+        saveLutMeta()
     }
 
     fun toggleFavorite(lutId: String) {
@@ -247,7 +294,9 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteLut(lutId: String) {
         val target = lutLibraryList.value.find { it.id == lutId }
         target?.localFilePath?.let { path ->
-            try { File(path).delete() } catch (e: Exception) { e.printStackTrace() }
+            try { File(path).delete() } catch (e: Exception) {
+                DoukLog.w("LutVM", "DELETE_FILE_FAIL", "path" to path, "error" to (e.message ?: "?"))
+            }
         }
 
         lutLibraryList.value = lutLibraryList.value.filter { it.id != lutId }
@@ -369,7 +418,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                e.printStackTrace()
+                DoukLog.w("LutVM", "IMPORT_FAIL", "error" to (e.message ?: "?"))
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "导入失败: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                 }
@@ -378,6 +427,12 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                 if (!committed) importedFile?.delete()
             }
         }
+    }
+
+    /** 统一导入入口：按扩展名把 .xmp 调色预设与 .cube LUT 分流。 */
+    fun importPresetFile(uri: Uri) {
+        val name = (getFileName(context, uri) ?: "").lowercase(java.util.Locale.ROOT)
+        if (name.endsWith(".xmp")) importXmpPreset(uri) else importAndAddLutToLibrary(uri)
     }
 
     fun updateSelectedXmp(item: XmpItem?) {
@@ -409,7 +464,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                DoukLog.w("LutVM", "XMP_IMPORT_FAIL", "error" to (e.message ?: "?"))
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "导入 XMP 失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
@@ -434,8 +489,50 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            prefs.edit().putString(KEY_IMPORTED_LUTS_JSON, jsonArray.toString()).apply()
+            prefs.edit()
+                .putString(KEY_IMPORTED_LUTS_JSON, jsonArray.toString())
+                .putString(KEY_LUT_META_JSON, metaJson())
+                .apply()
         }
+    }
+
+    /** 所有 LUT（含内置）的启用状态与强度，单独存一份，内置项也能记住。 */
+    private fun metaJson(): String {
+        val json = JSONObject()
+        for (item in lutLibraryList.value) {
+            json.put(
+                item.id,
+                JSONObject().apply {
+                    put("enabled", item.isEnabled)
+                    put("strength", item.strength.toDouble())
+                }
+            )
+        }
+        return json.toString()
+    }
+
+    private fun saveLutMeta() {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_LUT_META_JSON, metaJson())
+            .apply()
+    }
+
+    private fun readLutMeta(prefs: android.content.SharedPreferences): Map<String, Pair<Boolean, Float>> {
+        val result = HashMap<String, Pair<Boolean, Float>>()
+        val json = prefs.getString(KEY_LUT_META_JSON, null)
+        if (json.isNullOrEmpty()) return result
+        try {
+            val obj = JSONObject(json)
+            for (id in obj.keys()) {
+                val entry = obj.optJSONObject(id) ?: continue
+                result[id] = entry.optBoolean("enabled", true) to
+                    entry.optDouble("strength", 0.7).toFloat()
+            }
+        } catch (e: Exception) {
+            DoukLog.w("LutVM", "META_PARSE_FAIL", "error" to (e.message ?: "?"))
+        }
+        return result
     }
 
     private fun saveLastSelectedState() {
@@ -463,7 +560,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                         xmpData = currentXmpData
                     )
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    DoukLog.w("LutVM", "GPU_FILTER_FALLBACK", "error" to (e.message ?: "?"))
                     applyLutToBitmap(currentBitmap, currentLutData, lutIntensity)
                 }
 
@@ -479,6 +576,13 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                     contentResolver.openOutputStream(uri)?.use { fos ->
                         filteredBmp.compress(Bitmap.CompressFormat.JPEG, 95, fos)
                     }
+                    // 导出也带版权：与相机下载共用同一套 IPTC 设置
+                    if (com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.iptcEnabled) {
+                        val profile = com.lutcamera.lutcamerapro.util.IptcTemplates.active().toStampProfile()
+                        if (!profile.isEmpty) {
+                            com.lutcamera.lutcamerapro.util.IptcStamp.apply(context, uri.toString(), profile)
+                        }
+                    }
                 }
 
                 withContext(Dispatchers.Main) {
@@ -486,7 +590,7 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                     callback(true)
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                DoukLog.w("LutVM", "SAVE_FAIL", "error" to (e.message ?: "?"))
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "保存失败: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                     callback(false)
@@ -589,7 +693,9 @@ class LutViewModel(application: Application) : AndroidViewModel(application) {
                 val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (cursor.moveToFirst() && nameIndex != -1) { name = cursor.getString(nameIndex) }
             }
-        } catch (e: Exception) { e.printStackTrace() }
+        } catch (e: Exception) {
+            DoukLog.w("LutVM", "QUERY_NAME_FAIL", "error" to (e.message ?: "?"))
+        }
         if (name == null) { name = uri.lastPathSegment?.substringAfterLast('/') ?: "imported.cube" }
         return name
     }

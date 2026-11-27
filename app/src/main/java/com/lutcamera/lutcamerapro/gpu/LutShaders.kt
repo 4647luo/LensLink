@@ -39,6 +39,13 @@ object LutShaders {
     uniform int uUseTetrahedral;
     uniform int uShowHighlightWarning;
     uniform int uShowShadowWarning;
+    // 监看专用：伪色（曝光判断）与 UV 变换（旋转/镜像在 GPU 里做）
+    uniform int uFalseColor;
+    // 峰值对焦：用屏幕空间导数找亮度边缘，阈值以上染成品红，和伪色互斥使用
+    uniform int uPeaking;
+    uniform float uPeakThreshold;
+    uniform int uUvRotation;
+    uniform int uUvMirror;
 
     // 🌟 XMP 调色引擎专属 Uniforms
                 uniform int uEnableXmp;
@@ -176,8 +183,43 @@ object LutShaders {
         return sRGBToLinearExact(clamp(gamma, 0.0, 1.0));
     }
 
-    vec3 getTexel(sampler3D lut, vec3 iCoord, float size) {
-        ivec3 clampedCoord = ivec3(clamp(iCoord, vec3(0.0), vec3(size - 1.0)));
+    /**
+     * 画面旋转与镜像在 GPU 里做：Compose 的 graphicsLayer 对 SurfaceView 无效，
+     * 又不想让用户丢掉「视图 → 旋转」能力，所以把屏幕坐标反解回源纹理坐标。
+     * uv 以左上角为原点、v 向下，与纹理坐标一致。
+     */
+    vec2 mapUv(vec2 uv) {
+        vec2 p = uv;
+        // 先反解镜像（屏幕 x 以中心翻转等价于 1-x）
+        if (uUvMirror == 1) p.x = 1.0 - p.x;
+        // 再反解旋转：把"已旋转的屏幕坐标"还原成源图坐标
+        if (uUvRotation == 90) {
+            p = vec2(p.y, 1.0 - p.x);
+        } else if (uUvRotation == 180) {
+            p = vec2(1.0 - p.x, 1.0 - p.y);
+        } else if (uUvRotation == 270) {
+            p = vec2(1.0 - p.y, p.x);
+        }
+        return p;
+    }
+
+    /**
+     * 伪色色带：按 0-255 亮度分九段，和监看界面的图例一一对应。
+     * 用的是相机原始画面亮度（LUT 之前），这样开 LUT 时也能判断真实曝光。
+     */
+    vec3 falseColorBand(float lum) {
+        if (lum < 6.0) return vec3(0.431, 0.180, 0.910);      // 黑场剪裁：紫
+        if (lum < 41.0) return vec3(0.118, 0.420, 1.000);      // 深阴影：蓝
+        if (lum < 81.0) return vec3(0.000, 0.700, 0.700);      // 阴影过渡：青
+        if (lum < 136.0) return vec3(0.122, 0.816, 0.416);     // 中灰 18%：绿
+        if (lum < 176.0) return vec3(0.706, 0.706, 0.706);     // 亮部过渡：灰
+        if (lum < 216.0) return vec3(1.000, 0.831, 0.000);     // 接近高光：黄
+        if (lum < 241.0) return vec3(1.000, 0.478, 0.000);     // 高光：橙
+        if (lum < 253.0) return vec3(1.000, 0.231, 0.188);     // 高光临限：红
+        return vec3(1.000, 0.000, 1.000);                       // 过曝：洋红
+    }
+
+    vec3 getTexel(sampler3D lut, vec3 iCoord, float size) {        ivec3 clampedCoord = ivec3(clamp(iCoord, vec3(0.0), vec3(size - 1.0)));
         return texelFetch(lut, clampedCoord, 0).rgb;
     }
 
@@ -217,7 +259,7 @@ object LutShaders {
     }
 
     void main() {
-        vec4 rawColor = texture(uImageTexture, vTextureCoord);
+        vec4 rawColor = texture(uImageTexture, mapUv(vTextureCoord));
         vec3 linearColor = sRGBToLinearExact(rawColor.rgb);
 
         // 1. 如果启用了 XMP 调色预设，先进行 XMP 调整阶段
@@ -255,6 +297,16 @@ object LutShaders {
 
         vec3 finalSRGB = linearTosRGBExact(blendedLinear);
 
+        // 4.1 峰值对焦（Peaking）：合焦区域的边缘在片元空间导数会明显跳变，
+        // 用原始画面亮度算梯度，超过阈值就把这一段染成品红。
+        // 用 dFdx/dFdy 而不是邻域采样，阈值与取景分辨率无关，切画质档不用重调。
+        float peakLuma = dot(rawColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float peakEdge = length(vec2(dFdx(peakLuma), dFdy(peakLuma)));
+        if (uPeaking == 1 && peakEdge > uPeakThreshold && uFalseColor == 0) {
+            float mixK = clamp((peakEdge - uPeakThreshold) * 6.0, 0.0, 0.92);
+            finalSRGB = mix(finalSRGB, vec3(1.0, 0.12, 0.85), mixK);
+        }
+
         // 4. 曝光警告分析
                 float relativeLuminance = dot(finalSRGB, vec3(0.2126, 0.7152, 0.0722));
         float maxChannel = max(finalSRGB.r, max(finalSRGB.g, finalSRGB.b));
@@ -267,7 +319,16 @@ object LutShaders {
             if (pattern > 0.0) finalSRGB = vec3(0.1, 0.4, 1.0);
         }
 
-        // 5. 8-Bit 电影级抗色阶断层微抖动 (High-Precision Dithering)
+        // 5. 伪色（曝光判断）：按相机原始亮度的 IRE 分段覆盖整屏
+        // 注意这里用 rawColor（LUT 之前的原始画面），套了 LUT 也还是判断真实曝光
+        if (uFalseColor == 1) {
+            float lumRaw = dot(rawColor.rgb, vec3(0.2126, 0.7152, 0.0722)) * 255.0;
+            finalSRGB = falseColorBand(lumRaw);
+            fragColor = vec4(finalSRGB, rawColor.a);
+            return;
+        }
+
+        // 6. 8-Bit 电影级抗色阶断层微抖动 (High-Precision Dithering)
         // 针对天空、阴影等平滑渐变区域消除 8-bit 量化断层，极大还原胶片连续影调
                 float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
         finalSRGB += (dither - 0.5) / 255.0;
@@ -277,11 +338,70 @@ object LutShaders {
     }
     """
 
-    fun createProgram(): Int {
-        val vertexShader = loadShader(GLES30.GL_VERTEX_SHADER, VERTEX_SHADER)
+    // ==================== 波形图（GPU 点泼溅） ====================
+    // 源画面按 256 列 × N 行网格采样，每个采样点按「列 → x、亮度 → y」泼溅到
+    // 一张 256×128 的离屏纹理（加法混合），再用第二个 pass 显示出来。
+    // 全部在 GPU 上做，替掉以前 CPU 逐像素生成 256×128 波形位图的路径。
+    private const val WAVE_VERTEX_SHADER = """#version 300 es
+    precision highp float;
+    uniform sampler2D uSrc;
+    uniform float uGridRows;
+    uniform float uPointWeight;
+    out float vWeight;
+
+    void main() {
+        int cols = 256;
+        int gx = gl_VertexID % cols;
+        int gy = gl_VertexID / cols;
+        float sx = (float(gx) + 0.5) / float(cols);
+        float sy = (float(gy) + 0.5) / uGridRows;
+        vec3 c = textureLod(uSrc, vec2(sx, sy), 0.0).rgb;
+        float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        gl_Position = vec4(sx * 2.0 - 1.0, lum * 2.0 - 1.0, 0.0, 1.0);
+        gl_PointSize = 1.0;
+        vWeight = uPointWeight;
+    }
+    """
+
+    private const val WAVE_SPLAT_FRAGMENT = """#version 300 es
+    precision highp float;
+    in float vWeight;
+    out vec4 fragColor;
+    void main() { fragColor = vec4(vWeight, vWeight, vWeight, vWeight); }
+    """
+
+    private const val WAVE_DISPLAY_FRAGMENT = """#version 300 es
+    precision highp float;
+    in vec2 vTextureCoord;
+    out vec4 fragColor;
+    uniform sampler2D uWave;
+    uniform float uGain;
+
+    void main() {
+        float v = texture(uWave, vTextureCoord).r;
+        float g = clamp(v * uGain, 0.0, 1.0);
+        // IRE 25 / 50 / 75 参考线，做出监视器刻度感
+        float lines = 0.0;
+        if (abs(vTextureCoord.y - 0.25) < 0.010) lines = 0.08;
+        if (abs(vTextureCoord.y - 0.50) < 0.010) lines = 0.16;
+        if (abs(vTextureCoord.y - 0.75) < 0.010) lines = 0.08;
+        vec3 col = mix(vec3(0.04, 0.05, 0.06), vec3(0.42, 1.0, 0.55), g);
+        col += vec3(lines);
+        fragColor = vec4(col, 0.86);
+    }
+    """
+
+    fun createWaveSplatProgram(): Int = buildProgram(WAVE_VERTEX_SHADER, WAVE_SPLAT_FRAGMENT)
+
+    fun createWaveDisplayProgram(): Int = buildProgram(VERTEX_SHADER, WAVE_DISPLAY_FRAGMENT)
+
+    fun createProgram(): Int = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+
+    private fun buildProgram(vertexCode: String, fragmentCode: String): Int {
+        val vertexShader = loadShader(GLES30.GL_VERTEX_SHADER, vertexCode)
         if (vertexShader == 0) return 0
 
-        val fragmentShader = loadShader(GLES30.GL_FRAGMENT_SHADER, FRAGMENT_SHADER)
+        val fragmentShader = loadShader(GLES30.GL_FRAGMENT_SHADER, fragmentCode)
         if (fragmentShader == 0) return 0
 
         val program = GLES30.glCreateProgram()

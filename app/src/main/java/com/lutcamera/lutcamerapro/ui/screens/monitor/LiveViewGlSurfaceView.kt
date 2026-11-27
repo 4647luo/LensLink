@@ -15,7 +15,9 @@ import com.lutcamera.lutcamerapro.lut.XmpData
  */
 class LiveViewGlSurfaceView @JvmOverloads constructor(
     context: Context,
-    attrs: AttributeSet? = null
+    attrs: AttributeSet? = null,
+    /** 全屏监看要传 false：media overlay 会把 SurfaceView 抬到 Window 内容之上，Compose 叠加层就被盖住了 */
+    mediaOverlay: Boolean = true
 ) : GLSurfaceView(context, attrs) {
 
     private val renderer = LutRenderer()
@@ -29,7 +31,7 @@ class LiveViewGlSurfaceView @JvmOverloads constructor(
         setEGLContextClientVersion(3)
         setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         holder.setFormat(PixelFormat.TRANSLUCENT)
-        setZOrderMediaOverlay(true)
+        setZOrderMediaOverlay(mediaOverlay)
 
         setRenderer(renderer)
         renderMode = RENDERMODE_WHEN_DIRTY
@@ -85,6 +87,50 @@ class LiveViewGlSurfaceView @JvmOverloads constructor(
         renderer.isHighlightWarning = highlight
         renderer.isShadowWarning = shadow
         requestRender()
+    }
+
+    /** 伪色：在片元着色器里按 IRE 分段上色，整套在 GPU 上，不再做 CPU 查表缩放 */
+    fun setFalseColor(enabled: Boolean) {
+        if (renderer.falseColorEnabled == enabled) return
+        renderer.falseColorEnabled = enabled
+        requestRender()
+    }
+
+    /** 峰值对焦：GPU 边缘检测，和伪色互斥（伪色开启时不生效） */
+    fun setPeaking(enabled: Boolean, threshold: Float = 0.08f) {
+        if (renderer.peakingEnabled == enabled && renderer.peakThreshold == threshold) return
+        renderer.peakingEnabled = enabled
+        renderer.peakThreshold = threshold
+        requestRender()
+    }
+
+    /**
+     * 画面旋转 / 镜像交给着色器做 UV 反解。
+     * SurfaceView 不吃 Compose 的 graphicsLayer，旋转镜像只能在 shader 里兜。
+     */
+    fun setUvTransform(rotationDeg: Int, mirror: Boolean) {
+        val rot = ((rotationDeg % 360) + 360) % 360
+        if (renderer.uvRotation == rot && renderer.uvMirror == mirror) return
+        renderer.uvRotation = rot
+        renderer.uvMirror = mirror
+        requestRender()
+    }
+
+    /**
+     * GPU 波形图。rect 为归一化 [x, y, w, h]（左上角 + 宽高，y 向下）；
+     * 传 null 表示沿用上一次的位置。
+     */
+    fun setWaveform(enabled: Boolean, rect: FloatArray? = null) {
+        var changed = false
+        if (renderer.waveformEnabled != enabled) {
+            renderer.waveformEnabled = enabled
+            changed = true
+        }
+        if (rect != null && rect.size >= 4 && !rect.copyOf(4).contentEquals(renderer.waveformRect)) {
+            renderer.waveformRect = rect.copyOf(4)
+            changed = true
+        }
+        if (changed) requestRender()
     }
 }
 

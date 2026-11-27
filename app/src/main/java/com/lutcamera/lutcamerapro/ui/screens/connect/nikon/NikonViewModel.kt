@@ -11,6 +11,7 @@ import com.lutcamera.lutcamerapro.lut.LutData
 import com.lutcamera.lutcamerapro.lut.XmpData
 import com.lutcamera.lutcamerapro.model.BorderState
 import com.lutcamera.lutcamerapro.network.FtpPushReceiver
+import com.lutcamera.lutcamerapro.network.CameraLanProbe
 import com.lutcamera.lutcamerapro.network.NetworkUtils
 import com.lutcamera.lutcamerapro.network.NikonPtpClient
 import com.lutcamera.lutcamerapro.ui.screens.connect.wired.SaveMode
@@ -27,6 +28,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayInputStream
 import java.io.File
 import com.lutcamera.lutcamerapro.network.PhotoInbox
@@ -69,6 +72,9 @@ class NikonViewModel : ViewModel() {
     // 最近一次连接时保存的应用上下文，供下载原图等操作使用
                 private var appContext: Context? = null
 
+    // 下载串行化：PTP 命令/数据通道一次只服务一个传输，连点几张就排队，避免互相抢带宽
+                private val downloadMutex = Mutex()
+
     // 当前相机品牌系统（默认尼康）
                 var currentBrand by mutableStateOf(CameraBrand.NIKON)
         private set
@@ -77,6 +83,9 @@ class NikonViewModel : ViewModel() {
                 var wirelessMode by mutableStateOf(WirelessSubMode.AP_DIRECT)
 
     var cameraIp by mutableStateOf(NikonPtpClient.DEFAULT_NIKON_AP_IP)
+    /** 局域网自动搜相机进度：null 表示没在扫，否则是「已扫 X / 共 Y」。 */
+    var lanScanText by mutableStateOf<String?>(null)
+        private set
     var localIp by mutableStateOf("192.168.1.2")
     var ftpPort by mutableIntStateOf(2121)
 
@@ -311,7 +320,7 @@ class NikonViewModel : ViewModel() {
                     originalMaxLongEdge = if (settings.thumbnailOnly) 1080 else null,
                     onOriginalSaved = {
                         originalUri = it
-                        stampGpsIfEnabled(it)
+                        stampMetaAfterSave(it)
                         entry = inbox.recordSaved(entry, originalUri, outputUri)
                     },
                     onOutputSaved = {
@@ -399,6 +408,20 @@ class NikonViewModel : ViewModel() {
     }
     var pairingBusy by mutableStateOf(false)
         private set
+
+    /** 换新配对身份：相机上没记录过这个 GUID，会重新弹一次配对确认。 */
+    fun resetPairingIdentity(context: Context) {
+        if (isConnected || isConnecting) return
+        try {
+            val fingerprint = ptpClient.resetPairingIdentity(context.applicationContext)
+            pairingMessage = "已换新配对身份 ($fingerprint)。请让相机停在「连接至智能设备」页面再点立即连接；" +
+                "相机屏幕弹确认时点允许。若仍报 InitFail 1，请在相机菜单里删掉旧的已注册设备。"
+            addLog(pairingMessage)
+        } catch (e: Exception) {
+            pairingMessage = "重置配对身份失败：${e.message}"
+            addLog(pairingMessage)
+        }
+    }
     private var pairingVersion: Long? = null
     fun startPairing() {
         if (!isConnected || pairingBusy || pairingCode != null) return
@@ -691,6 +714,22 @@ class NikonViewModel : ViewModel() {
             }
         }
 
+        // 网络层掉线监听：相机热点关闭或手机 Wi‑Fi 断开时，立刻判定连接中断，
+        // 不再等到下一次命令超时（否则界面要卡十几秒才变灰）。
+        viewModelScope.launch {
+            ptpClient.isConnected.collect { connected ->
+                if (connected) {
+                    appContext?.let { ctx ->
+                        com.lutcamera.lutcamerapro.network.CameraNetworkWatcher.start(ctx) { reason ->
+                            addLog("🔴 $reason")
+                            ptpClient.notifyNetworkLost(reason)
+                        }
+                    }
+                } else {
+                    com.lutcamera.lutcamerapro.network.CameraNetworkWatcher.stop()
+                }
+            }
+        }
         // 上次被杀进程时留下的传输队列：相机一重新连上，先补文件列表再自动续传。
         // PTP 的 object handle 只在当次连接有效，重连后必须重新读一遍列表，
         // 不能拿上一次连接留下的 storageFiles 直接续传，否则 handle 会错位。
@@ -746,6 +785,34 @@ class NikonViewModel : ViewModel() {
             ptpClient.setFocusPoint(normX, normY)
             addLogInner("🎯 对焦点已下发机身: (${(normX * 100).toInt()}%, ${(normY * 100).toInt()}%)")
         }
+    }
+
+    /**
+     * 读机身时钟（PTP DateTime 0x5011，格式 yyyyMMdd'T'HHmmss）。
+     * 机身不回该属性时返回 null，界面显示「机身未返回时钟」。
+     */
+    suspend fun readCameraClock(): String? = withContext(Dispatchers.IO) {
+        if (!isConnected) return@withContext null
+        runCatching {
+            val raw = ptpClient.getDevicePropValue(0x5011.toShort()) ?: return@runCatching null
+            if (raw.size < 16) return@runCatching null
+            val text = String(raw, Charsets.US_ASCII).trim('\u0000', ' ', '\n', '\r')
+            if (text.length < 15) return@runCatching null
+            val parsed = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
+                .parse(text.substring(0, 15)) ?: return@runCatching null
+            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(parsed)
+        }.getOrNull()
+    }
+
+    /** 把手机当前时间写入机身时钟。机身拒绝写该属性时返回 false。 */
+    suspend fun syncCameraClock(): Boolean = withContext(Dispatchers.IO) {
+        if (!isConnected) return@withContext false
+        runCatching {
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US)
+                .format(java.util.Date())
+            // PTP 字符串属性按 PTP 规范以单字节 0 结尾，尼康也按这个长度接受
+            ptpClient.setDevicePropValue(0x5011.toShort(), stamp.toByteArray(Charsets.US_ASCII) + byteArrayOf(0))
+        }.getOrDefault(false)
     }
 
     fun toggleVideoRecording() {
@@ -827,7 +894,13 @@ class NikonViewModel : ViewModel() {
         }
     }
 
-    fun connect(context: Context, cameraIp: String) {
+    /**
+     * 连接入口。
+     *
+     * [skipPreflight]：调用方（自动扫描/配对后重连）已经用 TCP 探过 15740，跳过这里的预检，
+     * 避免同一次点击里连着探两遍、多等半秒到一秒。
+     */
+    fun connect(context: Context, cameraIp: String, skipPreflight: Boolean = false) {
         appContext = context.applicationContext
         // 设置页的「自动下载」必须真正接到 PTP 新照片事件上，否则界面只记了偏好、
         // 相机拍完不会回传。选了「不下载」或总开关关闭时保持关闭。
@@ -843,17 +916,101 @@ class NikonViewModel : ViewModel() {
             return
         }
         this.cameraIp = target
-        connect(
-            appContext = context,
-            getLut = { photoSettings?.lut },
-            getIntensity = { photoSettings?.intensity ?: 1f },
-            getAutoApplyLut = { photoSettings?.autoLut ?: false },
-            getAutoApplyBorder = { photoSettings?.autoBorder ?: false },
-            getSaveMode = { photoSettings?.mode ?: SaveMode.ORIGINAL_ONLY },
-            getBorderState = { photoSettings?.border ?: BorderState() },
-            getXmp = { photoSettings?.xmp },
-            onPhotoProcessed = {}
+        // AP 模式留空就用默认热点地址（不同机型 .1.1 / .1.10 的差异交给下面的预检处理）。
+        if (this.cameraIp.isBlank() && wirelessMode == WirelessSubMode.AP_DIRECT) {
+            this.cameraIp = NikonPtpClient.DEFAULT_NIKON_AP_IP
+        }
+        val startSession = {
+            connect(
+                appContext = context,
+                getLut = { photoSettings?.lut },
+                getIntensity = { photoSettings?.intensity ?: 1f },
+                getAutoApplyLut = { photoSettings?.autoLut ?: false },
+                getAutoApplyBorder = { photoSettings?.autoBorder ?: false },
+                getSaveMode = { photoSettings?.mode ?: SaveMode.ORIGINAL_ONLY },
+                getBorderState = { photoSettings?.border ?: BorderState() },
+                getXmp = { photoSettings?.xmp },
+                onPhotoProcessed = {}
+            )
+        }
+        if (skipPreflight) {
+            startSession()
+            return
+        }
+        // 手动点「立即连接」时先花一个很短的窗口确认端口到底在哪个地址上：
+        // 相机热点在不同机型上可能是 .1.1 也可能是 .1.10，路由器下 DHCP 还可能换地址。
+        // 命中就直接用命中地址，探不到（STA）再扫一遍 /24；都不通才进原流程等待提示。
+        viewModelScope.launch {
+            isConnecting = true
+            val ok = runCatching { resolveTargetBeforeConnect(context.applicationContext) }
+                .getOrElse { e ->
+                    addLog("端口预检异常：${e.message}")
+                    true
+                }
+            if (!ok) {
+                isConnecting = false
+                return@launch
+            }
+            // 预检期间用户点了「取消连接」：不要反过来又去连。
+            if (!isConnecting) return@launch
+            isConnecting = false
+            startSession()
+        }
+    }
+
+    /**
+     * 把 [cameraIp] 校正到「实际开放了 15740 的那个地址」。
+     * @return false 表示确定没法连（地址空且局域网里也没有相机），不必再进握手流程。
+     */
+    private suspend fun resolveTargetBeforeConnect(context: Context): Boolean {
+        val sta = wirelessMode == WirelessSubMode.STA_LAN
+        val target = cameraIp.trim()
+        val known = runCatching {
+            com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.knownDevices().map { it.ip }
+        }.getOrDefault(emptyList())
+        val probe = CameraLanProbe.priorityTargets(
+            context,
+            listOfNotNull(target.takeIf { it.isNotBlank() }) + known
         )
+        addLog("确认${if (sta) "局域网" else "相机热点"}里的 ${CameraLanProbe.PTP_PORT} 端口…")
+        val hits = CameraLanProbe.probePreferred(
+            context = context,
+            ips = probe,
+            timeoutMs = if (sta) 1200 else 900
+        )
+        val pick = hits.firstOrNull { it.ip == target } ?: hits.firstOrNull()
+        if (pick != null) {
+            if (pick.ip != target) {
+                addLog("${target.ifBlank { "空地址" }} 没开放端口，改用同网段可达的 ${pick.ip}")
+                cameraIp = pick.ip
+            }
+            return true
+        }
+        // AP 模式绝不扫整段：相机热点扛不住两百多个并发 SYN，会把热点压断。
+        if (sta) {
+            addLog("候选地址都不通，开始扫本机网段…")
+            lanScanText = "正在搜索相机…"
+            val wide = CameraLanProbe.scan(
+                context = context,
+                timeoutMs = 320,
+                preferred = probe
+            ) { done, total ->
+                viewModelScope.launch(Dispatchers.Main) { lanScanText = "已扫描 $done/$total" }
+            }
+            lanScanText = null
+            val hit = wide.firstOrNull()
+            if (hit != null) {
+                cameraIp = hit.ip
+                addLog("网段里找到相机 ${hit.ip}（${hit.iface}，${hit.rttMs}ms），正在连接")
+                return true
+            }
+            if (target.isBlank()) {
+                addLog("局域网里没有找到开放 ${CameraLanProbe.PTP_PORT} 的设备。确认相机已连到同一台路由器，并在相机端进入 Wi-Fi connection › Connect to smart device")
+                return false
+            }
+        }
+        // 有地址但探不通：交给握手流程去区分「相机休眠 / 没进连接画面 / 机身未确认」。
+        return true
     }
 
     private fun connect(
@@ -939,15 +1096,12 @@ class NikonViewModel : ViewModel() {
                         lockedBaseline = null
                         compressionDesc = null
                         addLogInner("🔴 ${currentBrand.displayName} 相机已断开: $reason")
-                        // Z Console 的做法：路由失效后不修补旧 socket，直接重建整条连接。
-                        // 这里在首次连接失败时自动再来一次，换掉旧 socket 与旧路由快照。
-                        val ctx = appContext
-                        val target = cameraIp
-                        if (failedWhileConnecting && connectRetryCount < 1 && ctx != null && target.isNotBlank()) {
-                            connectRetryCount++
-                            addLogInner("🔁 连接失败，重建网络路由后自动重试（第 $connectRetryCount 次）")
-                            delay(1500)
-                            connect(ctx, target)
+                        // 首连失败不再自动重连一次：那次重试会让「点一下」的总等待翻倍，
+                        // 用户只会觉得卡住。失败原因立即交给界面（连接页常驻显示并给「重试」），
+                        // 重连由用户主动点，和官方 App 的反馈节奏一致。
+                        connectRetryCount = 0
+                        if (failedWhileConnecting) {
+                            _uiEvent.send(NikonUiEvent.ShowToast(ptpClient.connectionStage.value.ifBlank { "连接失败" }))
                         } else {
                             _uiEvent.send(NikonUiEvent.ShowToast("🔴 已断开连接"))
                         }
@@ -1577,6 +1731,28 @@ class NikonViewModel : ViewModel() {
         return latest?.let { it.latitude to it.longitude }
     }
 
+    /** 导入照片落盘后的统一后续：GPS 与版权各按自己的开关走 */
+    private fun stampMetaAfterSave(pathOrUri: String) {
+        stampGpsIfEnabled(pathOrUri)
+        stampIptcIfEnabled(pathOrUri)
+    }
+
+    /** 写入作者 / 版权（EXIF Artist+Copyright 与 IPTC-IIM），只处理 JPG */
+    private fun stampIptcIfEnabled(pathOrUri: String) {
+        if (!com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.iptcEnabled) return
+        val profile = com.lutcamera.lutcamerapro.util.IptcTemplates.active().toStampProfile()
+        if (profile.isEmpty) return
+        val displayName = if (pathOrUri.startsWith("content://", true)) {
+            android.net.Uri.parse(pathOrUri).lastPathSegment ?: pathOrUri
+        } else java.io.File(pathOrUri).name
+        val ok = com.lutcamera.lutcamerapro.util.IptcStamp.apply(appContext, pathOrUri, profile)
+        if (ok) {
+            addLogInner("已写入版权信息（EXIF + IPTC）：$displayName")
+        } else {
+            addLogInner("该文件不能写入版权（只处理 JPG，RAW/视频跳过）：$displayName")
+        }
+    }
+
     /** 导入照片落盘后补写 EXIF GPS（设置里「导入图片时附加手机 GPS」打开才写） */
     private fun stampGpsIfEnabled(pathOrUri: String) {
         if (!com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.gpsEnabled) return
@@ -1594,7 +1770,7 @@ class NikonViewModel : ViewModel() {
         if (stamped) {
             addLogInner("已把手机 GPS 写入 $displayName")
         } else {
-            addLogInner("JPG 可写 GPS，RAW/视频不支持写入定位：$displayName")
+            addLogInner("JPG / HEIC 可写 GPS，RAW 与视频不支持写入定位：$displayName")
         }
     }
 
@@ -1609,8 +1785,11 @@ class NikonViewModel : ViewModel() {
             return
         }
         val transferId = TransferCenter.enqueue(file.fileName, file.folder, file.sizeBytes)
-        TransferCenter.start(transferId, file.sizeBytes)
+        TransferCenter.markWaiting(transferId)
         viewModelScope.launch(Dispatchers.IO) {
+            // 排队：前一张没传完就先显示「等待中」，拿到锁才真正开始
+            downloadMutex.withLock {
+            TransferCenter.start(transferId, file.sizeBytes)
             addLogInner("📥 正在下载原图: ${file.fileName}...")
             try {
                 // 调用真实 PTP 高速通道拉取原图流式分页
@@ -1638,7 +1817,7 @@ class NikonViewModel : ViewModel() {
                         borderState = null,
                         currentXmp = null,
                         sourceFileName = file.fileName,
-                        onOriginalSaved = { stampGpsIfEnabled(it) }
+                        onOriginalSaved = { stampMetaAfterSave(it) }
                     )
                 }
 
@@ -1654,6 +1833,7 @@ class NikonViewModel : ViewModel() {
                     addLogInner("⚠️ 下载失败: ${file.fileName} (${e.message})")
                     _uiEvent.send(NikonUiEvent.DownloadCompleted(file.fileName, false))
                 }
+            }
             }
         }
     }
@@ -1846,7 +2026,7 @@ class NikonViewModel : ViewModel() {
                                 originalMaxLongEdge = if (
                                     com.lutcamera.lutcamerapro.ui.douk.DoukPrefs.lockedSize == "仅缩略图"
                                 ) 1080 else null,
-                                onOriginalSaved = { stampGpsIfEnabled(it) },
+                                onOriginalSaved = { stampMetaAfterSave(it) },
                                 onProcessingError = { failure = it }
                             )
                         }
@@ -2080,7 +2260,7 @@ class NikonViewModel : ViewModel() {
                         borderState = null,
                         currentXmp = null,
                         sourceFileName = file?.fileName,
-                        onOriginalSaved = { stampGpsIfEnabled(it) },
+                        onOriginalSaved = { stampMetaAfterSave(it) },
                         onProcessingError = { failureReason = it }
                     )
                 }

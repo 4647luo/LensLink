@@ -288,6 +288,12 @@ object FtpPushReceiver {
                             try {
                                 server.soTimeout = 15_000
                                 dataSocket = server.accept()
+                                if (!isClientAllowed(dataSocket)) {
+                                    Log.w(TAG, "拒绝非相机来源的数据通道: ${dataSocket.inetAddress?.hostAddress}")
+                                    runCatching { dataSocket.close() }
+                                    reply("421 数据通道来源不被允许")
+                                    continue
+                                }
                                 dataSockets.add(dataSocket)
                                 dataSocket.soTimeout = 20_000
                                 copied = temp.outputStream().use { output ->

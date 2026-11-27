@@ -227,7 +227,7 @@ object ImageDecode {
             "HdrProbe", "IMG",
             "gain" to gain.toString(),
             "cs" to (probe.colorSpace?.name ?: "-"),
-            "cfg" to probe.config.name
+            "cfg" to (probe.config?.name ?: "-")
         )
         probe.recycle()
         gain || csHdr || hasHdrMarker(file)
@@ -610,7 +610,10 @@ object ImageDecode {
         var remaining = files.filter { it.exists() }.sortedBy { it.lastModified() }.toMutableList()
         var total = remaining.sumOf { it.length() }
         while (total > MAX_HDR_CACHE_BYTES && remaining.isNotEmpty()) {
-            val oldest = remaining.removeFirst()
+            // 用 removeAt(0)，别用 removeFirst()：compileSdk 35 + JDK 21 会解析到
+            // java.util.List#removeFirst（SequencedCollection），API 34 及以下没有这个方法，
+            // 运行时会 NoSuchMethodError，等于缓存清理直接崩掉。
+            val oldest = remaining.removeAt(0)
             total -= oldest.length()
             runCatching { oldest.delete() }
         }
@@ -620,7 +623,7 @@ object ImageDecode {
 
     /**
      * 按 HDR 解码：目标色域直接要 BT.2020 / PQ，解出来是 RGBA_F16。
-     * 拿到的是 PQ 编码值，交给 HdrImageView 原样写进 PQ 交换链就是真 HDR。
+     * 拿到的是 PQ 编码值，交给 HDR 图片视图原样写进 PQ 交换链就是真 HDR。
      */
     fun decodeHdrBitmap(file: File, maxSide: Int): android.graphics.Bitmap? = runCatching {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return@runCatching null

@@ -2,6 +2,7 @@ package com.lutcamera.lutcamerapro.model
 
 import android.content.Context
 import com.google.gson.Gson
+import com.lutcamera.lutcamerapro.log.DoukLog
 
 object BorderStateRepository {
 
@@ -17,7 +18,7 @@ object BorderStateRepository {
             val json = gson.toJson(state)
             prefs.edit().putString(KEY_BORDER_STATE, json).apply()
         } catch (e: Exception) {
-            e.printStackTrace()
+            DoukLog.w("Border", "SAVE_FAIL", "error" to (e.message ?: "?"))
         }
     }
 

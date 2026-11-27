@@ -688,23 +688,26 @@ fun DoukSettingsScreen(state: DoukState) {
                 val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
                 diagnosticsExportLauncher.launch("lianjing-diagnostics-$stamp.zip")
             },
-            onSendWithLogs = {
-                scope.launch {
-                    val msg = withContext(Dispatchers.IO) {
-                        DoukDiagnostics.email(
-                            context,
-                            FEEDBACK_MAIL,
-                            "连镜 反馈（$APP_VERSION）",
-                            feedbackBody()
-                        ).fold(
-                            { "已生成诊断包并拉起邮件客户端，请确认收件人后发送" },
-                            { "发送失败：${it.message}" }
-                        )
+            onSendMail = { withLogs ->
+                if (withLogs) {
+                    scope.launch {
+                        val msg = withContext(Dispatchers.IO) {
+                            DoukDiagnostics.email(
+                                context,
+                                FEEDBACK_MAIL,
+                                "连镜 反馈（$APP_VERSION）",
+                                feedbackBody()
+                            ).fold(
+                                { "已生成诊断包并拉起邮件客户端，请确认收件人后发送" },
+                                { "发送失败：${it.message}" }
+                            )
+                        }
+                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                     }
-                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                } else {
+                    sendFeedback(context)
                 }
-            },
-            onPlainMail = { sendFeedback(context) }
+            }
         )
     } else if (showAbout) {
         AboutPanel(
@@ -2091,6 +2094,122 @@ private data class ChangelogEntry(val version: String, val lines: List<String>)
 
 private val CHANGELOG_ENTRIES = listOf(
     ChangelogEntry(
+        "1.2.0",
+        listOf(
+            "· 连接：mDNS 首个服务出现后 400ms 收尾即返回；入网判定同时挂 DHCP 回调，不再等满超时；入网后 1 秒确认网络仍在，被系统收回时直接判失败。",
+            "· 连接：加入相机热点前先检测本机「个人热点」，在跑就提前拦截并提示去关，不再白等一轮超时。",
+            "· 连接：失败原因分「热点被系统收回 / 本机热点占用网卡 / 不在相机网段 / 端口未开放 / 握手无应答 / VPN 接管」，各带下一步动作。",
+            "· 配对：InitFail 1 时可在诊断面板「换新身份并重新配对」，让机身重新弹一次配对确认。",
+            "· 口令：相机热点密码用 Keystore 加密保存；修复每次冷启动被清空导致「无密码」超时的回归。",
+            "· 界面：设备页胶囊去掉外描边，添加设备卡片未选中不再叠第二条边。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.29",
+        listOf(
+            "· 修复：相机热点口令每次冷启动都被清空。1.1.26 起口令以 Keystore 密文存在 camera_wifi_password（带 enc1: 前缀），而初始化里仍无条件写空串，等于每次启动都把密文抹掉 —— 表现就是连过之后重启应用，再连相机热点变成「无密码」，等 22 秒超时。现在只清明文，密文保留。",
+            "· 连接：没有带密码加入失败时直接说「这次没有带密码，要填相机屏幕上的 8 位密码」，不再混在「等待入网超时」里让人猜。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.28",
+        listOf(
+            "· 连接：加入相机热点前先查本机「个人热点」是否还在跑（热点网卡不在系统网络列表里，靠这个特征识别，结果写进日志）。还在跑就直接拦住并提示去关，不再等系统给一次 DHCP 再收回。",
+            "· 连接：失败文案新增「本机热点占用网卡」这一种，PTP 与预检两条路径都会点名是热点没关，不再统一说「手机不在相机网段」。",
+            "· 界面：设备页顶部「蓝牙 / Wi-Fi|USB」胶囊去掉外描边，只留一层填充；「添加设备」里的连接方式卡片未选中时不再叠第二条边，避免卡片套卡片。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.27",
+        listOf(
+            "· 连接：相机热点入网后会再等 1 秒确认网络还在。平板自己开着「个人热点」时，系统会先给一次 DHCP 再把相机热点收回，以前这会被误判成「手机不在相机网段」；现在直接提示「入网 N 秒后被系统断开，请先关闭个人热点」。",
+            "· 连接：失败文案按原因分开——热点被系统收回、手机确实不在相机网段、端口没开放三种情况不再共用一句话。",
+            "· 配对：接口回 InitFail 1（相机不认当前身份）时，新增「换新身份并重新配对」，生成新 GUID 让机身重新弹一次配对确认；有旧日志仍可走「恢复配对身份」。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.26",
+        listOf(
+            "· 安全：相机热点口令改回本机记忆，但用系统 Keystore 的 AES‑GCM 加密后落盘，密钥不可导出、不进备份；1.1.25 及以前留下的明文在首次读取时自动迁移成密文，不用重输。",
+            "· 连接：mDNS 发现改成「首个服务出现后再等 400ms 收尾」就返回，不再白等满 1.2–1.6 秒窗口；多个服务并发解析，连接前探测整体快了 0.5–1.5 秒。",
+            "· 连接：热点入网总预算从最坏 56 秒收到 22 秒（WPA2）+ 16 秒（WPA3 补试）；DHCP 比 onAvailable 晚回来时，链路属性一更新就继续，不再干等到超时。",
+            "· 连接：PTP/IP 命令与事件通道开启 TCP keepalive，相机休眠或路由器 NAT 超时后会尽早暴露死连接，交给重连逻辑处理，减少「显示在线但发指令没回」。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.25",
+        listOf(
+            "· 隐私：GPS 设置新增「在线高程补海拔」开关，关闭后只用本机定位、气压计与本地缓存；权限说明与条款补充麦克风、在线高程的用途口径。",
+            "· 安全：FTP 数据通道在接收前校验来源地址，不属于已授权客户端则拒绝；相机热点口令不再写入本机存储，只记住 SSID，旧版残留口令一并清除。",
+            "· 稳定性：日志统一收口到运行日志文件，去掉堆栈直接打印；音频/视频输入缓冲区空值补安全回退；PTP/IP 单包分配上限收紧；相机热点 SSID 识别只认 NIKON 前缀。",
+            "· 清理：移除废弃的旧 HDR 视图，去掉冗余 SDK 版本判断与陈旧构建注释。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.24",
+        listOf(
+            "· 撤销「Wi‑Fi 会话期间继续用蓝牙推 GPS」：相机进入「连接至智能设备」后，机身蓝牙不再作为可靠链路，连上 Wi‑Fi 就把蓝牙扫描停掉；GPS 推送只在设备页的「蓝牙」模式下进行。",
+            "· 海拔补齐（保留）：本次 fix → 20 分钟内 GPS 海拔 → 气压计（用 GPS 海拔标定海平面气压）→ 在线高程（按经纬度查地面高程，1.5 公里内复用）→ 最近的 GPS fix，设备页显示这一包海拔来源。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.23",
+        listOf(
+            "· 添加设备：Wi‑Fi AP 直连下方新增「搜索相机设备」与「连接相机热点（备用）」两个入口，热点入口从设备页挪过来。",
+            "· 设备页：蓝牙 / Wi‑Fi|USB 胶囊单独占一行，与相机照片块隔开 16dp；照片卡片与胶囊不再是一整块。",
+            "· 连接：相机热点弹窗改为四角 24dp 圆角，不再像从底部切出来的一块。",
+            "· 海拔：网络定位不带高度时，有气压计的机器用气压计补（用 GPS 海拔反推海平面气压标定），没气压计的机器按经纬度查一次在线高程，缓存 1.5 公里；设备页显示这一包海拔的来源（本次 / 缓存 / 气压计 / 在线高程 / GPS 最近）。",
+            "· 稳定性：修掉 API 34 及以下清理 HDR 缓存时的 removeFirst() 崩溃隐患；Wi‑Fi 扫描和麦克风采集补上显式权限检查，lint 已清零。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.22",
+        listOf(
+            "· Live 图：播放层改为 TextureView + MediaPlayer，首帧上屏后才淡入，长按瞬间不再黑一下；不再「挖空」画面。",
+            "· 设备页：蓝牙与 Wi‑Fi|USB 拆成两枚独立胶囊，中间留 10dp，不再粘在一起。",
+            "· 连接：相机热点名称可直接从「当前 Wi‑Fi」或附近 Wi‑Fi 列表点选，减少手输；列表会标出相机热点并支持重新扫描。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.21",
+        listOf(
+            "· Live 图：长按改在原图位置上直接播放，不再另开全屏窗口，播完/轻点回到原图，画面不再黑一下再跳回来；播放期间横滑与缩放暂停响应。",
+            "· 设备页：蓝牙 / Wi‑Fi|USB 胶囊挪到相机照片卡片顶部正中。",
+            "· 连接：新增应用内直接加入相机热点（WifiNetworkSpecifier），记住 SSID/密码，断开连接时自动释放这条无外网网络。",
+            "· 连接：端口探测并发加入当前网段低号地址、192.168.122/125 段与网关，并与 mDNS（_ptpip/_ptp）同时跑，机身公布的地址优先。",
+            "· 连接：按机型代际调整探测窗口与握手前等待（一代 1.2s/900ms、二代 0.9s/600ms、三代 0.6s/350ms），失败提示按代际给排查步骤。",
+            "· 蓝牙：配对身份按机身分别保存，一台手机连多台机身不再互相覆盖 device/nonce。",
+        )
+    ),
+    ChangelogEntry(
+        "1.1.20",
+        listOf(
+            "· 设备页：蓝牙 / Wi‑Fi|USB 的切换从「再点一次设备」的浮层挪到相机照片右上角的小胶囊，点一下即切，页面不再被浮层压住。",
+            "· 连接：梳理 AP / STA / USB / 蓝牙四条链路的接入策略，保留自动探测与看门狗重连，去掉和设备切换无关的底部弹层。"
+        )
+    ),
+    ChangelogEntry(
+        "1.1.19",
+        listOf(
+            "· 编辑器：调色整条链路改到 GPU（曝光/亮度/对比/高光/阴影/色温色调/饱和度/自然饱和度/曲线/HSL/褪色/黑白，以及降噪/锐化/清晰度/颗粒），45MP 导出不再堆几百 MB 的 IntArray。",
+            "· HDR：预览光晕（bloom）改在 GPU 上做阈值遮罩 + 可分离模糊，亮部外溢更平滑，拖动调节不再掉帧。",
+            "· 监视：新增「峰值对焦」开关，用屏幕空间梯度在 GPU 上描品红边缘，与伪色互斥。",
+            "· 图库：应用图库改成增量索引（记录 mtime/大小/宽高），再次进入只补新照片，不再全量重读每张图尺寸。",
+            "· 连接：新增 Wi‑Fi 网络回调，掉线立刻提示并触发重连，不用等轮询超时。"
+        )
+    ),
+    ChangelogEntry(
+        "1.1.18",
+        listOf(
+            "· 连接：事件通道断开后会用原会话号自动重建，不再只能退回每 2 秒的轮询兜底，回传恢复即时通知。",
+            "· 图库：缩略图缓存改为真 LRU（按最近查看淘汰），容量随设备内存自适应；每格独立刷新，滚动时不再整屏重组。",
+            "· 定位：写入照片时补 GPSDateStamp/GPSTimeStamp/海拔（按 UTC），缺少时间戳的定位不再被看图软件判为无效；媒体库图片改为原地写，40MP 原图不再整包搬三遍；新增 HEIC/HEIF 写入。",
+            "· 监视：直方图跨像素取样，计算量降到原来的 1/4；直方图数据按内容比较，不再每 150ms 强制刷新面板。",
+            "· 取景：位图双缓冲复用，长时间监看的 GC 抖动和内存峰值明显下降。",
+            "· 构建：Kotlin 2.1 + Compose Compiler 插件，compileSdk 升到 35，移除 metadata 版本跳过与编译器扩展的旧补丁。"
+        )
+    ),
+    ChangelogEntry(
         "1.1.5",
         listOf(
             "· 更换 Release 签名证书：已安装旧版的用户需先卸载再安装 1.1.5，直接覆盖会提示应用未安装。",
@@ -2323,6 +2442,7 @@ private val TERMS_LINES = listOf(
     "2. 应用产生的所有数据（回传的图片、导入的 LUT、运行日志、设置项）都保存在本机应用私有目录中，卸载应用时会一并删除。",
     "3. 只有在你主动点「反馈与建议」时，应用才会调用系统邮件客户端，由你确认收件人与内容后自行发送。应用不会在后台自行发送任何信息。",
     "4. 定位权限仅用于把坐标写入照片或推送给相机。关闭相关开关后，应用不会再获取位置。",
+    "5. 海拔补齐：当 GPS 与气压计都拿不到高度时，可按经纬度查询公开高程服务补海拔；该行为可在 GPS 设置里关闭，关闭后只用本机定位、气压计与本地缓存。",
     "",
     "四、照片与文件",
     "1. 回传到手机的图片、在应用内进行的浏览与删除操作，均直接作用于相机存储卡或手机本地文件。删除相机内文件属于不可恢复操作，请在操作前自行确认。",
@@ -2330,7 +2450,7 @@ private val TERMS_LINES = listOf(
     "3. 建议在重要拍摄任务前先做一次小批量回传测试，确认流程与你的相机、存储卡配合正常。",
     "",
     "五、权限使用",
-    "网络权限用于与相机建立连接；定位权限用于写入或推送 GPS；蓝牙权限仅用于向相机推送定位；通知权限用于在蓝牙推送期间保持前台服务；文件与照片权限用于读取相机回传图片、导入 LUT 与导出日志。以上权限只在对应功能开启时使用。",
+    "网络权限用于与相机建立连接；定位权限用于写入或推送 GPS；蓝牙权限仅用于向相机推送定位；通知权限用于在蓝牙推送期间保持前台服务；文件与照片权限用于读取相机回传图片、导入 LUT 与导出日志；麦克风权限仅在监看页开启「音频电平」时采样环境声做参考电平，不录音、不上传。以上权限只在对应功能开启时使用。",
     "",
     "六、使用风险与免责",
     "1. 本应用按「现状」提供，不对特定用途的适用性、无中断性或无错误作出明示或默示担保。",
@@ -2458,6 +2578,7 @@ private fun GpsPanel(
     val sp = remember { context.getSharedPreferences("douk_nikon_ble", Context.MODE_PRIVATE) }
     var importAttach by remember { mutableStateOf(DoukPrefs.gpsAttachImport) }
     var bleAttach by remember { mutableStateOf(DoukPrefs.gpsAttachBle) }
+    var onlineElev by remember { mutableStateOf(DoukPrefs.onlineElevationEnabled) }
     val masterOn = true
     var interval by remember { mutableStateOf(ble.intervalMinutes.value) }
     var accuracy by remember { mutableStateOf(ble.locationAccuracy.value) }
@@ -2572,6 +2693,16 @@ private fun GpsPanel(
             ) {
                 syncTime = it
                 ble.setSyncTime(it)
+            }
+            SettingDivider()
+            SettingSwitchRow(
+                "在线高程补海拔",
+                "缺海拔时按经纬度查询公开高程服务；关闭后只用 GPS、气压计与本地缓存",
+                onlineElev,
+                enabled = masterOn
+            ) {
+                onlineElev = it
+                DoukPrefs.onlineElevationEnabled = it
             }
         }
 
@@ -2966,15 +3097,17 @@ private fun PresetExportPanel(
     }
 }
 
-/** 反馈与建议：日志要么只保存，要么作为邮件附件发出去，不再分散在「关于」里 */
+/** 反馈与建议：两个入口 —— 只保存诊断包，或打开邮件（诊断包可选，默认带上）。 */
 @Composable
 private fun FeedbackPanel(
     onBack: () -> Unit,
     onSaveDiagnostics: () -> Unit,
-    onSendWithLogs: () -> Unit,
-    onPlainMail: () -> Unit
+    onSendMail: (Boolean) -> Unit
 ) {
     BackHandler(onBack = onBack)
+    var showMailDialog by remember { mutableStateOf(false) }
+    var attachLogs by remember { mutableStateOf(true) }
+
     SettingsSubPage(title = "反馈与建议", onBack = onBack) {
         Text(
             "遇到闪退、连不上相机、按钮没反应，把诊断包一起发过来最快。诊断包只含设备信息、运行日志、相机协议交互和崩溃堆栈，不含照片、视频和 LUT 原文件。",
@@ -2984,18 +3117,14 @@ private fun FeedbackPanel(
         )
         Spacer(modifier = Modifier.height(16.dp))
         SettingCard {
-            SettingRow("只保存诊断日志", "生成 ZIP 存到手机文件，之后自己决定怎么发") {
+            SettingRow("保存诊断日志", "生成 ZIP 存到手机，之后自己决定怎么发") {
                 onSaveDiagnostics()
             }
             SettingDivider()
             SettingRow(
-                "写邮件并附上日志",
-                "收件人已填 $FEEDBACK_MAIL，正文带问题模板，ZIP 作为附件",
-            ) { onSendWithLogs() }
-            SettingDivider()
-            SettingRow("只发文字，不带日志", "邮件客户端打开后自己写问题和复现步骤") {
-                onPlainMail()
-            }
+                "发送邮箱",
+                "收件人已填 $FEEDBACK_MAIL；正文带问题模板，诊断日志可勾选",
+            ) { showMailDialog = true }
         }
         Spacer(modifier = Modifier.height(12.dp))
         Text(
@@ -3005,6 +3134,54 @@ private fun FeedbackPanel(
             lineHeight = 18.sp
         )
         Spacer(modifier = Modifier.height(30.dp))
+    }
+
+    if (showMailDialog) {
+        AlertDialog(
+            onDismissRequest = { showMailDialog = false },
+            title = { Text("发送反馈邮件", color = DoukColors.textPrimary) },
+            text = {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { attachLogs = !attachLogs },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = attachLogs,
+                            onCheckedChange = { attachLogs = it },
+                            colors = CheckboxDefaults.colors(checkedColor = DoukColors.accent)
+                        )
+                        Text(
+                            "附带诊断日志（推荐）",
+                            fontSize = 14.sp,
+                            color = DoukColors.textPrimary
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        "诊断包含设备与系统信息、运行日志、相机协议交互记录、崩溃堆栈；不含照片、视频和 LUT 原文件。",
+                        fontSize = 12.sp,
+                        color = DoukColors.textTertiary,
+                        lineHeight = 18.sp
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showMailDialog = false
+                        onSendMail(attachLogs)
+                    }
+                ) { Text("发送邮箱", color = DoukColors.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMailDialog = false }) {
+                    Text("取消", color = DoukColors.textTertiary)
+                }
+            }
+        )
     }
 }
 
@@ -3046,11 +3223,12 @@ private fun AboutPanel(
                     PermissionLine("通知", "连上相机或蓝牙推送期间保持前台服务，避免后台被系统冻结。")
                     PermissionLine("照片与文件", "读取相机回传的图片、导入 LUT 与导出日志。")
                     PermissionLine("手机相册", "仅在图库切到「手机」来源时读取缩略图，不上传、不修改。")
+                    PermissionLine("麦克风", "仅在监看页开启「音频电平」时采样环境声做参考电平，不录音、不上传。")
                 }
             }
             Spacer(modifier = Modifier.height(12.dp))
             Text(
-                "以上权限只在对应功能开启时使用，不会上传到任何服务器。",
+                "除可关闭的在线高程查询外，以上权限只在对应功能开启时使用，数据不上传到任何服务器。",
                 fontSize = 12.sp,
                 color = DoukColors.textTertiary
             )

@@ -82,10 +82,15 @@ fun NikonDiagnosticsPanel(vm: NikonViewModel, ip: String, onIp: (String) -> Unit
             if (camera.isNotBlank()) Text(camera, fontSize = 12.sp)
             Text(stage, fontSize = 12.sp)
             if (stage.contains("InitFail 1")) {
-                Text("相机已收到连接请求，但拒绝了这次的应用身份。若以前连接成功过，可选择当时导出的日志 ZIP 恢复身份。",
-                    fontSize = 12.sp)
-                TextButton(onClick = { recoverIdentity.launch(arrayOf("application/zip", "application/octet-stream")) }) {
-                    Text("从旧日志恢复配对身份")
+                Text("相机已收到连接请求，但拒绝了这次的应用身份。已有旧日志时先恢复原身份；" +
+                    "找不到旧日志就换一个新身份，让相机重新弹一次配对确认。", fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { recoverIdentity.launch(arrayOf("application/zip", "application/octet-stream")) }) {
+                        Text("从旧日志恢复配对身份")
+                    }
+                    TextButton(onClick = { vm.resetPairingIdentity(context) }) {
+                        Text("换新身份并重新配对")
+                    }
                 }
             }
             if (vm.pairingMessage.isNotBlank()) Text(vm.pairingMessage, fontSize = 13.sp)

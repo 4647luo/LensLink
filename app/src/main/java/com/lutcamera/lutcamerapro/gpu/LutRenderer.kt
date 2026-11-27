@@ -15,6 +15,14 @@ import javax.microedition.khronos.opengles.GL10
 
 class LutRenderer : GLSurfaceView.Renderer {
 
+    companion object {
+        /** 波形离屏纹理：256 列对应画面宽度，128 行对应亮度轴 */
+        private const val WAVE_WIDTH = 256
+        private const val WAVE_HEIGHT = 128
+        /** 每列采样多少行（总采样点 = 256 × 160 = 40960，GPU 上很轻） */
+        private const val WAVE_ROWS = 160
+    }
+
     private var programId: Int = 0
     private var aPositionHandle: Int = 0
     private var aTextureCoordHandle: Int = 0
@@ -63,6 +71,38 @@ class LutRenderer : GLSurfaceView.Renderer {
     @Volatile var isShadowWarning: Boolean = false
 
     @Volatile var currentXmpData: XmpData? = null
+
+    // ---- 监看专用：伪色 / GPU 旋转镜像 / GPU 波形 ----
+    @Volatile var falseColorEnabled: Boolean = false
+    /** 峰值对焦：GPU 边缘检测，阈值 0.02～0.25，越大只显示越硬的边 */
+    @Volatile var peakingEnabled: Boolean = false
+    @Volatile var peakThreshold: Float = 0.08f
+    @Volatile var uvRotation: Int = 0
+    @Volatile var uvMirror: Boolean = false
+    @Volatile var waveformEnabled: Boolean = false
+
+    /** 波形区域：归一化 [x, y, w, h]，x/y 取左上角、y 轴向下（和 Compose 坐标一致） */
+    @Volatile var waveformRect: FloatArray = floatArrayOf(0.04f, 0.66f, 0.42f, 0.30f)
+
+    private var uFalseColorHandle = 0
+    private var uPeakingHandle = 0
+    private var uPeakThresholdHandle = 0
+    private var uUvRotationHandle = 0
+    private var uUvMirrorHandle = 0
+
+    private var waveSplatProgram = 0
+    private var waveDisplayProgram = 0
+    private var waveSplatSrcHandle = 0
+    private var waveSplatRowsHandle = 0
+    private var waveSplatWeightHandle = 0
+    private var waveDisplayTexHandle = 0
+    private var waveDisplayGainHandle = 0
+    private var waveDisplayPosHandle = 0
+    private var waveDisplayUvHandle = 0
+    private var waveFbo = 0
+    private var waveTexture = 0
+    private var surfaceW = 1
+    private var surfaceH = 1
 
     @Volatile private var isGlInitialized = false
     private val pendingBitmap = java.util.concurrent.atomic.AtomicReference<Bitmap?>(null)
@@ -138,6 +178,11 @@ class LutRenderer : GLSurfaceView.Renderer {
         uUseTetrahedralHandle = GLES30.glGetUniformLocation(programId, "uUseTetrahedral")
         uShowHighlightWarningHandle = GLES30.glGetUniformLocation(programId, "uShowHighlightWarning")
         uShowShadowWarningHandle = GLES30.glGetUniformLocation(programId, "uShowShadowWarning")
+        uFalseColorHandle = GLES30.glGetUniformLocation(programId, "uFalseColor")
+        uPeakingHandle = GLES30.glGetUniformLocation(programId, "uPeaking")
+        uPeakThresholdHandle = GLES30.glGetUniformLocation(programId, "uPeakThreshold")
+        uUvRotationHandle = GLES30.glGetUniformLocation(programId, "uUvRotation")
+        uUvMirrorHandle = GLES30.glGetUniformLocation(programId, "uUvMirror")
 
         // 绑定 XMP Uniforms
                 uEnableXmpHandle = GLES30.glGetUniformLocation(programId, "uEnableXmp")
@@ -161,6 +206,8 @@ class LutRenderer : GLSurfaceView.Renderer {
         GLES30.glGenTextures(1, textures, 0)
         imageTextureId = textures[0]
 
+        createWaveProgramsAndTarget()
+
         isGlInitialized = true
 
         if (pendingBitmap.get() != null || pendingLutData.get() != null) {
@@ -169,10 +216,13 @@ class LutRenderer : GLSurfaceView.Renderer {
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-        GLES30.glViewport(0, 0, width, height)
+        surfaceW = width.coerceAtLeast(1)
+        surfaceH = height.coerceAtLeast(1)
+        GLES30.glViewport(0, 0, surfaceW, surfaceH)
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        GLES30.glViewport(0, 0, surfaceW, surfaceH)
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         if (programId == 0 || !isGlInitialized) return
 
@@ -209,6 +259,11 @@ class LutRenderer : GLSurfaceView.Renderer {
         GLES30.glUniform1i(uUseTetrahedralHandle, if (isTetrahedralSupported) 1 else 0)
         GLES30.glUniform1i(uShowHighlightWarningHandle, if (isHighlightWarning) 1 else 0)
         GLES30.glUniform1i(uShowShadowWarningHandle, if (isShadowWarning) 1 else 0)
+        GLES30.glUniform1i(uFalseColorHandle, if (falseColorEnabled) 1 else 0)
+        GLES30.glUniform1i(uPeakingHandle, if (peakingEnabled && !falseColorEnabled) 1 else 0)
+        GLES30.glUniform1f(uPeakThresholdHandle, peakThreshold.coerceIn(0.01f, 0.4f))
+        GLES30.glUniform1i(uUvRotationHandle, uvRotation)
+        GLES30.glUniform1i(uUvMirrorHandle, if (uvMirror) 1 else 0)
 
         // 填充 XMP 参数
                 val xmp = currentXmpData
@@ -240,6 +295,115 @@ class LutRenderer : GLSurfaceView.Renderer {
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glDisableVertexAttribArray(aPositionHandle)
         GLES30.glDisableVertexAttribArray(aTextureCoordHandle)
+
+        // 波形图：全部在 GPU 上算，不再由 CPU 生成 256×128 位图
+        if (waveformEnabled && waveFbo != 0) drawWaveform()
+    }
+
+    /** 建波形用的两个 program 与离屏目标（RGBA8 加法累加，然后按增益显示）。 */
+    private fun createWaveProgramsAndTarget() {
+        waveFbo = 0
+        waveTexture = 0
+        waveSplatProgram = LutShaders.createWaveSplatProgram()
+        waveDisplayProgram = LutShaders.createWaveDisplayProgram()
+        if (waveSplatProgram != 0) {
+            waveSplatSrcHandle = GLES30.glGetUniformLocation(waveSplatProgram, "uSrc")
+            waveSplatRowsHandle = GLES30.glGetUniformLocation(waveSplatProgram, "uGridRows")
+            waveSplatWeightHandle = GLES30.glGetUniformLocation(waveSplatProgram, "uPointWeight")
+        }
+        if (waveDisplayProgram != 0) {
+            waveDisplayTexHandle = GLES30.glGetUniformLocation(waveDisplayProgram, "uWave")
+            waveDisplayGainHandle = GLES30.glGetUniformLocation(waveDisplayProgram, "uGain")
+            waveDisplayPosHandle = GLES30.glGetAttribLocation(waveDisplayProgram, "aPosition")
+            waveDisplayUvHandle = GLES30.glGetAttribLocation(waveDisplayProgram, "aTextureCoord")
+        }
+
+        val tex = IntArray(1)
+        GLES30.glGenTextures(1, tex, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[0])
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8,
+            WAVE_WIDTH, WAVE_HEIGHT, 0,
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val fbo = IntArray(1)
+        GLES30.glGenFramebuffers(1, fbo, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo[0])
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, tex[0], 0
+        )
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            Log.e("LutRenderer", "波形离屏目标不可用: 0x${Integer.toHexString(status)}")
+            GLES30.glDeleteTextures(1, tex, 0)
+            GLES30.glDeleteFramebuffers(1, fbo, 0)
+            return
+        }
+        waveTexture = tex[0]
+        waveFbo = fbo[0]
+    }
+
+    /**
+     * 波形渲染：pass1 把源帧按「列 → x、亮度 → y」泼溅累加到离屏纹理，
+     * pass2 把这张纹理按 [waveformRect] 画到画面内的一个小窗口里。
+     */
+    private fun drawWaveform() {
+        val src = imageTextureId
+        if (src == 0 || waveSplatProgram == 0) return
+
+        // ---- pass 1：点泼溅
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, waveFbo)
+        GLES30.glViewport(0, 0, WAVE_WIDTH, WAVE_HEIGHT)
+        GLES30.glClearColor(0f, 0f, 0f, 0f)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+
+        GLES30.glUseProgram(waveSplatProgram)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, src)
+        GLES30.glUniform1i(waveSplatSrcHandle, 0)
+        GLES30.glUniform1f(waveSplatRowsHandle, WAVE_ROWS.toFloat())
+        GLES30.glUniform1f(waveSplatWeightHandle, 0.02f)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
+        GLES30.glDrawArrays(GLES30.GL_POINTS, 0, WAVE_WIDTH * WAVE_ROWS)
+        GLES30.glDisable(GLES30.GL_BLEND)
+
+        // ---- pass 2：显示到画面内指定矩形
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        val rect = waveformRect
+        val px = (rect[0] * surfaceW).toInt().coerceIn(0, surfaceW - 1)
+        val pw = (rect[2] * surfaceW).toInt().coerceIn(1, surfaceW - px)
+        val ph = (rect[3] * surfaceH).toInt().coerceIn(1, surfaceH - 1)
+        // GL 的 viewport 原点在左下，Compose 的 y 从上往下，这里换算一次
+        val py = (surfaceH - (rect[1] * surfaceH).toInt() - ph).coerceIn(0, surfaceH - ph)
+        GLES30.glViewport(px, py, pw, ph)
+
+        GLES30.glUseProgram(waveDisplayProgram)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, waveTexture)
+        GLES30.glUniform1i(waveDisplayTexHandle, 0)
+        // RGBA8 累加每个点只加 0.02，显示时放大 ~14 倍才看得见密度
+        GLES30.glUniform1f(waveDisplayGainHandle, 14f)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        GLES30.glEnableVertexAttribArray(waveDisplayPosHandle)
+        GLES30.glVertexAttribPointer(waveDisplayPosHandle, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
+        GLES30.glEnableVertexAttribArray(waveDisplayUvHandle)
+        GLES30.glVertexAttribPointer(waveDisplayUvHandle, 2, GLES30.GL_FLOAT, false, 0, textureBuffer)
+        GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
+        GLES30.glDisableVertexAttribArray(waveDisplayPosHandle)
+        GLES30.glDisableVertexAttribArray(waveDisplayUvHandle)
+        GLES30.glDisable(GLES30.GL_BLEND)
+
+        // 恢复全屏 viewport，否则下一帧主画面会被裁到波形窗口里
+        GLES30.glViewport(0, 0, surfaceW, surfaceH)
     }
 
     private fun load2DTexture(bitmap: Bitmap) {

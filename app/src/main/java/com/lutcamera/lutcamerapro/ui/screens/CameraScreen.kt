@@ -498,7 +498,7 @@ fun CameraScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                items(lutViewModel.lutLibraryList.value, contentType = { "camera-lut" }) { lutItem ->
+                items(lutViewModel.enabledLuts, contentType = { "camera-lut" }) { lutItem ->
                     val isSelected = lutViewModel.currentLutId == lutItem.id
                     Box(
                         modifier = Modifier
@@ -736,7 +736,9 @@ fun CameraScreen(
                         )
                         Text(
                             text = when (tetherMode) {
-                                ActiveTetherMode.WIRELESS_NIKON -> "目标 IP: ${settingsViewModel.nikonIp}"
+                                ActiveTetherMode.WIRELESS_NIKON -> nikonViewModel.lanScanText
+                                ?.let { "目标 IP: ${settingsViewModel.nikonIp} · $it" }
+                                ?: "目标 IP: ${settingsViewModel.nikonIp}"
                                 else -> "USB 硬件直连模式"
                             },
                             fontSize = 12.sp,

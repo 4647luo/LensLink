@@ -10,8 +10,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -48,6 +51,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -57,6 +61,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +71,7 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -78,7 +84,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.lutcamera.lutcamerapro.network.CameraHotspot
 import com.lutcamera.lutcamerapro.network.CameraLanProbe
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleRemoteClient
@@ -88,11 +96,10 @@ fun DeviceScreen(
     state: DoukState,
     onAddDevice: () -> Unit,
     onOpenControl: () -> Unit,
-    // 当前显示哪一组服务卡片：null = 初始设备页，"wifi" = Wi‑Fi|USB 页，"bluetooth" = 蓝牙页。
-    // 它和切换条是否展开是两件事：收起切换条后，页面仍停留在用户刚选的那一页。
-    serviceMode: String? = null,
-    // 底部「蓝牙 / Wi‑Fi|USB」切换条是否正在显示，只决定要不要给浮层让出 72dp。
-    serviceBarVisible: Boolean = false
+    // 当前显示哪一组服务卡片："wifi" = Wi‑Fi|USB 页，"bluetooth" = 蓝牙页。
+    // 切换入口已经挪到相机照片右上角的小胶囊，不再靠底部栏二次点击弹层。
+    serviceMode: String = "wifi",
+    onServiceSelect: (String) -> Unit = {}
 ) {
     var showManual by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -212,10 +219,7 @@ fun DeviceScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                // 设备页切换条是浮层；显示时把滚动视口底部让出 72dp，
-                // 否则最后一张蓝牙/存储卡会被「蓝牙 | Wi‑Fi|USB」压住。
-                // 收起切换条后只收回这 72dp，不改变当前显示的服务页。
-                .padding(bottom = if (serviceBarVisible) 72.dp else 0.dp)
+                // 切换入口在相机照片右上角的小胶囊上，页面底部不再给浮层让位。
                 .verticalScroll(scrollState)
                 .padding(horizontal = DoukSpace.page)
         ) {
@@ -223,7 +227,13 @@ fun DeviceScreen(
             if (state.isConnected) {
                 ConnectedStatus(state)
                 Spacer(modifier = Modifier.height(DoukSpace.md))
-                PhotoHero(photo = cameraPhoto, connected = true, modelName = state.profile.name)
+                PhotoHero(
+                    photo = cameraPhoto,
+                    connected = true,
+                    modelName = state.profile.name,
+                    serviceMode = serviceMode,
+                    onServiceSelect = onServiceSelect
+                )
                 Spacer(modifier = Modifier.height(DoukSpace.lg))
                 when (serviceMode) {
                     "bluetooth" -> {
@@ -245,11 +255,19 @@ fun DeviceScreen(
                     }
                 }
             } else {
-                PhotoHero(photo = cameraPhoto, connected = false, modelName = "")
+                PhotoHero(
+                    photo = cameraPhoto,
+                    connected = false,
+                    modelName = "",
+                    serviceMode = serviceMode,
+                    onServiceSelect = onServiceSelect
+                )
                 if (state.showAddDeviceButton) {
                     Spacer(modifier = Modifier.height(DoukSpace.lg))
                     PrimaryButton(text = "添加设备", icon = Icons.Rounded.Add, onClick = onAddDevice)
                 }
+                // 「连接相机 Wi‑Fi 热点」已挪到「添加设备 → Wi‑Fi AP 直连」里，
+                // 和「搜索相机设备」并排，避免设备页空态堆一排并列按钮。
                 // 之前这里挂了一个「模拟相机（测试监看）」的入口，正式版不需要，去掉
 
                 // 连接过的设备：只有这次搜索真的搜到了这台（IP 对上）才列出来；
@@ -304,7 +322,7 @@ fun DeviceScreen(
     if (showManual) {
         AlertDialog(
             onDismissRequest = { showManual = false },
-            shape = DoukShapes.sheet,
+            shape = RoundedCornerShape(24.dp),
             containerColor = DoukColors.surface,
             confirmButton = {
                 TextButton(onClick = { showManual = false }) {
@@ -323,6 +341,197 @@ fun DeviceScreen(
             }
         )
     }
+
+}
+
+/** 应用内加入相机热点：扫到的相机 SSID 一键填，也可以手动输 SSID 与机身显示的密码。 */
+@Composable
+internal fun CameraHotspotDialog(state: DoukState, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val saved = remember { state.savedCameraHotspot() }
+    var current by remember { mutableStateOf<String?>(null) }
+    var ssid by remember { mutableStateOf(saved?.ssid.orEmpty()) }
+    var password by remember { mutableStateOf(saved?.password.orEmpty()) }
+    var nearby by remember { mutableStateOf(emptyList<String>()) }
+    var scanning by remember { mutableStateOf(true) }
+
+    val permissions = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(
+                Manifest.permission.NEARBY_WIFI_DEVICES,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    val scanScope = rememberCoroutineScope()
+    fun refresh() {
+        scanScope.launch {
+            scanning = true
+            current = CameraHotspot.currentSsid(context)
+            nearby = CameraHotspot.scanNearbySsids(context)
+            // 默认值优先级：上次用过的 → 当前已连的相机热点 → 扫到的第一个相机热点
+            if (ssid.isBlank()) {
+                ssid = current?.takeIf { CameraHotspot.isCameraSsid(it) }
+                    ?: nearby.firstOrNull { CameraHotspot.isCameraSsid(it) }
+                    ?: ""
+            }
+            scanning = false
+        }
+    }
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { refresh() }
+
+    LaunchedEffect(Unit) {
+        val granted = permissions.all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        }
+        if (granted) refresh() else launcher.launch(permissions)
+    }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        // 四角统一 24dp：原来用的 sheet 形状只有上面两个角是圆的，底部是直角，
+        // 在平板大屏上看起来像从底边裁出来的一块。
+        shape = RoundedCornerShape(24.dp),
+        containerColor = DoukColors.surface,
+        title = { Text("连接相机 Wi‑Fi 热点", style = DoukType.h2, color = DoukColors.textPrimary) },
+        text = {
+            Column {
+                Text(
+                    "不跳系统设置，直接由应用加入相机热点。相机需先进入「连接至智能设备」，屏幕上会显示热点名与密码。",
+                    fontSize = 12.sp,
+                    color = DoukColors.textSecondary
+                )
+                Spacer(Modifier.height(10.dp))
+                // 当前连着的 Wi‑Fi：用户多半已经在系统里连过相机热点，直接填最省事
+                val currentSsid = current
+                if (currentSsid != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(DoukShapes.cardSmall)
+                            .background(DoukColors.surfaceMuted)
+                            .clickable { ssid = currentSsid }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "当前 Wi‑Fi：$currentSsid",
+                            fontSize = 12.sp,
+                            color = DoukColors.textPrimary,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            if (ssid == currentSsid) "已填入" else "填入",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = DoukColors.accent
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "附近 Wi‑Fi（点一下即填入）",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = DoukColors.textPrimary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        if (scanning) "读取中…" else "重新扫描",
+                        fontSize = 11.sp,
+                        color = DoukColors.accent,
+                        modifier = Modifier.clickable {
+                            scanning = true
+                            refresh()
+                        }
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                if (!scanning && nearby.isEmpty()) {
+                    Text(
+                        "没扫到热点：确认相机 Wi‑Fi 已开启；若系统限制定位权限，可先手动连上相机热点，再回到这里点「当前 Wi‑Fi」。",
+                        fontSize = 12.sp,
+                        color = DoukColors.textSecondary
+                    )
+                } else {
+                    nearby.take(6).forEach { name ->
+                        val selected = name == ssid
+                        val isCamera = CameraHotspot.isCameraSsid(name)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(DoukShapes.cardSmall)
+                                .clickable { ssid = name }
+                                .padding(horizontal = 8.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                name,
+                                fontSize = 13.sp,
+                                color = if (selected) DoukColors.accent else DoukColors.textPrimary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (isCamera) {
+                                Text(
+                                    "相机",
+                                    fontSize = 10.sp,
+                                    color = DoukColors.textSecondary,
+                                    modifier = Modifier
+                                        .clip(DoukShapes.cardSmall)
+                                        .background(DoukColors.surfaceMuted)
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            if (selected) Text("已选", fontSize = 11.sp, color = DoukColors.accent)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = ssid,
+                    onValueChange = { ssid = it },
+                    singleLine = true,
+                    shape = DoukShapes.cardSmall,
+                    label = { Text("热点名称（SSID，可点上面的条目自动填）", fontSize = 12.sp) },
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    singleLine = true,
+                    shape = DoukShapes.cardSmall,
+                    label = { Text("热点密码（相机屏幕上显示；开放热点留空）", fontSize = 12.sp) },
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 14.sp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "加入成功后会自动找 15740 端口并直接连相机；下次会记住这组热点名与密码。",
+                    fontSize = 11.sp,
+                    color = DoukColors.textSecondary
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                state.joinCameraHotspot(context, ssid, password)
+                onClose()
+            }) {
+                Text("连接", style = DoukType.title, color = DoukColors.accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onClose) {
+                Text("取消", style = DoukType.title, color = DoukColors.textSecondary)
+            }
+        }
+    )
 }
 
 @Composable
@@ -433,48 +642,119 @@ private fun ConnectedStatus(state: DoukState) {
 
 /** 相机实物照片区：空态只放图与图标，已连接时叠型号名与状态胶囊 */
 @Composable
-private fun PhotoHero(photo: ImageBitmap?, connected: Boolean, modelName: String) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(1.55f)
-    ) {
-        if (photo != null) {
-            // 透明底机身 PNG 直接铺满，不加圆角裁切、阴影和黑色渐变，
-            // 避免图片周围出现一圈看得见的「画框」。
-            Image(
-                bitmap = photo,
-                contentDescription = "相机照片",
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit
-            )
-        } else {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .clip(DoukShapes.card)
-                    .background(DoukColors.surfaceMuted)
-            ) {
-                // 没设照片时的占位：一圈很淡的主色光晕 + 相机图标，不写字
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Box(
-                        modifier = Modifier
-                            .size(124.dp)
-                            .clip(CircleShape)
-                            .background(DoukColors.accentContainer)
-                    )
-                    Icon(
-                        Icons.Rounded.CameraAlt,
-                        contentDescription = null,
-                        tint = DoukColors.accent.copy(alpha = 0.62f),
-                        modifier = Modifier.size(52.dp)
-                    )
-                }
-            }
+private fun PhotoHero(
+    photo: ImageBitmap?,
+    connected: Boolean,
+    modelName: String,
+    serviceMode: String = "wifi",
+    onServiceSelect: (String) -> Unit = {}
+) {
+    // 服务切换胶囊和照片分成上下两块，中间留 16dp：
+    // 之前胶囊贴在照片卡片顶部（等于被照片那块大卡片套住），现在各占一块，视觉上不再黏在一起。
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            HeroServiceChip(
+                label = "蓝牙",
+                icon = Icons.Rounded.Bluetooth,
+                selected = serviceMode == "bluetooth"
+            ) { onServiceSelect("bluetooth") }
+            HeroServiceChip(
+                label = "Wi‑Fi|USB",
+                icon = Icons.Rounded.Wifi,
+                selected = serviceMode == "wifi"
+            ) { onServiceSelect("wifi") }
         }
 
-        // 图片只放机身 PNG，不再叠加「在线」和相机型号，避免透明底图片周围出现遮挡
+        Spacer(modifier = Modifier.height(16.dp))
 
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1.55f)
+        ) {
+            if (photo != null) {
+                // 透明底机身 PNG 直接铺满，不加圆角裁切、阴影和黑色渐变，
+                // 避免图片周围出现一圈看得见的「画框」。
+                Image(
+                    bitmap = photo,
+                    contentDescription = "相机照片",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(DoukShapes.card)
+                        .background(DoukColors.surfaceMuted)
+                ) {
+                    // 没设照片时的占位：一圈很淡的主色光晕 + 相机图标，不写字
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Box(
+                            modifier = Modifier
+                                .size(124.dp)
+                                .clip(CircleShape)
+                                .background(DoukColors.accentContainer)
+                        )
+                        Icon(
+                            Icons.Rounded.CameraAlt,
+                            contentDescription = null,
+                            tint = DoukColors.accent.copy(alpha = 0.62f),
+                            modifier = Modifier.size(52.dp)
+                        )
+                    }
+                }
+            }
+
+            // 图片只放机身 PNG，不再叠加「在线」和相机型号，避免透明底图片周围出现遮挡
+        }
+    }
+}
+
+/** 照片上方的一枚独立胶囊：选中填主色，未选中是半透明深底 */
+@Composable
+private fun HeroServiceChip(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val pill = RoundedCornerShape(percent = 50)
+    // 只留一层填充：以前选中态是「实心胶囊 + 外面再描一圈」，看起来像小胶囊套在大胶囊里。
+    Row(
+        modifier = Modifier
+            .clip(pill)
+            .background(
+                if (selected) DoukColors.accent.copy(alpha = 0.94f)
+                else Color.Black.copy(alpha = 0.62f),
+                pill
+            )
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            )
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            icon,
+            contentDescription = label,
+            tint = if (selected) Color.White else Color.White.copy(alpha = 0.82f),
+            modifier = Modifier.size(14.dp)
+        )
+        Spacer(Modifier.width(5.dp))
+        Text(
+            label,
+            fontSize = 11.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) Color.White else Color.White.copy(alpha = 0.82f),
+            maxLines = 1
+        )
     }
 }
 
@@ -491,13 +771,13 @@ private fun ConnectionHint(state: DoukState) {
                 .padding(top = 4.dp)
                 .size(5.dp)
                 .clip(CircleShape)
-                .background(if (state.isConnecting) DoukColors.textTertiary else DoukColors.warning)
+                .background(if (state.isConnecting) DoukColors.textTertiary else DoukColors.danger)
         )
         Spacer(modifier = Modifier.width(DoukSpace.xs))
         Text(
             text = merged.joinToString("\n"),
             style = DoukType.caption,
-            color = if (state.isConnecting) DoukColors.textSecondary else DoukColors.warning
+            color = if (state.isConnecting) DoukColors.textSecondary else DoukColors.danger
         )
     }
 }
@@ -861,6 +1141,7 @@ private fun BleGpsCard(state: DoukState, context: android.content.Context) {
     val lastFixProvider by state.ble.lastFixProvider.collectAsStateWithLifecycle()
     val payloadSatellites by state.ble.lastPayloadSatellites.collectAsStateWithLifecycle()
     val payloadAltitude by state.ble.lastPayloadAltitude.collectAsStateWithLifecycle()
+    val payloadAltitudeSrc by state.ble.lastAltitudeSource.collectAsStateWithLifecycle()
     val pushConfirmed by state.ble.lastPushConfirmed.collectAsStateWithLifecycle()
 
     val ready = phase == com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient.Phase.READY
@@ -908,8 +1189,11 @@ private fun BleGpsCard(state: DoukState, context: android.content.Context) {
         null -> "等待推送"
     }
     val payloadText = if (payloadSatellites > 0) {
-        val alt = payloadAltitude?.let { "$it m" } ?: "—"
-        "$payloadSatellites 颗 · $alt"
+        val altText = payloadAltitude?.let { meters ->
+            val src = payloadAltitudeSrc.takeIf { it.isNotBlank() && it != "无" }
+            if (src != null) "$meters m（$src）" else "$meters m"
+        } ?: "—"
+        "$payloadSatellites 颗 · $altText"
     } else "—"
     val lastPushAgo = if (lastPushAt > 0L) agoText(now - lastPushAt) else "—"
     val lastFixAgo = if (lastFixAt > 0L) agoText(now - lastFixAt) else "—"
@@ -982,7 +1266,7 @@ private fun BleGpsCard(state: DoukState, context: android.content.Context) {
                 if (state.isConnected && !ready) {
                     Spacer(modifier = Modifier.height(3.dp))
                     Text(
-                        "Wi‑Fi 连接时可能停播；搜不到先断 Wi‑Fi，并让相机停在配对页",
+                        "Wi‑Fi 会话期间蓝牙推送暂停（省电）；要推 GPS 请断开 Wi‑Fi，切到「蓝牙」模式再连一次",
                         style = DoukType.label,
                         color = DoukColors.textTertiary
                     )

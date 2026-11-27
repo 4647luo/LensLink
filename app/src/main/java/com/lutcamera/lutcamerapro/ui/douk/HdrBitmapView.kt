@@ -35,7 +35,7 @@ internal class HdrBitmapView @JvmOverloads constructor(
 
     var onFrameReady: ((String?) -> Unit)? = null
 
-    /** 和旧 HdrImageView 保持同一套调用契约：当前图像 key 与首帧日志标记。 */
+    /** 保持与旧版 HDR 视图同一套调用契约：当前图像 key 与首帧日志标记。 */
     var sourceTag: String? = null
     var loggedReady = false
 

@@ -247,7 +247,9 @@ object NikonGeoPayload {
         buffer.put(lon.sub2.toByte())
         buffer.put(satellites.coerceIn(0, 100).toByte())
         buffer.put(if (altitudeMeters >= 0) 'P'.code.toByte() else 'M'.code.toByte())
-        buffer.putShort(abs(altitudeMeters).toShort())
+        // 海拔字段是有符号 16 位；气压计偶尔会因为低气压给出离谱读数，这里先夹紧再写，
+        // 否则 40000 米这种值写进去会变成负数（溢出成 -25536）。
+        buffer.putShort(abs(altitudeMeters).coerceAtMost(32_000).toShort())
         buffer.putShort(calendar.get(Calendar.YEAR).toShort())
         buffer.put((calendar.get(Calendar.MONTH) + 1).toByte())
         buffer.put(calendar.get(Calendar.DAY_OF_MONTH).toByte())

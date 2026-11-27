@@ -182,7 +182,15 @@ internal data class EditState(
     /** HDR 色彩浓度：50 = 原色，100 = 更浓，0 = 更淡 */
     val hdrColor: Float = 50f,
     /** HDR 色温：-100 = 冷，0 = 中性，100 = 暖 */
-    val hdrWarmth: Float = 0f
+    val hdrWarmth: Float = 0f,
+    /**
+     * HDR 高光柔光（Glow）：0 = 只抬高光本身，100 = 高光向外扩散成一圈柔光。
+     *
+     * HDRfy / Glow HDR 这类 App 的「柔」来自 bloom：只有最亮的区域发光，
+     * 光晕溢到周围但暗部保持不动。这里把它做成增益图的低频扩散，
+     * 预览与导出的 GainMap 走同一套算法，所见即所得。
+     */
+    val hdrGlow: Float = 35f
 ) {
     /** 有没有做过任何改动，决定「还原」按钮要不要亮 */
     val isPristine: Boolean
@@ -416,6 +424,11 @@ internal fun PhotoEditorScreen(
     var hdrPreview by remember(item.stableKey) { mutableStateOf(initialHdrPreview) }
     var hdrPreviewLayer by remember(item.stableKey) { mutableStateOf<HdrPreviewLayer?>(null) }
     var hdrPreviewBitmap by remember(item.stableKey) { mutableStateOf<Bitmap?>(null) }
+    // 每个 HDR 预设的小缩略图：切预设前先看效果，不用来回点。
+    var hdrPresetThumbs by remember(item.stableKey) { mutableStateOf<Map<String, ImageBitmap>>(emptyMap()) }
+    // GainMap 只跟「强度 / 层次 / 几何」有关：改暗部、色彩、色温、柔光时不必重建，
+    // 直接复用上一次的 layer。RAW 生成一次要读传感器数据，重复生成最伤手感。
+    var hdrGainKey by remember(item.stableKey) { mutableStateOf("") }
     // 窗口整体下移导航栏高度后，状态栏已经在窗口外面，标题栏不再重复加
     // statusBarsPadding，否则顶部会空出 60px。
     var windowLiftPx by remember(item.stableKey) { mutableIntStateOf(0) }
@@ -648,6 +661,7 @@ internal fun PhotoEditorScreen(
         preview,
         hdrPreview,
         state.hdrStrength,
+        state.hdrGlow,
         state.hdrHighlight,
         state.hdrShadow,
         state.hdrColor,
@@ -661,12 +675,14 @@ internal fun PhotoEditorScreen(
     ) {
         if (!hdrPreview || preview == null) {
             hdrPreviewLayer = null
+            hdrGainKey = ""
             hdrPreviewBitmap = null
             return@LaunchedEffect
         }
         val strength = (state.hdrStrength / 100f).coerceIn(0f, 1f)
         if (strength <= 0.02f) {
             hdrPreviewLayer = null
+            hdrGainKey = ""
             hdrPreviewBitmap = null
             return@LaunchedEffect
         }
@@ -676,7 +692,18 @@ internal fun PhotoEditorScreen(
         val grade = HdrGrade.from(state)
         val maxBoost = 1f + 2.4f * strength
         val highlightStart = (0.36f + 0.50f * (state.hdrHighlight / 100f)).coerceIn(0.30f, 0.90f)
-        val layer = withContext(Dispatchers.Default) {
+        // GainMap 的等价条件：强度、层次、几何（裁剪/旋转/翻转）不变，就沿用上一次的 layer。
+        val gainKey = buildString {
+            append(srcFormat).append('|').append(item.stableKey).append('|')
+            append(strength).append('|').append(state.hdrHighlight).append('|')
+            append(state.cropFree).append('|').append(state.cropRatio).append('|')
+            append(state.quarterTurns).append('|').append(state.fineRotate).append('|')
+            append(state.flipHorizontal).append('|').append(state.flipVertical)
+        }
+        val cachedLayer = hdrPreviewLayer
+        val layer = if (cachedLayer != null && hdrGainKey == gainKey) {
+            cachedLayer
+        } else withContext(Dispatchers.Default) {
             val sourceFile = resolveSourceFile(item, srcFormat)
             // RAW：直接读传感器 CFA 原始数据生成 GainMap，不再用内嵌 JPEG 反推。
             val rawLayer = if (
@@ -756,11 +783,42 @@ internal fun PhotoEditorScreen(
                 }
             }
         }
+        // 柔光分两层：增益图那层负责真 HDR 的头部亮度（导出用），预览再补一层
+        // 屏幕空间的 bloom，让「亮部发光」在平板 SDR 屏上真的看得见——
+        // 增益图里只多几个格，落在肩部滚降之后肉眼分辨不出来。
+        val glowAmount = (state.hdrGlow / 100f).coerceIn(0f, 1f)
         hdrPreviewLayer = layer
-        val composed = if (layer != null) {
-            withContext(Dispatchers.Default) { buildHdrPreviewComposite(bmp, layer, grade) }
+        hdrGainKey = if (layer != null) gainKey else ""
+        val composedRaw = if (layer != null) {
+            withContext(Dispatchers.Default) {
+                buildHdrPreviewComposite(
+                    src = bmp,
+                    layer = layer,
+                    grade = grade,
+                    strength = strength,
+                    highlight01 = (state.hdrHighlight / 100f).coerceIn(0f, 1f)
+                )
+            }
         } else null
+        val composed = if (composedRaw != null && glowAmount > 0.02f) {
+            val bloomed = withContext(Dispatchers.Default) {
+                GpuEditPipeline.bloom(composedRaw, glowAmount) ?: applyHdrBloom(composedRaw, glowAmount)
+            }
+            if (bloomed != null) {
+                runCatching { composedRaw.recycle() }
+                bloomed
+            } else composedRaw
+        } else composedRaw
         hdrPreviewBitmap = composed
+        if (glowAmount > 0.02f) {
+            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                "PhotoEditor", "HDR_GLOW",
+                "amount" to glowAmount,
+                "raw" to (composedRaw?.let { "${it.width}x${it.height}" } ?: "none"),
+                "out" to (composed?.let { "${it.width}x${it.height}" } ?: "none"),
+                "applied" to (composed != null && composedRaw != null && composed !== composedRaw)
+            )
+        }
         com.lutcamera.lutcamerapro.log.DoukLog.i(
             "PhotoEditor", "HDR_PREVIEW",
             "from" to when {
@@ -773,8 +831,19 @@ internal fun PhotoEditorScreen(
         )
     }
 
+    // 预设缩略图只跟「底图是哪张、预览开关」有关，和滑杆无关：
+    // 拖动任意参数都不重算这 10 张，只在换照片 / 开关切换时算一次。
+    LaunchedEffect(preview, hdrPreview, srcFormat) {
+        if (!hdrPreview || preview == null) {
+            hdrPresetThumbs = emptyMap()
+            return@LaunchedEffect
+        }
+        val bmp = preview?.asAndroidBitmap() ?: return@LaunchedEffect
+        if (bmp.isRecycled) return@LaunchedEffect
+        hdrPresetThumbs = withContext(Dispatchers.Default) { buildHdrPresetThumbs(bmp) }
+    }
+
     LaunchedEffect(
-        renderState,
         item.stableKey,
         filterRuntime,
         previewEpoch,
@@ -1380,6 +1449,7 @@ internal fun PhotoEditorScreen(
                                 state = state,
                                 previewOn = hdrPreview,
                                 exportOn = exportHdr,
+                                presetThumbs = hdrPresetThumbs,
                                 sdkReady = android.os.Build.VERSION.SDK_INT >= 34,
                                 sourceLabel = if (srcFormat in rawExts) {
                                     "RAW 传感器直出 GainMap"
@@ -1855,6 +1925,37 @@ private fun StudioAdjustChip(
     }
 }
 
+/**
+ * 参数滑块统一手势。
+ *
+ * 旧实现一按下就 consume 并按 x 改值，所以「往下滑页面」路过滑块区域时会先把参数改掉，
+ * 看起来就是「一滑就动参数」。这里改用横向拖动识别：
+ * 只有横向位移越过 touchSlop 才接管并改值；竖向滑动由父容器先消费，
+ * 本手势检测到被消费就自行取消，既不抢滚动也不改参数。
+ * 点击（没超过 touchSlop）同样不改值，避免误触。
+ */
+private fun Modifier.horizontalValueSlider(
+    key: Any?,
+    enabled: Boolean,
+    padPx: Float,
+    onFraction: (Float) -> Unit,
+    onStart: () -> Unit = {},
+    onEnd: () -> Unit = {}
+): Modifier {
+    if (!enabled) return this
+    return this.pointerInput(key) {
+        detectHorizontalDragGestures(
+            onDragStart = { onStart() },
+            onDragEnd = { onEnd() },
+            onDragCancel = { onEnd() },
+            onHorizontalDrag = { change, _ ->
+                val track = (size.width - padPx * 2f).coerceAtLeast(1f)
+                onFraction(((change.position.x - padPx) / track).coerceIn(0f, 1f))
+            }
+        )
+    }
+}
+
 @Composable
 private fun StudioValueSlider(
     label: String,
@@ -1892,32 +1993,14 @@ private fun StudioValueSlider(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(42.dp)
-                .then(
-                    if (enabled) Modifier.pointerInput(label) {
-                        awaitEachGesture {
-                            fun apply(x: Float) {
-                                val f = ((x - padPx) / (size.width - padPx * 2f)).coerceIn(0f, 1f)
-                                latestLive.value(range.start + (range.endInclusive - range.start) * f)
-                            }
-                            val down = awaitFirstDown()
-                            apply(down.position.x)
-                            down.consume()
-                            var active = true
-                            while (active) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull { it.id == down.id }
-                                if (change == null) {
-                                    active = false
-                                } else if (change.pressed) {
-                                    apply(change.position.x)
-                                    change.consume()
-                                } else {
-                                    active = false
-                                    onCommit()
-                                }
-                            }
-                        }
-                    } else Modifier
+                .horizontalValueSlider(
+                    key = label,
+                    enabled = enabled,
+                    padPx = padPx,
+                    onFraction = { f ->
+                        latestLive.value(range.start + (range.endInclusive - range.start) * f)
+                    },
+                    onEnd = onCommit
                 )
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -2116,11 +2199,80 @@ private fun StudioFilterRail(
     }
 }
 
+/**
+ * HDR 预设：一次把强度 / 层次 / 柔光 / 暗部 / 色彩 / 色温整套落下去。
+ *
+ * 每个预设必须把六项写全，参数之间也要拉开距离 —— 否则用户点了不同预设，
+ * 只看得到「高光强度」动了一点，会以为预设没生效。下面这组按典型场景配的：
+ * 轻、亮、光晕、电影（冷高反差）、人像（柔暖）、夜景（极限抬暗部）、
+ * 风光（宽层次高饱和）、逆光（强柔光抬暗部）、室内（暖调抬暗部）、冷调（蓝）。
+ */
+private data class HdrPreset(
+    val label: String,
+    val strength: Float,
+    val highlight: Float,
+    val glow: Float,
+    val shadow: Float,
+    val color: Float,
+    val warmth: Float
+) {
+    fun apply(s: EditState): EditState = s.copy(
+        hdrStrength = strength,
+        hdrHighlight = highlight,
+        hdrGlow = glow,
+        hdrShadow = shadow,
+        hdrColor = color,
+        hdrWarmth = warmth
+    )
+
+    fun matches(s: EditState): Boolean =
+        kotlin.math.abs(s.hdrStrength - strength) < 0.5f &&
+            kotlin.math.abs(s.hdrHighlight - highlight) < 0.5f &&
+            kotlin.math.abs(s.hdrGlow - glow) < 0.5f &&
+            kotlin.math.abs(s.hdrShadow - shadow) < 0.5f &&
+            kotlin.math.abs(s.hdrColor - color) < 0.5f &&
+            kotlin.math.abs(s.hdrWarmth - warmth) < 0.5f
+
+    /** 卡片上的两字参数标：强度·层次，点之前就能看出预设之间的差别。 */
+    val chipTag: String get() = "${strength.roundToInt()}·${highlight.roundToInt()}"
+}
+
+private val HdrPresets = listOf(
+    HdrPreset("自然", strength = 52f, highlight = 55f, glow = 22f, shadow = 12f, color = 52f, warmth = 0f),
+    HdrPreset("通透", strength = 78f, highlight = 40f, glow = 40f, shadow = 26f, color = 64f, warmth = -4f),
+    HdrPreset("光晕", strength = 88f, highlight = 25f, glow = 92f, shadow = 8f, color = 56f, warmth = 6f),
+    HdrPreset("电影", strength = 95f, highlight = 82f, glow = 45f, shadow = 4f, color = 74f, warmth = -12f),
+    HdrPreset("人像", strength = 40f, highlight = 70f, glow = 10f, shadow = 30f, color = 40f, warmth = 14f),
+    HdrPreset("夜景", strength = 100f, highlight = 15f, glow = 75f, shadow = 60f, color = 60f, warmth = -8f),
+    HdrPreset("风光", strength = 84f, highlight = 48f, glow = 26f, shadow = 34f, color = 70f, warmth = -6f),
+    HdrPreset("逆光", strength = 96f, highlight = 35f, glow = 80f, shadow = 50f, color = 50f, warmth = 10f),
+    HdrPreset("室内", strength = 58f, highlight = 64f, glow = 30f, shadow = 42f, color = 44f, warmth = 16f),
+    HdrPreset("冷调", strength = 72f, highlight = 60f, glow = 35f, shadow = 18f, color = 46f, warmth = -22f)
+)
+
+/** 当前参数对应的预设名；没有完全匹配就是「自定义」。 */
+private fun currentHdrPresetLabel(state: EditState): String =
+    HdrPresets.firstOrNull { it.matches(state) }?.label ?: "自定义"
+
+/** 六个参数的简明读数（顺序＝下面滑杆顺序），点了预设立刻能看到每项都变了。 */
+private fun hdrParamSummary(state: EditState): String {
+    fun pct(v: Float) = "${v.roundToInt()}"
+    val warm = when {
+        state.hdrWarmth > 0.5f -> "+${state.hdrWarmth.roundToInt()}"
+        state.hdrWarmth < -0.5f -> "${state.hdrWarmth.roundToInt()}"
+        else -> "0"
+    }
+    // 每项一个缩写，横排一行就能读完：强/层/柔/暗/彩/温。
+    return "强${pct(state.hdrStrength)} 层${pct(state.hdrHighlight)} 柔${pct(state.hdrGlow)} " +
+        "暗${pct(state.hdrShadow)} 彩${pct(state.hdrColor)} 温$warm"
+}
+
 @Composable
 private fun StudioHdrPanel(
     state: EditState,
     previewOn: Boolean,
     exportOn: Boolean,
+    presetThumbs: Map<String, ImageBitmap>,
     sdkReady: Boolean,
     sourceLabel: String,
     onPreview: (Boolean) -> Unit,
@@ -2189,6 +2341,105 @@ private fun StudioHdrPanel(
             }
         }
 
+        Spacer(modifier = Modifier.height(9.dp))
+        // 标题行兼作「当前参数一览」：预设名 + 六项读数都放这一行，
+        // 点不同预设或手动拖任一滑杆，都能立刻看出六项到底变没变、变成多少。
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("预设", fontSize = 9.sp, color = EditorPalette.dim)
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                currentHdrPresetLabel(state),
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = EditorPalette.accent,
+                maxLines = 1
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                hdrParamSummary(state),
+                fontSize = 7.5.sp,
+                color = EditorPalette.dim,
+                maxLines = 1
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 5.dp)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            HdrPresets.forEach { preset ->
+                val active = preset.matches(state)
+                val thumb = presetThumbs[preset.label]
+                Column(
+                    modifier = Modifier
+                        .width(58.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (active) EditorPalette.accentSoft else EditorPalette.panelRaised)
+                        .border(
+                            0.9.dp,
+                            if (active) EditorPalette.accent else EditorPalette.line,
+                            RoundedCornerShape(10.dp)
+                        )
+                        .clickable(enabled = previewOn && sdkReady) {
+                            onStateLive(preset.apply(state))
+                            onStateCommit()
+                        }
+                        .padding(3.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(EditorPalette.lineSoft),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (thumb != null) {
+                            Image(
+                                bitmap = thumb,
+                                contentDescription = preset.label,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Icon(
+                                Icons.Rounded.HdrOn,
+                                contentDescription = null,
+                                tint = EditorPalette.dim,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                        // 强度·层次角标：缩略图只能看出「亮不亮」，角标补上参数差异。
+                        Text(
+                            preset.chipTag,
+                            fontSize = 7.sp,
+                            maxLines = 1,
+                            color = Color.White,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(2.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(Color(0xCC000000))
+                                .padding(horizontal = 2.dp, vertical = 0.5.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        preset.label,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        color = if (active) EditorPalette.accent else EditorPalette.text
+                    )
+                }
+            }
+        }
+
         StudioValueSlider(
             label = "高光强度",
             value = state.hdrStrength,
@@ -2205,6 +2456,15 @@ private fun StudioHdrPanel(
             valueText = { if (it <= 35f) "宽" else if (it >= 75f) "窄" else "${it.roundToInt()}%" },
             enabled = previewOn && sdkReady,
             onLive = { onStateLive(state.copy(hdrHighlight = it)) },
+            onCommit = onStateCommit
+        )
+        StudioValueSlider(
+            label = "高光柔光",
+            value = state.hdrGlow,
+            range = 0f..100f,
+            valueText = { if (it <= 5f) "硬" else if (it >= 70f) "很柔" else "${it.roundToInt()}%" },
+            enabled = previewOn && sdkReady,
+            onLive = { onStateLive(state.copy(hdrGlow = it)) },
             onCommit = onStateCommit
         )
         StudioValueSlider(
@@ -2741,32 +3001,16 @@ private fun AdjustSlider(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(if (compact) 52.dp else 66.dp)
-                    .pointerInput(item.label) {
-                        awaitEachGesture {
-                            fun apply(x: Float) {
-                                val fraction = ((x - padPx) / (size.width - padPx * 2f)).coerceIn(0f, 1f)
-                                val v = range.start + (range.endInclusive - range.start) * fraction
-                                latestLive.value(item.set(latestState.value, v))
-                            }
-                            val down = awaitFirstDown()
-                            apply(down.position.x)
-                            down.consume()
-                            var active = true
-                            while (active) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull { it.id == down.id }
-                                if (change == null) {
-                                    active = false
-                                } else if (change.pressed) {
-                                    apply(change.position.x)
-                                    change.consume()
-                                } else {
-                                    active = false
-                                    onCommit()
-                                }
-                            }
-                        }
-                    }
+                    .horizontalValueSlider(
+                        key = item.label,
+                        enabled = true,
+                        padPx = padPx,
+                        onFraction = { fraction ->
+                            val v = range.start + (range.endInclusive - range.start) * fraction
+                            latestLive.value(item.set(latestState.value, v))
+                        },
+                        onEnd = onCommit
+                    )
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val cy = size.height - trackHeight / 2f - with(density) { 2.dp.toPx() }
@@ -3127,33 +3371,19 @@ private fun GradientSlider(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(60.dp)
-                .pointerInput(label) {
-                    awaitEachGesture {
-                        fun apply(x: Float) {
-                            val fraction = ((x - padPx) / (size.width - padPx * 2f)).coerceIn(0f, 1f)
-                            latestLive.value(range.start + (range.endInclusive - range.start) * fraction)
-                        }
-                        val down = awaitFirstDown()
-                        touching = true
-                        apply(down.position.x)
-                        down.consume()
-                        var active = true
-                        while (active) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id }
-                            if (change == null) active = false
-                            else if (change.pressed) {
-                                apply(change.position.x)
-                                change.consume()
-                            } else {
-                                active = false
-                                touching = false
-                                onCommit()
-                            }
-                        }
+                .horizontalValueSlider(
+                    key = label,
+                    enabled = true,
+                    padPx = padPx,
+                    onFraction = { fraction ->
+                        latestLive.value(range.start + (range.endInclusive - range.start) * fraction)
+                    },
+                    onStart = { touching = true },
+                    onEnd = {
                         touching = false
+                        onCommit()
                     }
-                }
+                )
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val cy = size.height - trackHeight / 2f - with(density) { 2.dp.toPx() }
@@ -3766,11 +3996,27 @@ private fun render(
     var work = geometry(src, s)
     work = if (s.cropFree) cropByRect(work, s.cropL, s.cropT, s.cropR, s.cropB)
     else cropByRatio(work, s.cropRatio)
-    // Ultra HDR / 硬件解码出来的位图是不可变的，setPixels 会直接抛 IllegalStateException
+    // Ultra HDR / 硬件解码出来的位图是不可变的，setPixels 会直接抛 IllegalException
     val target = if (work.isMutable && work.config == Bitmap.Config.ARGB_8888) {
         work
     } else {
         work.copy(Bitmap.Config.ARGB_8888, true) ?: work
+    }
+    // 优先走 GPU：45MP 导出时 CPU 版要分配几张同尺寸 IntArray，耗时以秒计。
+    // GPU 路径失败（自检没过 / 驱动异常）返回 null，下面照旧跑 CPU 版本。
+    val gpu = GpuEditPipeline.render(target, buildGpuParams(s))
+    if (gpu != null) {
+        val lut3d = if (s.filter.startsWith("res:") && s.filterAmount > 0f) runtime.lut(s.filter) else null
+        if (lut3d != null) {
+            val lutData = com.lutcamera.lutcamerapro.lut.LutData("editor", lut3d.size, lut3d.data)
+            val withLut = runCatching {
+                com.lutcamera.lutcamerapro.gpu.GpuLutOffscreenFilter.applyLut(
+                    gpu, lutData, (s.filterAmount / 100f).coerceIn(0f, 1f)
+                )
+            }.getOrNull()
+            if (withLut != null) return withLut
+        }
+        return gpu
     }
     val pixels = target.getPixelsArray()
     applyColor(pixels, s, runtime)
@@ -4017,6 +4263,60 @@ private fun applyColor(px: IntArray, s: EditState, runtime: FilterRuntime) {
     }
 }
 
+/** 把当前编辑参数翻译成 GPU 管线的 uniform 集合，映射公式和 applyColor 一一对应 */
+private fun buildGpuParams(s: EditState): GpuEditPipeline.Params {
+    val amount = s.filterAmount / 100f
+    val look = FILTER_LOOKS[s.filter] ?: FilterLook()
+    val ev = 2.0.pow(((s.exposure + look.exposure * amount) / 100f * 2f).toDouble()).toFloat()
+    val bright = s.brightness / 100f * 0.4f
+    val contrast = 1f + (s.contrast + look.contrast * amount) / 100f
+    val hi = s.highlight / 100f
+    val sh = s.shadow / 100f
+    val sat = (1f + (s.saturation + look.saturation * amount) / 100f).coerceAtLeast(0f)
+    val vib = s.vibrancy / 100f
+    val temp = (s.temperature + look.temperature * amount) / 100f
+    val tint = (s.tint + look.tint * amount) / 100f
+    val fade = look.fade * amount / 100f * 0.18f
+    val mono = (look.mono * amount / 100f).coerceIn(0f, 1f)
+
+    fun curveBytes(points: List<Float>): ByteArray? {
+        if (!needsCurve(points)) return null
+        val lut = buildCurveLut(points)
+        return ByteArray(256) { lut[it].coerceIn(0, 255).toByte() }
+    }
+
+    val hslHue = s.hslHue / 360f
+    val hslOn = s.hslHue != 0f || s.hslSat != 0f || s.hslLight != 0f
+    val targetHue = HSL_RANGES[s.hslRange.coerceIn(0, HSL_RANGES.lastIndex)].first / 360f
+
+    return GpuEditPipeline.Params(
+        ev = ev,
+        bright = bright,
+        contrast = contrast,
+        highlight = hi,
+        shadow = sh,
+        temperature = temp,
+        tint = tint,
+        saturation = sat,
+        vibrance = vib,
+        fade = fade,
+        mono = mono,
+        masterCurve = curveBytes(s.curve),
+        redCurve = curveBytes(s.curveR),
+        greenCurve = curveBytes(s.curveG),
+        blueCurve = curveBytes(s.curveB),
+        hslOn = hslOn,
+        hueShift = hslHue,
+        targetHue = targetHue,
+        hslSatK = 1f + s.hslSat / 100f,
+        hslLightK = s.hslLight / 100f * 0.5f,
+        denoise = s.denoise / 100f,
+        sharpen = s.sharpen / 100f,
+        clarity = s.clarity / 100f,
+        grain = s.grain / 100f
+    )
+}
+
 private fun clamp255(v: Float): Int {
     val x = (v * 255f).toInt()
     return if (x < 0) 0 else if (x > 255) 255 else x
@@ -4225,6 +4525,8 @@ private fun saveEdited(
                             sourcePair = reusePair,
                             sourceOrientation = GalleryFileOps.exifOrientationOf(file),
                             hdrStrength = strength,
+                            hdrGlow = s.hdrGlow / 100f,
+                            hdrHighlight = s.hdrHighlight,
                             rawSensorGain = rawGainBmp,
                             rawSensorGainMax = rawGainMax
                         )
@@ -4546,6 +4848,13 @@ private fun findExifApp1(data: ByteArray): Pair<Int, Int>? {
  * 亮部在 gainmap 里带 0–2.6x 的额外亮度，HDR 屏打开时会真的更亮。
  * 失败返回 false，调用方回退成普通 JPEG。
  */
+/**
+ * 导出 Ultra HDR：走 Google libultrahdr（经 [UltraHdrCodec]）。
+ *
+ * 底图只压一次（Kotlin 的 JPEG 编码），增益图按 ISO 21496-1 的参数交给 libultrahdr 写进容器，
+ * 不再用 `Bitmap.setGainmap` + `compress` 那套「属性写在 Bitmap 上、由框架代写」的做法。
+ * 任何一步失败都退回旧实现，保证不会产出打不开的文件。
+ */
 internal fun writeUltraHdrJpeg(
     target: File,
     bmp: Bitmap,
@@ -4553,6 +4862,167 @@ internal fun writeUltraHdrJpeg(
     sourcePair: ImageDecode.HdrPair? = null,
     sourceOrientation: Int = androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
     hdrStrength: Float = 1f,
+    hdrGlow: Float = 0f,
+    hdrHighlight: Float = 50f,
+    rawSensorGain: Bitmap? = null,
+    rawSensorGainMax: Float = 2.9f
+): Boolean {
+    if (android.os.Build.VERSION.SDK_INT < 34) return false
+    if (!UltraHdrCodec.available) {
+        return writeUltraHdrJpegLegacy(
+            target, bmp, quality, sourcePair, sourceOrientation,
+            hdrStrength, hdrGlow, rawSensorGain, rawSensorGainMax
+        )
+    }
+    val strength = hdrStrength.coerceIn(0.02f, 1f)
+    val base = if (bmp.config == Bitmap.Config.ARGB_8888 && bmp.isMutable) {
+        bmp
+    } else {
+        bmp.copy(Bitmap.Config.ARGB_8888, true) ?: return false
+    }
+    var gainBmp: Bitmap? = null
+    var orientedSourceGain: Bitmap? = null
+    return try {
+        val jpegBytes = compressToJpegBytes(base, quality)
+        if (jpegBytes == null) {
+            return writeUltraHdrJpegLegacy(
+                target, bmp, quality, sourcePair, sourceOrientation,
+                hdrStrength, hdrGlow, rawSensorGain, rawSensorGainMax
+            )
+        }
+        val gain: UltraHdrCodec.Gain? = when {
+            sourcePair != null && sourcePair.gain.width > 0 && sourcePair.gain.height > 0 -> {
+                val rawGain = sourcePair.gain
+                val sourceGain = if (!sourcePair.orientationApplied &&
+                    sourceOrientation != androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
+                ) {
+                    GalleryFileOps.applyExifOrientation(rawGain, sourceOrientation).also {
+                        if (it !== rawGain) orientedSourceGain = it
+                    }
+                } else rawGain
+                // 无裁剪/旋转/翻转时沿用相机原片的 GainMap：只把强度按滑杆缩放，
+                // 高光的真实层次仍来自相机那一套，不是重新按直方图猜。
+                val alpha = toAlphaBitmap(sourceGain).also { gainBmp = it }
+                val glowAlpha = applyHdrGlow(alpha, hdrGlow)
+                if (glowAlpha != null) {
+                    runCatching { alpha.recycle() }
+                    gainBmp = glowAlpha
+                }
+                val ratioMax = (1f + (sourcePair.ratioMax.coerceIn(1f, 16f) - 1f) * strength)
+                    .coerceIn(1f, 16f)
+                val ratioMin = sourcePair.ratioMin.coerceIn(0.01f, ratioMax)
+                val capMax = (1f + (sourcePair.displayRatioFull - 1f) * strength)
+                    .coerceAtLeast(ratioMin)
+                val g = checkNotNull(gainBmp)
+                UltraHdrCodec.Gain(
+                    gray = UltraHdrCodec.grayOf(g),
+                    width = g.width,
+                    height = g.height,
+                    minBoost = ratioMin,
+                    maxBoost = ratioMax,
+                    gamma = sourcePair.gamma.coerceIn(0.05f, 8f),
+                    epsSdr = sourcePair.epsSdr.coerceIn(0f, 1f),
+                    epsHdr = sourcePair.epsHdr.coerceIn(0f, 1f),
+                    capMin = sourcePair.minDisplayRatio.coerceIn(0.01f, 20f),
+                    capMax = capMax
+                )
+            }
+            rawSensorGain != null && rawSensorGain.width > 0 && rawSensorGain.height > 0 -> {
+                // RAW 传感器原始像素算出的增益：alpha 0..255 对应 1..rawSensorGainMax
+                val alpha = toAlphaBitmap(rawSensorGain).also { gainBmp = it }
+                val glowAlpha = applyHdrGlow(alpha, hdrGlow)
+                if (glowAlpha != null) {
+                    runCatching { alpha.recycle() }
+                    gainBmp = glowAlpha
+                }
+                val maxBoost = rawSensorGainMax.coerceIn(1.02f, 5f)
+                val g = checkNotNull(gainBmp)
+                UltraHdrCodec.Gain(
+                    gray = UltraHdrCodec.grayOf(g),
+                    width = g.width,
+                    height = g.height,
+                    minBoost = 1f,
+                    maxBoost = maxBoost,
+                    gamma = 1f,
+                    epsSdr = 0.01f,
+                    epsHdr = 0.01f,
+                    capMin = 1f,
+                    capMax = maxBoost
+                )
+            }
+            else -> UltraHdrCodec.syntheticGain(
+                sdr = base,
+                strength = strength,
+                highlight01 = (hdrHighlight / 100f).coerceIn(0f, 1f),
+                glow = hdrGlow.coerceIn(0f, 1f)
+            )
+        }
+        if (gain == null) {
+            return writeUltraHdrJpegLegacy(
+                target, bmp, quality, sourcePair, sourceOrientation,
+                hdrStrength, hdrGlow, rawSensorGain, rawSensorGainMax
+            )
+        }
+        val ok = UltraHdrCodec.encode(jpegBytes, gain, target, gainQuality = 85)
+        if (!ok) {
+            // 至少把底图写出去，避免用户拿到 0 字节文件
+            runCatching { target.writeBytes(jpegBytes) }
+            com.lutcamera.lutcamerapro.log.DoukLog.w(
+                "PhotoEditor", "ULTRA_HDR_LIB_FAIL",
+                "gain" to "${gain.width}x${gain.height}"
+            )
+        }
+        ok
+    } catch (e: Throwable) {
+        com.lutcamera.lutcamerapro.log.DoukLog.w("PhotoEditor", "ULTRA_HDR_ERR", "msg" to (e.message ?: ""))
+        false
+    } finally {
+        if (base !== bmp) runCatching { base.recycle() }
+        runCatching { gainBmp?.recycle() }
+        runCatching { orientedSourceGain?.recycle() }
+    }
+}
+
+/** 把 Bitmap 压成 JPEG 字节（不落盘，交给 libultrahdr 当底图）。 */
+private fun compressToJpegBytes(bmp: Bitmap, quality: Int): ByteArray? = runCatching {
+    val out = java.io.ByteArrayOutputStream()
+    bmp.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(60, 100), out)
+    val bytes = out.toByteArray()
+    out.close()
+    bytes
+}.getOrNull()
+
+/** 任意增益 Bitmap → ALPHA_8 单通道（gray 值放 alpha 位，沿用旧路径的取法）。 */
+private fun toAlphaBitmap(src: Bitmap): Bitmap {
+    val w = src.width
+    val h = src.height
+    val px = IntArray(w * h)
+    src.getPixels(px, 0, w, 0, 0, w, h)
+    val isAlpha = src.config == Bitmap.Config.ALPHA_8
+    val dst = IntArray(w * h)
+    for (i in px.indices) {
+        val p = px[i]
+        val v = if (isAlpha) {
+            (p ushr 24) and 0xFF
+        } else {
+            (((p shr 16) and 0xFF) + ((p shr 8) and 0xFF) + (p and 0xFF)) / 3
+        }
+        dst[i] = v shl 24
+    }
+    val out = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
+    out.setPixels(dst, 0, w, 0, 0, w, h)
+    return out
+}
+
+/** 旧实现：Bitmap.setGainmap + compress，仅在 libultrahdr 路径不可用时兜底。 */
+private fun writeUltraHdrJpegLegacy(
+    target: File,
+    bmp: Bitmap,
+    quality: Int,
+    sourcePair: ImageDecode.HdrPair? = null,
+    sourceOrientation: Int = androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
+    hdrStrength: Float = 1f,
+    hdrGlow: Float = 0f,
     rawSensorGain: Bitmap? = null,
     rawSensorGainMax: Float = 2.9f
 ): Boolean {
@@ -4603,10 +5073,15 @@ internal fun writeUltraHdrJpeg(
             }
             alpha.setPixels(dst, 0, gw, 0, 0, gw, gh)
             gainContents = alpha
+            val glowAlpha = applyHdrGlow(alpha, hdrGlow)
+            if (glowAlpha != null) {
+                runCatching { gainContents?.recycle() }
+                gainContents = glowAlpha
+            }
             val ratioMax = (1f + (sourcePair.ratioMax.coerceIn(1f, 16f) - 1f) * strength)
                 .coerceIn(1f, 16f)
             val ratioMin = sourcePair.ratioMin.coerceIn(0.01f, ratioMax)
-            gm = android.graphics.Gainmap(alpha)
+            gm = android.graphics.Gainmap(checkNotNull(gainContents))
             gm.setRatioMin(ratioMin, ratioMin, ratioMin)
             gm.setRatioMax(ratioMax, ratioMax, ratioMax)
             gm.setGamma(
@@ -4655,8 +5130,13 @@ internal fun writeUltraHdrJpeg(
             }
             alpha.setPixels(dst, 0, gw, 0, 0, gw, gh)
             gainContents = alpha
+            val glowAlpha = applyHdrGlow(alpha, hdrGlow)
+            if (glowAlpha != null) {
+                runCatching { gainContents?.recycle() }
+                gainContents = glowAlpha
+            }
             val ratioMax = rawSensorGainMax.coerceIn(1.02f, 5f)
-            gm = android.graphics.Gainmap(alpha)
+            gm = android.graphics.Gainmap(checkNotNull(gainContents))
             gm.setRatioMin(1f, 1f, 1f)
             gm.setRatioMax(ratioMax, ratioMax, ratioMax)
             gm.setGamma(1f, 1f, 1f)
@@ -4717,7 +5197,12 @@ internal fun writeUltraHdrJpeg(
             }
             gainContents = Bitmap.createBitmap(gw, gh, Bitmap.Config.ALPHA_8)
             gainContents.setPixels(alpha, 0, gw, 0, 0, gw, gh)
-            gm = android.graphics.Gainmap(gainContents)
+            val glowAlpha = applyHdrGlow(checkNotNull(gainContents), hdrGlow)
+            if (glowAlpha != null) {
+                runCatching { gainContents?.recycle() }
+                gainContents = glowAlpha
+            }
+            gm = android.graphics.Gainmap(checkNotNull(gainContents))
             gm.setRatioMin(1f, 1f, 1f)
             gm.setRatioMax(maxBoost, maxBoost, maxBoost)
             gm.setGamma(1f, 1f, 1f)
@@ -4762,7 +5247,9 @@ internal fun writeUltraHdrJpeg(
 private fun buildHdrPreviewComposite(
     src: Bitmap,
     layer: HdrPreviewLayer,
-    grade: HdrGrade = HdrGrade()
+    grade: HdrGrade = HdrGrade(),
+    strength: Float = 1f,
+    highlight01: Float = 0.8f
 ): Bitmap? {
     if (src.isRecycled || src.width < 2 || src.height < 2) return null
     val previewScale = minOf(1f, 1024f / maxOf(src.width, src.height).toFloat())
@@ -4782,6 +5269,30 @@ private fun buildHdrPreviewComposite(
         val epsHdr = layer.epsHdr.coerceIn(0f, 1f)
         val logMin = kotlin.math.ln(ratioMin.toDouble())
         val logMax = kotlin.math.ln(ratioMax.toDouble())
+
+        // ① GPU 优先：整个「调色 + GainMap 合成」压成一个 AGSL 像素着色器，
+        //    离屏渲染回 Bitmap。滑杆拖动时 CPU 不再逐像素跑 70 万次 pow/exp，
+        //    这是编辑器 HDR 预览卡顿的主要来源。
+        HdrGpuCompositor.composite(
+            base, gain,
+            HdrGpuCompositor.CompositeParams(
+                shadow = grade.shadow,
+                color = grade.color,
+                warmth = grade.warmth,
+                logMin = logMin.toFloat(),
+                logMax = logMax.toFloat(),
+                gamma = gamma,
+                epsSdr = epsSdr,
+                epsHdr = epsHdr,
+                strength = strength,
+                highlight = highlight01
+            )
+        )?.let { gpuOut ->
+            // finally 里会回收 base/gain 的临时缩略图，这里直接返回 GPU 结果即可
+            return gpuOut
+        }
+
+        // ② 兜底：API 32 及以下（没有 AGSL / RuntimeShader）仍走原来的逐像素实现
         val out = IntArray(outW * outH)
         for (i in basePixels.indices) {
             val graded = applyHdrGradePixel(basePixels[i], grade)
@@ -4797,24 +5308,43 @@ private fun buildHdrPreviewComposite(
             }
             val logGain = logMin + (logMax - logMin) * gv.pow(gamma)
             val boost = kotlin.math.exp(logGain).toFloat()
-            val dr = ((r + epsSdr) * boost - epsHdr).coerceIn(0f, 4f)
-            val dg = ((g + epsSdr) * boost - epsHdr).coerceIn(0f, 4f)
-            val db = ((b + epsSdr) * boost - epsHdr).coerceIn(0f, 4f)
-            // 真正的 Gainmap 合成不是把增益无差别乘到每个像素：中间调硬乘会整片发白，
-            // 旧的 (1-r)*0.55 上限又会让亮部互相挤压，只剩“高光被拉高”。
-            // 现在按亮度分区释放增益，并用肩部滚降把 >1.0 的线性光收回 SDR；
-            // 输出增益限制在 0.94–1.32，并且只在高光区加一点饱和度，
-            // 让开关前后的差异更明显，同时保留中间调的层次。
+            // Gainmap 合成是把线性光乘上去；SDR 屏只能显示 0..1，所以这里必须真的做一次
+            // 「HDR → SDR 折叠」。旧实现把输出夹在 0.94–1.32，而增益只从 0.66 亮度起算，
+            // 结果抬的全是已经贴到 255 的高光，中间调一个像素都不动 —— 表现就是「滑了没反应」。
+            // 现在让中高调按亮度权重吃满增益，再用肩部把 >1 的部分收回来：
+            // 中间调被抬起来、高光平滑滚降，这才是 HDRfy / Glow HDR 那种质感。
             val baseLum = 0.2126f * r + 0.7152f * g + 0.0722f * b
-            val hdrLum = 0.2126f * dr + 0.7152f * dg + 0.0722f * db
-            val hdrWeight = smoothstep(0.08f, 0.78f, baseLum)
-            val displayLum = baseLum + (hdrShoulder(hdrLum) - baseLum).coerceAtLeast(0f) * hdrWeight
-            val scale = if (baseLum > 1e-5f) (displayLum / baseLum).coerceIn(0.94f, 1.32f) else 1f
-            // 高光多出来的能量也会让颜色更实；只在高光区轻微加饱和，阴影不染色。
-            val saturation = 1f + 0.08f * smoothstep(0.35f, 0.90f, baseLum)
-            val outR = (baseLum + (r - baseLum) * saturation * scale).coerceIn(0f, 1f)
-            val outG = (baseLum + (g - baseLum) * saturation * scale).coerceIn(0f, 1f)
-            val outB = (baseLum + (b - baseLum) * saturation * scale).coerceIn(0f, 1f)
+            // ① 中间调曝光提升：HDR 展开真正的观感来源。gainmap 只补高光，
+            //    滑杆要是只靠 gainmap，中间调（画面 80% 的像素）就完全不动。
+            // 只在中间调抬曝光：亮部（已经是 200 以上的地方）权重迅速收到 0，
+            // 否则白底/高调照片会被抬成一片死白。HDR 折叠对高光应该是「压」而不是「再抬」。
+            val liftWeight = smoothstep(0.02f, 0.42f, baseLum) *
+                (1f - smoothstep(0.45f, 0.82f, baseLum))
+            val exposure = 1f + (0.66f + 0.58f * highlight01) * strength * liftWeight
+            val gainWeight = 0.75f * smoothstep(0.02f, 0.45f, baseLum) *
+                (1f - 0.7f * smoothstep(0.55f, 0.95f, baseLum))
+            val expanded = (baseLum + epsSdr) * exposure * (1f + (boost - 1f) * gainWeight) - epsHdr
+            // ② 片式 tone map（ACES Filmic 近似）：HDR→SDR 标准的滚降方式，
+            //    高光平滑压到 1 以内不切白，比自写的指数肩部更接近 HDRfy 那种质感。
+            val folded = acesFilmic(expanded.coerceAtLeast(0f))
+            // ③ 补回反差，否则展开后的画面会发灰。
+            val toned = contrastCurve(folded, 0.40f * strength)
+            // 不加肩部压缩时画面不该变暗；这里给一个很小的下限，避免暗部被压死。
+            // 另外对已经很亮的像素（线性 0.72 ≈ sRGB 225 以上）只允许压、不允许再抬，
+            // 这样白底文档/高调天空不会因为滑杆变成一片死白。
+            val displayLum = if (baseLum > 0.72f) minOf(toned, baseLum)
+            else maxOf(baseLum * 0.90f, toned)
+            val scale = if (baseLum > 1e-5f) (displayLum / baseLum).coerceIn(0.90f, 2.40f) else 1f
+            // 已经很亮（接近纯白）的像素不再跟着抬：否则白底、高调天空会被推成一片死白。
+            val whiteGuard = smoothstep(0.78f, 0.96f, baseLum)
+            val effScale = scale + (1f - scale) * whiteGuard
+            // 高光多出来的能量也会让颜色更实；只在中高光加饱和，阴影不染色。
+            val saturation = 1f + 0.22f * strength * smoothstep(0.30f, 0.90f, baseLum)
+            // 关键：scale 必须乘在「亮度基底」上。之前写成 baseLum + (r-baseLum)*sat*scale，
+            // 灰色像素 r≈baseLum，括号里那项为 0，scale 直接被吃掉 —— 画面当然一点不动。
+            val outR = ((baseLum + (r - baseLum) * saturation) * effScale).coerceIn(0f, 1f)
+            val outG = ((baseLum + (g - baseLum) * saturation) * effScale).coerceIn(0f, 1f)
+            val outB = ((baseLum + (b - baseLum) * saturation) * effScale).coerceIn(0f, 1f)
             val rr = (linearToSrgb(outR) * 255f).roundToInt().coerceIn(0, 255)
             val gg = (linearToSrgb(outG) * 255f).roundToInt().coerceIn(0, 255)
             val bb = (linearToSrgb(outB) * 255f).roundToInt().coerceIn(0, 255)
@@ -4822,6 +5352,21 @@ private fun buildHdrPreviewComposite(
         }
         val result = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         result.setPixels(out, 0, outW, 0, 0, outW, outH)
+        // 诊断：合成到底把画面抬了多少（排查「滑了没反应」时用这一行就够）
+        runCatching {
+            var sumIn = 0L
+            var sumOut = 0L
+            for (i in basePixels.indices) {
+                sumIn += (((basePixels[i] shr 16) and 0xFF) + ((basePixels[i] shr 8) and 0xFF) + (basePixels[i] and 0xFF)) / 3
+                sumOut += (((out[i] shr 16) and 0xFF) + ((out[i] shr 8) and 0xFF) + (out[i] and 0xFF)) / 3
+            }
+            val n = basePixels.size.coerceAtLeast(1)
+            com.lutcamera.lutcamerapro.log.DoukLog.i(
+                "PhotoEditor", "HDR_COMPOSITE",
+                "px" to n, "meanIn" to (sumIn / n), "meanOut" to (sumOut / n),
+                "strength" to strength, "highlight" to highlight01
+            )
+        }
         result
     } catch (_: Throwable) {
         null
@@ -4837,11 +5382,35 @@ private fun srgbToLinear(v: Float): Float =
 private fun linearToSrgb(v: Float): Float =
     if (v <= 0.0031308f) v * 12.92f else 1.055f * v.pow(1f / 2.4f) - 0.055f
 
-/** HDR 预览的亮度肩部：0.48 以下保持原反差，0.48 以上平滑滚降，顶部封在 0.98 不切白。 */
-private fun hdrShoulder(linear: Float): Float {
+/** HDR 预览的亮度肩部：knee 以下保持原反差，以上平滑滚降，顶部封在 0.98 不切白。 */
+private fun hdrShoulder(linear: Float, knee: Float = 0.48f): Float {
     val x = linear.coerceAtLeast(0f)
-    if (x <= 0.48f) return x
-    return 0.48f + 0.50f * (1f - kotlin.math.exp(-(x - 0.48f) / 0.34f))
+    val k = knee.coerceIn(0.22f, 0.80f)
+    if (x <= k) return x
+    return k + (0.98f - k) * (1f - kotlin.math.exp(-(x - k) / 0.34f))
+}
+
+/** 以 0.45 为支点的轻微 S 曲线：amount=0 不动，amount 越大反差越强（不会切黑切白）。 */
+private fun contrastCurve(v: Float, amount: Float): Float {
+    if (amount <= 0.01f) return v
+    val t = v.coerceIn(0f, 1f)
+    val a = amount.coerceIn(0.0f, 1.0f)
+    val pivot = 0.45f
+    val y = pivot + (t - pivot) * (1f + 0.55f * a)
+    return y.coerceIn(0f, 1f)
+}
+
+/**
+ * ACES Filmic 近似曲线（Krzysztof Narkowicz 的经典拟合）：
+ * 输入线性亮度，输出 0..1，高光平滑滚降，中间调带胶片式反差。
+ * 这是 HDR → SDR 显示变换里最常用的一条，比自写指数肩部更接近 HDRfy 的观感。
+ */
+private fun acesFilmic(x: Float): Float {
+    val v = x.coerceAtLeast(0f)
+    val num = v * (2.51f * v + 0.03f)
+    val den = v * (2.43f * v + 0.59f) + 0.14f
+    if (den <= 1e-6f) return 0f
+    return (num / den).coerceIn(0f, 1f)
 }
 
 private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
@@ -4854,6 +5423,215 @@ private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
  * 从 18% 亮度开始按比例抬升，让中高调一起参与 HDR 预览；不是只把最亮的高光拉白。
  * 这是可视化预览，不参与导出；导出仍走 writeUltraHdrJpeg 的真实增益图。
  */
+/**
+ * HDR 高光柔光（Glow / bloom）：只用增益图里「已经够亮」的部分做低频扩散，
+ * 再把光晕叠加回去。暗部与中间调的增益保持 0，所以画面不会整体发灰，
+ * 这一点是 HDRfy / Glow HDR 这类 App 的观感来源：亮部发光，其余不动。
+ *
+ * 输入是 GainMap（ALPHA_8 或灰度 ARGB），输出同尺寸的新增益图；amount 为 0 时返回 null。
+ */
+private fun applyHdrGlow(gain: Bitmap, amount01: Float): Bitmap? {
+    val amount = amount01.coerceIn(0f, 1f)
+    if (amount <= 0.02f || gain.isRecycled || gain.width < 8 || gain.height < 8) return null
+    val w = gain.width
+    val h = gain.height
+    val alphaOnly = gain.config == Bitmap.Config.ALPHA_8
+    val src = IntArray(w * h)
+    gain.getPixels(src, 0, w, 0, 0, w, h)
+    fun levelOf(p: Int): Int = if (alphaOnly) {
+        (p ushr 24) and 0xFF
+    } else {
+        (((p shr 16) and 0xFF) + ((p shr 8) and 0xFF) + (p and 0xFF)) / 3
+    }
+
+    // 1) 只留高光：阈值以下直接归零，阈值以上按余量归一化，保证光晕只出现在亮处。
+    val floor = 96
+    val mask = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val maskPx = IntArray(w * h) { i ->
+        val l = levelOf(src[i])
+        val a = if (l > floor) (l - floor) * 255 / (255 - floor) else 0
+        (0xFF shl 24) or (a shl 16) or (a shl 8) or a
+    }
+    mask.setPixels(maskPx, 0, w, 0, 0, w, h)
+
+    // 2) 降到长边 192 再做三次盒式模糊：GainMap 本身是低频亮度层，这个尺度足够柔和，
+    //    且 200 万像素级别的图也能在几十毫秒内算完，拖动滑块不卡。
+    val scale = 192f / maxOf(w, h).toFloat()
+    val mw = (w * scale).toInt().coerceAtLeast(8)
+    val mh = (h * scale).toInt().coerceAtLeast(8)
+    var small: Bitmap = Bitmap.createScaledBitmap(mask, mw, mh, true)
+    mask.recycle()
+    val radius = (maxOf(mw, mh) / 48).coerceIn(2, 12)
+    repeat(3) {
+        val next = boxBlur(small, radius)
+        small.recycle()
+        small = next
+    }
+    val halo = Bitmap.createScaledBitmap(small, w, h, true)
+    small.recycle()
+    val haloPx = IntArray(w * h)
+    halo.getPixels(haloPx, 0, w, 0, 0, w, h)
+    halo.recycle()
+
+    // 3) 叠加时按 (255 - 原增益) 留余量：越亮的地方可加的空间越小，不会溢出成纯白。
+    //    Glow 的量级按「HDR 屏上能不能看出光」定：haloV 经过归一化和小尺度模糊后
+    //    只剩几十，按余量再打折就等于没加，所以这里直接乘 0.85 放大到真正的头部亮度。
+    val out = IntArray(w * h)
+    for (i in src.indices) {
+        val base = levelOf(src[i])
+        val haloV = (haloPx[i] shr 16) and 0xFF
+        val headroom = (255 - base) / 255f
+        val add = haloV.toFloat() * amount * 0.85f * (0.35f + 0.65f * headroom)
+        val nv = (base + add).toInt().coerceIn(0, 255)
+        out[i] = if (alphaOnly) {
+            nv shl 24
+        } else {
+            val p = src[i]
+            (p and 0xFF000000.toInt()) or (nv shl 16) or (nv shl 8) or nv
+        }
+    }
+    val result = Bitmap.createBitmap(w, h, gain.config ?: Bitmap.Config.ARGB_8888)
+    result.setPixels(out, 0, w, 0, 0, w, h)
+    return result
+}
+
+/**
+ * 预览用的屏幕空间高光扩散（bloom / halation）。真 HDR 屏上「亮部比白更亮」的那点余量，
+ * 压进 SDR 预览后落在肩部滚降里，肉眼几乎看不见，所以单独在合成图上补一层低频光晕：
+ * 只取亮度 >190 的区域（平方软化，避免硬边），做两次盒式模糊，再按 amount 加回原图。
+ * 这是 HDRfy / Glow HDR 一眼能看出来的部分——亮部往外发光，暗部与中间调不动。
+ */
+private fun applyHdrBloom(src: Bitmap, amount01: Float): Bitmap? {
+    val amount = amount01.coerceIn(0f, 1f)
+    if (amount <= 0.02f || src.isRecycled || src.width < 16 || src.height < 16) return null
+    val w = src.width
+    val h = src.height
+    val scale = 384f / maxOf(w, h).toFloat()
+    if (scale >= 0.99f) return null
+    val mw = (w * scale).toInt().coerceAtLeast(8)
+    val mh = (h * scale).toInt().coerceAtLeast(8)
+    val small = Bitmap.createScaledBitmap(src, mw, mh, true)
+    val px = IntArray(mw * mh)
+    small.getPixels(px, 0, mw, 0, 0, mw, mh)
+    if (small !== src) small.recycle()
+    val mask = Bitmap.createBitmap(mw, mh, Bitmap.Config.ARGB_8888)
+    val maskPx = IntArray(mw * mh) { i ->
+        val p = px[i]
+        val l = ((p shr 16) and 0xFF) * 0.299f + ((p shr 8) and 0xFF) * 0.587f +
+            (p and 0xFF) * 0.114f
+        val t = ((l - 208f) / 44f).coerceIn(0f, 1f)
+        val a = (t * t * 255f).toInt().coerceIn(0, 255)
+        (0xFF shl 24) or (a shl 16) or (a shl 8) or a
+    }
+    mask.setPixels(maskPx, 0, mw, 0, 0, mw, mh)
+    var blur: Bitmap = mask
+    repeat(2) {
+        val next = boxBlur(blur, (maxOf(mw, mh) / 52).coerceIn(2, 14))
+        blur.recycle()
+        blur = next
+    }
+    val halo = Bitmap.createScaledBitmap(blur, w, h, true)
+    blur.recycle()
+    val haloPx = IntArray(w * h)
+    halo.getPixels(haloPx, 0, w, 0, 0, w, h)
+    halo.recycle()
+    val srcPx = IntArray(w * h)
+    src.getPixels(srcPx, 0, w, 0, 0, w, h)
+    val outPx = IntArray(w * h) { i ->
+        val p = srcPx[i]
+        val add = ((haloPx[i] shr 16) and 0xFF) * amount * 1.15f
+        val r = (((p shr 16) and 0xFF) + add).toInt().coerceIn(0, 255)
+        val g = (((p shr 8) and 0xFF) + add).toInt().coerceIn(0, 255)
+        val b = ((p and 0xFF) + add).toInt().coerceIn(0, 255)
+        (p and 0xFF000000.toInt()) or (r shl 16) or (g shl 8) or b
+    }
+    val out = Bitmap.createBitmap(w, h, src.config ?: Bitmap.Config.ARGB_8888)
+    out.setPixels(outPx, 0, w, 0, 0, w, h)
+    return out
+}
+
+/** 单通道盒式模糊（分离式滑动窗口，O(w*h)），只关心亮度，alpha 一律写满。 */
+private fun boxBlur(src: Bitmap, radius: Int): Bitmap {
+    val w = src.width
+    val h = src.height
+    val px = IntArray(w * h)
+    src.getPixels(px, 0, w, 0, 0, w, h)
+    val gray = IntArray(w * h) { (px[it] shr 16) and 0xFF }
+    val tmp = IntArray(w * h)
+    val win = radius * 2 + 1
+
+    for (y in 0 until h) {
+        val row = y * w
+        var sum = 0
+        for (k in -radius..radius) sum += gray[row + k.coerceIn(0, w - 1)]
+        for (x in 0 until w) {
+            tmp[row + x] = sum / win
+            sum += gray[row + (x + radius + 1).coerceIn(0, w - 1)] -
+                gray[row + (x - radius).coerceIn(0, w - 1)]
+        }
+    }
+    for (x in 0 until w) {
+        var sum = 0
+        for (k in -radius..radius) sum += tmp[k.coerceIn(0, h - 1) * w + x]
+        for (y in 0 until h) {
+            val v = sum / win
+            px[y * w + x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            sum += tmp[(y + radius + 1).coerceIn(0, h - 1) * w + x] -
+                tmp[(y - radius).coerceIn(0, h - 1) * w + x]
+        }
+    }
+    val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    out.setPixels(px, 0, w, 0, 0, w, h)
+    return out
+}
+/**
+ * 生成 6 张 HDR 预设缩略图。
+ *
+ * 用同一张编辑底图缩到 96px（长边）后，按每个预设自己的「强度 / 层次 / 暗部 /
+ * 色彩 / 色温」跑一遍 [buildHdrPreviewGain] + [buildHdrPreviewComposite]，
+ * 这样点之前就能看到该预设在这张片子上是什么效果。6 张 96px 的逐像素计算
+ * 总量不到一张 420px 预览的四分之一，放在 `Dispatchers.Default` 上可以忽略。
+ */
+private fun buildHdrPresetThumbs(src: Bitmap, side: Int = 96): Map<String, ImageBitmap> {
+    if (src.isRecycled || src.width < 2 || src.height < 2) return emptyMap()
+    val scale = minOf(1f, side.toFloat() / maxOf(src.width, src.height).toFloat())
+    val w = (src.width * scale).toInt().coerceAtLeast(2)
+    val h = (src.height * scale).toInt().coerceAtLeast(2)
+    val small = Bitmap.createScaledBitmap(src, w, h, true)
+    val out = HashMap<String, ImageBitmap>(HdrPresets.size)
+    try {
+        HdrPresets.forEach { preset ->
+            val strength = (preset.strength / 100f).coerceIn(0f, 1f)
+            val highlight01 = (preset.highlight / 100f).coerceIn(0f, 1f)
+            val maxBoost = 1f + 2.4f * strength
+            val highlightStart = (0.36f + 0.50f * highlight01).coerceIn(0.30f, 0.90f)
+            // 每个预设各用一份独立底图：合成/增益内部会把尺寸不变的入参直接归还，
+            // 共用同一张 96px 底图会在第一张之后就被回收，后面的缩略图就只剩空白。
+            val work = small.copy(Bitmap.Config.ARGB_8888, false) ?: return@forEach
+            val gain = buildHdrPreviewGain(work, maxBoost, highlightStart) ?: run {
+                runCatching { work.recycle() }
+                return@forEach
+            }
+            val composed = try {
+                buildHdrPreviewComposite(
+                    src = work,
+                    layer = HdrPreviewLayer(gain, maxBoost),
+                    grade = HdrGrade(shadow = preset.shadow, color = preset.color, warmth = preset.warmth),
+                    strength = strength,
+                    highlight01 = highlight01
+                )
+            } finally {
+                runCatching { gain.recycle() }
+                runCatching { if (!work.isRecycled) work.recycle() }
+            }
+            if (composed != null) out[preset.label] = composed.asImageBitmap()
+        }
+    } finally {
+        runCatching { small.recycle() }
+    }
+    return out
+}
+
 private fun buildHdrPreviewGain(
     src: Bitmap,
     maxBoost: Float = 2.9f,
@@ -4924,6 +5702,11 @@ private fun hdrTone(src: Bitmap): Bitmap {
  */
 private fun applyHdrGrade(src: Bitmap, grade: HdrGrade): Bitmap {
     if (grade.isNeutral || src.isRecycled) return src
+    // 导出前的全分辨率调色同样交给 GPU（AGSL）；老系统或渲染失败时回落到 CPU 循环
+    HdrGpuCompositor.grade(
+        src,
+        HdrGpuCompositor.GradeParams(grade.shadow, grade.color, grade.warmth)
+    )?.let { return it }
     val out = if (src.isMutable && src.config == Bitmap.Config.ARGB_8888) {
         src
     } else {

@@ -25,7 +25,33 @@ set(LIBRAW_UNINSTALL_TARGET OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/libraw-cmake"
                  "${CMAKE_CURRENT_BINARY_DIR}/libraw-build")
 
-add_library(lianjingraw SHARED raw_jni.cpp)
+# ---------------------------------------------------------------------------
+# Google libultrahdr（Ultra HDR 参考编解码器，v2.0.2，随源码内置）
+# 依赖的 libjpeg-turbo 已按 arm64-v8a 预编译在 vendor/jpeg-prefix，构建不再联网。
+# ---------------------------------------------------------------------------
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(UHDR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_JAVA OFF CACHE BOOL "" FORCE)
+set(UHDR_ENABLE_HEIF OFF CACHE BOOL "" FORCE)
+set(UHDR_ENABLE_GLES OFF CACHE BOOL "" FORCE)
+set(UHDR_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(UHDR_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+set(UHDR_BUILD_DEPS OFF CACHE BOOL "" FORCE)
+# 同时写 ISO 21496-1 与 XMP hdrgm 两个包：Android 系统 Gainmap 解码走 XMP，
+# Chrome / iOS / Google Photos 也认 XMP，兼容面最大（解码时库优先 ISO）
+set(UHDR_WRITE_XMP ON CACHE BOOL "" FORCE)
+set(UHDR_WRITE_ISO ON CACHE BOOL "" FORCE)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/vendor/libultrahdr"
+                 "${CMAKE_CURRENT_BINARY_DIR}/libultrahdr-build")
+
+add_library(lianjingraw SHARED raw_jni.cpp ultrahdr_jni.cpp)
+
+target_include_directories(lianjingraw PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/jpeg-prefix/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/libultrahdr")
 
 target_compile_options(lianjingraw PRIVATE
         -O2
@@ -37,6 +63,9 @@ target_compile_options(lianjingraw PRIVATE
 
 target_link_libraries(lianjingraw PRIVATE
         libraw::libraw
+        core
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/jpeg-prefix/lib/libjpeg.a"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/jpeg-prefix/lib/libturbojpeg.a"
         jnigraphics
         log
         android)

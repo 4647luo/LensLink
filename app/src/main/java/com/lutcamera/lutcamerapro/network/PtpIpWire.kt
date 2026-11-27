@@ -11,7 +11,10 @@ import java.nio.ByteOrder
 
 /** PTP/IP packet framing. Offsets include the eight-byte IP header, not a USB container. */
 internal object PtpIpWire {
+    /** 整段数据（多包累加）的上限，按相机样张/视频预留。 */
     const val MAX_DATA = 128 * 1024 * 1024
+    /** 单帧 PTP/IP 包头声明长度上限：控制/事件/元数据帧都远小于此，异常大包直接拒绝，避免按声明长度一次性分配。 */
+    private const val PACKET_MAX = 16 * 1024 * 1024
     fun le(bytes: ByteArray): ByteBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
     fun packet(type: Int, payload: ByteArray = byteArrayOf()): ByteArray =
         ByteBuffer.allocate(8 + payload.size).order(ByteOrder.LITTLE_ENDIAN)
@@ -32,7 +35,7 @@ internal object PtpIpWire {
         val header = ByteArray(8)
         fully(header, 0, 8)
         val length = le(header).int
-        if (length !in 8..MAX_DATA) { trace("RX_INVALID_HEADER", header); throw IOException("Invalid PTP/IP packet length: $length") }
+        if (length !in 8..PACKET_MAX) { trace("RX_INVALID_HEADER", header); throw IOException("Invalid PTP/IP packet length: $length") }
         return ByteArray(length).also {
             header.copyInto(it)
             fully(it, 8, length)

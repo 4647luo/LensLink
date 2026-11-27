@@ -17,7 +17,7 @@
 -keep class org.acra.** { *; }
 -keep class com.lutcamera.lutcamerapro.BuildConfig { *; }
 
-# Haze 1.2.0 是 Kotlin 2.1 metadata，当前项目 Kotlin 1.9 仅读取不反射；保留公开 API 避免 Compose 调用点被裁。
+# Haze 1.2.0 是 Kotlin 2.1 metadata，仅读取不反射；保留公开 API 避免 Compose 调用点被裁。
 -keep class dev.chrisbanes.haze.** { *; }
 
 # 保留行号，Release 崩溃仍能定位到具体行；不保留局部变量名。

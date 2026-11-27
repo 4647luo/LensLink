@@ -51,6 +51,10 @@
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="s" />
 
+    <!-- 监看音频电平：只做手机麦克风参考电平，不录制、不上传 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- 40MP 原图与 RAW/HDR 解码需要更大堆；缩略图与监看链路已做 LRU 缓存和位图复用，避免常驻高占用。 -->
     <application
         android:name=".DoukApplication"
         android:usesCleartextTraffic="false"

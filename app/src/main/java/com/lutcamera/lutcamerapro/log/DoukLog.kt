@@ -2,10 +2,17 @@ package com.lutcamera.lutcamerapro.log
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.StatFs
 import android.provider.MediaStore
+import com.lutcamera.lutcamerapro.BuildConfig
 import com.lutcamera.lutcamerapro.log.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -15,6 +22,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.LinkedBlockingQueue
 
 /**
@@ -84,9 +92,16 @@ object DoukLog {
                 buildString {
                     appendLine("连镜会话日志")
                     appendLine("开始时间: ${stampFormat.get().format(Date())}")
-                    appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL}")
-                    appendLine("系统: Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
-                    appendLine("包名: ${app.packageName}")
+                    appendLine("应用: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) ${BuildConfig.BUILD_TYPE}")
+                    appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL} / ${Build.PRODUCT}")
+                    appendLine("系统: Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}) / ${Build.SUPPORTED_ABIS.joinToString()}")
+                    appendLine("屏幕: ${app.resources.displayMetrics.widthPixels}x${app.resources.displayMetrics.heightPixels} @ ${app.resources.displayMetrics.densityDpi}dpi")
+                    appendLine("时区: ${TimeZone.getDefault().id} 语言: ${Locale.getDefault().toLanguageTag()}")
+                    appendLine("进程: pid=${android.os.Process.myPid()} 启动=${android.os.SystemClock.elapsedRealtime() / 1000}s")
+                    appendLine("内存: ${memoryLine()}")
+                    appendLine("存储: ${storageLine(app)}")
+                    appendLine("网络: ${networkLine(app)}")
+                    appendLine("电池: ${batteryLine(app)}")
                     appendLine("格式: 时间 级别/标签: 事件 key=value")
                     appendLine("========================================")
                 }
@@ -124,6 +139,102 @@ object DoukLog {
         }
         scheduleVersion()
     }
+
+    /** 分隔一段流程，长日志里靠它快速定位阶段。 */
+    fun section(title: String) = write(Level.INFO, "Session", "---- $title ----", emptyArray())
+
+    /** 记录异常：类名 + message + 前 8 帧，够看清是哪个调用链炸的。 */
+    fun eThrow(tag: String, event: String, tr: Throwable, vararg fields: Pair<String, Any?>) {
+        val frames = tr.stackTrace.take(8).joinToString(" <- ") {
+            "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
+        }
+        write(
+            Level.ERROR,
+            tag,
+            event,
+            arrayOf(
+                *fields,
+                "err" to "${tr.javaClass.simpleName}: ${tr.message}",
+                "stack" to frames
+            )
+        )
+    }
+
+    /** 计时起点，配合 [end] 记录一段操作耗时。 */
+    fun begin(): Long = android.os.SystemClock.elapsedRealtime()
+
+    fun end(tag: String, event: String, startedAt: Long, vararg fields: Pair<String, Any?>) {
+        write(
+            Level.INFO,
+            tag,
+            event,
+            arrayOf(*fields, "ms" to (android.os.SystemClock.elapsedRealtime() - startedAt))
+        )
+    }
+
+    /**
+     * 未捕获异常的兜底：队列可能来不及落盘，这里同步写一份再交回系统默认处理。
+     * ACRA 负责堆栈和 logcat，这里只保证会话日志里也有完整一段。
+     */
+    fun installCrashHandler() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching {
+                val line = buildString {
+                    append(timeFormat.get().format(Date()))
+                    append(" E/Crash: UNCAUGHT thread=").append(thread.name)
+                    append(' ').append(error.javaClass.name).append(": ").append(error.message)
+                    append('\n').append(android.util.Log.getStackTraceString(error))
+                }
+                writeSync(line)
+            }
+            previous?.uncaughtException(thread, error)
+        }
+    }
+
+    /** 同步写入一行，只给崩溃路径用，正常日志仍走队列。 */
+    private fun writeSync(line: String) {
+        val file = sessionFile ?: return
+        runCatching {
+            val parent = file.parentFile
+            if (parent != null && !parent.exists()) parent.mkdirs()
+            file.appendText(line + "\n")
+        }
+        runCatching { XLog.d(line) }
+    }
+
+    private fun mb(bytes: Long): Long = bytes / (1024 * 1024)
+
+    private fun memoryLine(): String {
+        val rt = Runtime.getRuntime()
+        return "heap ${mb(rt.totalMemory() - rt.freeMemory())}/${mb(rt.maxMemory())}MB used"
+    }
+
+    private fun storageLine(context: Context): String =
+        "free ${mb(runCatching { StatFs(context.filesDir.path).availableBytes }.getOrDefault(0L))}MB"
+
+    private fun networkLine(context: Context): String = runCatching {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return@runCatching "unknown"
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        when {
+            caps == null -> "offline"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            else -> "other"
+        }
+    }.getOrDefault("unknown")
+
+    private fun batteryLine(context: Context): String = runCatching {
+        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+        val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
+        val charging = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ==
+            BatteryManager.BATTERY_STATUS_CHARGING
+        "$pct% ${if (charging) "charging" else "battery"}"
+    }.getOrDefault("unknown")
 
     private fun startWriter() {
         if (writerThread != null) return

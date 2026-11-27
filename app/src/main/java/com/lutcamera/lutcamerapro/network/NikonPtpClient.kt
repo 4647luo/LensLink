@@ -32,6 +32,25 @@ class NikonPtpClient {
         private const val TAG = "NikonPtpClient"
         const val DEFAULT_NIKON_AP_IP = "192.168.1.1"
         const val PTP_PORT = 15740
+        /**
+         * 从发起连接到握手完成的硬预算（毫秒）。参考尼康官方 App 的节奏：点一下必须在十几秒内
+         * 拿到「成功」或明确的「失败」，不允许界面一直停在「正在连接」。超过预算按超时失败处理。
+         */
+        const val CONNECT_BUDGET_MS = 12_000L
+        /**
+         * 网络已经通了之后的预算（毫秒）。二代机（Z6II/Z7II/Z5 这一代）在 PTP/IP 初始化后
+         * 会在机身上弹「是否允许连接 / 配对确认」，等的是用户走过去手动点 OK，
+         * 十几秒根本不够，用同一个 12 秒窗口会把「正在等用户确认」误判成「相机没应答」。
+         */
+        const val PAIRING_BUDGET_MS = 90_000L
+        /** 握手 ACK 单次读取上限：比快速失败窗口长，留给机身屏幕确认的时间。 */
+        private const val HANDSHAKE_CONFIRM_MS = 45_000L
+        /** AP 直连时机身单客户端槽回收慢，命令通道建链留 4.5 秒，不给到 8 秒。 */
+        private const val SOCKET_CONNECT_TIMEOUT_MS = 4_500
+        private const val EVENT_CONNECT_TIMEOUT_MS = 2_500
+        private const val HANDSHAKE_SO_TIMEOUT_MS = 4_000
+        /** 单条命令的默认 socket 超时，也是 probeCommandAlive 结束后恢复的值。 */
+        private const val DEFAULT_OP_TIMEOUT_MS = 12_000L
         private val OP_NIKON_DEVICE_READY = 0x90C8.toShort()
         val defaultInstance = NikonPtpClient()
     }
@@ -55,7 +74,18 @@ class NikonPtpClient {
         fun onTransferStatus(message: String) {}
         fun onLiveViewFrame(bitmap: Bitmap) {}
     }
-    private class Connection(val command: Socket, val events: Socket, val trace: NikonTrace?) {
+    private class Connection(
+        val command: Socket,
+        events: Socket,
+        val trace: NikonTrace?,
+        /** 建链时用的网络与目标地址，事件通道断了要用同样的路由重开。 */
+        val network: Network? = null,
+        val remote: InetSocketAddress? = null
+    ) {
+        /** 事件通道可被重开替换，读线程每轮都重新取。 */
+        @Volatile var events: Socket = events
+        /** 相机在 Init_Command_Ack 里给的会话号，重开事件通道要带上同一个。 */
+        @Volatile var sessionId: Int = 0
         val label = UUID.randomUUID().toString().take(8)
         fun record(channel: String): (String, ByteArray) -> Unit = { direction, bytes -> trace?.packet("$label/$channel", direction, bytes) }
         fun send(socket: Socket, channel: String, bytes: ByteArray) {
@@ -190,6 +220,24 @@ class NikonPtpClient {
         return recovered.toString().take(8)
     }
 
+    /**
+     * 换一个全新的配对身份，等于让相机认为「这台手机从没连过」。
+     *
+     * 相机回 InitFail 1 表示机身不认当前 GUID（重装、清数据或换过配置之后最常见）。
+     * 拿不到旧日志时，这条路径比反复重试有效：新 GUID 会让机身重新弹一次配对确认。
+     */
+    fun resetPairingIdentity(context: Context): String {
+        if (connection != null) throw IOException("请先断开相机连接")
+        val saved = context.applicationContext.getSharedPreferences("nikon_transport", Context.MODE_PRIVATE)
+        val fresh = UUID.randomUUID()
+        saved.edit().putString("hostGuid", fresh.toString()).apply()
+        if (saved.getString("hostGuid", null) != fresh.toString()) throw IOException("新配对身份未能保存")
+        hostGuid = fresh
+        recorder(context).note("PAIRING_IDENTITY_RESET fingerprint=${fresh.toString().take(8)}")
+        DoukLog.w("NikonPtp", "IDENTITY_RESET", "fingerprint" to fresh.toString().take(8))
+        return fresh.toString().take(8)
+    }
+
     fun startNikonWiWatch(context: Context? = null, cameraIp: String = DEFAULT_NIKON_AP_IP,
         listener: NikonEventListener? = null, mode: ConnectionMode = ConnectionMode.CAMERA_AP) {
         stopNikonWatch()
@@ -206,6 +254,20 @@ class NikonPtpClient {
         DoukLog.i("NikonPtp", "IDENTITY", "hostGuid" to hostGuid.toString(), "mode" to mode, "target" to cameraIp)
         watchJob = scope.launch {
             var own: Connection? = null
+            // 两段预算：前段只负责「网络能不能通」（12 秒快速失败）；一旦命令端口连上，
+            // 说明问题不在网络上，剩下的握手要留给用户在相机屏幕上点确认，换成 90 秒窗口。
+            var budgetStartedAt = SystemClock.elapsedRealtime()
+            var budgetMs = CONNECT_BUDGET_MS
+            fun remainingBudgetMs(): Long = budgetMs - (SystemClock.elapsedRealtime() - budgetStartedAt)
+            fun ensureBudget(stage: String) {
+                if (remainingBudgetMs() <= 0L) throw SocketTimeoutException(
+                    "连接超时：$stage 阶段用完了 ${budgetMs / 1000} 秒预算，相机没有应答"
+                )
+            }
+            fun budgetCap(defaultMs: Long): Long {
+                val left = remainingBudgetMs()
+                return if (left <= 0L) 1L else minOf(defaultMs, left)
+            }
             // VPN 存在时，进程默认网络会被 tun 接管；socket 级绑定在部分 ROM 上会被忽略。
             // 这里把「进程默认网络 = 相机 Wi-Fi」保持到握手完成，再恢复，覆盖建 socket 和 connect 两段。
             val cm = context?.applicationContext
@@ -270,7 +332,8 @@ class NikonPtpClient {
                 if (route.source == CameraRouteResolver.Route.Source.REQUESTED_NETWORK) {
                     DoukLog.i("NikonPtp", "NET_REQUESTED", "target" to targetIp, "granted" to true)
                 }
-                val c = Connection(commandSocket, eventSocket, trace)
+                val c = Connection(commandSocket, eventSocket, trace, route.network,
+                    InetSocketAddress(address, PTP_PORT))
                 own = c
                 synchronized(lifecycle) {
                     if (generation != token) { c.close(); throw CancellationException() }
@@ -280,17 +343,35 @@ class NikonPtpClient {
                 listener?.onLog("连接方式 $mode，目标 $targetIp；${if (route.bound) "使用 Wi-Fi 路由" else "使用系统本地路由"}")
                 trace?.note("${c.label} ROUTE ${route.describe()} mode=$mode target=$address:$PTP_PORT")
                 c.command.tcpNoDelay = true
-                c.command.soTimeout = 12000
-                c.command.connect(InetSocketAddress(address, PTP_PORT), 8000)
+                ensureBudget("建立命令通道")
+                c.command.soTimeout = budgetCap(HANDSHAKE_SO_TIMEOUT_MS.toLong()).toInt()
+                c.command.connect(InetSocketAddress(address, PTP_PORT), budgetCap(SOCKET_CONNECT_TIMEOUT_MS.toLong()).toInt())
                 trace?.note("${c.label} TCP_COMMAND_CONNECTED local=${c.command.localSocketAddress} remote=${c.command.remoteSocketAddress}")
                 DoukLog.d("NikonPtp", "TCP_CONNECTED", "local" to c.command.localSocketAddress, "remote" to c.command.remoteSocketAddress)
-                _connectionStage.value = "设备可达，正在握手"
+                // 端口都通了，网络这一层已经没问题：把预算切到「等用户确认」的长窗口。
+                budgetMs = PAIRING_BUDGET_MS
+                budgetStartedAt = SystemClock.elapsedRealtime()
+                _connectionStage.value = "已连上相机端口，等机身确认（请看相机屏幕）"
+                DoukLog.i("NikonPtp", "BUDGET_SWITCH", "stage" to "pairing", "budgetMs" to PAIRING_BUDGET_MS)
                 val name = "LutCameraPro\u0000".toByteArray(Charsets.UTF_16LE)
                 val init = ByteBuffer.allocate(16 + name.size + 4).order(ByteOrder.LITTLE_ENDIAN)
                     .putLong(hostGuid.mostSignificantBits).putLong(hostGuid.leastSignificantBits)
                     .put(name).putInt(0x10000).array()
                 c.send(c.command, "command", PtpIpWire.packet(1, init))
-                val ack = PtpIpWire.read(c.command.inputStream, trace = c.record("command"))
+                // 最容易误判的一步：二代机收到 Init 后不会立刻回 ACK，而是在机身屏幕上
+                // 弹出「连接/配对确认」等人点。旧实现只等 4 秒，等于永远等不到。
+                c.command.soTimeout = budgetCap(HANDSHAKE_CONFIRM_MS).toInt()
+                val ack = try {
+                    PtpIpWire.read(c.command.inputStream, trace = c.record("command"))
+                } catch (e: SocketTimeoutException) {
+                    DoukLog.e("NikonPtp", "PAIRING_WAIT_TIMEOUT", "target" to "$targetIp:$PTP_PORT",
+                        "waitMs" to HANDSHAKE_CONFIRM_MS, "hint" to "camera screen confirmation")
+                    throw IOException(
+                        "相机端口通了，但机身一直没有回握手确认。请看一眼相机屏幕：应该出现「连接确认 / 配对」提示，" +
+                        "在相机上点 OK 或允许即可。如果屏幕没有任何提示，请在相机 Network 菜单确认：" +
+                        "Connect to smart device › Wi-Fi connection，出现 Connection type 选项时选 Camera control（不要 Picture transfer），再回来重试。"
+                    )
+                }
                 if (PtpIpWire.type(ack) == 5) {
                     val reason = if (ack.size >= 12) PtpIpWire.le(ack).getInt(8) else -1
                     // 相机端屏幕上那句「连接失败」就对应这里：机身主动回了 InitFail
@@ -302,17 +383,19 @@ class NikonPtpClient {
                 }
                 if (PtpIpWire.type(ack) != 2 || ack.size < 28) throw IOException("相机握手回复无效")
                 val id = PtpIpWire.le(ack).getInt(8)
+                c.sessionId = id
                 cameraIdentity = ack.copyOfRange(12, 28).joinToString("") { "%02x".format(it) }
                 DoukLog.i("NikonPtp", "HANDSHAKE_ACK", "identity" to cameraIdentity.take(12), "sessionId" to id)
                 c.events.tcpNoDelay = true
-                c.events.soTimeout = 5000
-                c.events.connect(InetSocketAddress(address, PTP_PORT), 4000)
+                c.events.soTimeout = budgetCap(HANDSHAKE_SO_TIMEOUT_MS.toLong()).toInt()
+                c.events.connect(InetSocketAddress(address, PTP_PORT), budgetCap(EVENT_CONNECT_TIMEOUT_MS.toLong()).toInt())
                 trace?.note("${c.label} TCP_EVENT_CONNECTED local=${c.events.localSocketAddress} remote=${c.events.remoteSocketAddress}")
                 c.send(c.events, "event", PtpIpWire.packet(3, ByteBuffer.allocate(4)
                     .order(ByteOrder.LITTLE_ENDIAN).putInt(id).array()))
                 if (PtpIpWire.type(PtpIpWire.read(c.events.inputStream, trace = c.record("event"))) != 4)
                     throw IOException("事件通道握手失败")
                 c.events.soTimeout = 0 // An idle event channel is normal; close() interrupts it.
+                ensureBudget("打开会话")
                 val opened = operation(0x1002, intArrayOf(1), expected = c)
                 DoukLog.i("NikonPtp", "OPEN_SESSION", "code" to "0x%04X".format(opened.response.code))
                 if (opened.response.code != 0x2001) throw CameraResponse(opened.response.code)
@@ -432,17 +515,25 @@ class NikonPtpClient {
                             // 包从别的网卡发出去了（例如 VPN 的 172.17.x.x），相机根本收不到
                             val wentOffSubnet = usedLocal != null && onCameraNet == null
                             val vpn = vpnActive(context)
+                            // 失败原因按「能不能到相机网段 → 端口通不通 → 握手有没有应答」三层归类，
+                            // 每层都给下一步动作。界面直接显示这一句，用户不用翻日志就知道该做什么。
                             val friendly = when {
-                                e is java.net.SocketTimeoutException ->
-                                    "相机端口可达但 PTP/IP 握手无响应：请先在相机上断开 SnapBridge/旧设备，重新进入「连接至智能设备」后再试"
+                                // 本机热点还在跑：相机热点会被系统收回，先说这个，免得用户以为网段填错
+                                onCameraNet == null && SoftApDetector.describe(context) != null ->
+                                    "本机「个人热点」还开着（${SoftApDetector.describe(context)}），它和相机热点抢同一张 Wi‑Fi 网卡，" +
+                                        "加入的相机热点会被系统收回。请先在 设置 › 连接与共享 › 个人热点 关闭热点，再点重试"
+                                onCameraNet == null && e is java.net.ConnectException ->
+                                    "手机不在相机网段（本机 ${CameraLanProbe.localNetworkSummary()}，相机 $cameraIp）。先在系统 WLAN 里连上相机显示的热点，出现「无法访问互联网」提示时选择保持连接，再点重试"
+                                onCameraNet == null && e is java.net.SocketTimeoutException ->
+                                    "手机不在相机网段（本机 ${CameraLanProbe.localNetworkSummary()}，相机 $cameraIp），连接包发不到机身。请确认 WLAN 连的是相机热点（不是家里的路由器），关闭 VPN / 双网加速后重试"
                                 wentOffSubnet && vpn ->
                                     "流量被 VPN 接管了（本机出口 $usedLocal），相机的连接包发不到。请在系统设置里关闭 VPN / 代理，或把「连镜」加入该 VPN 的分应用直连名单后重试"
                                 wentOffSubnet ->
-                                    "流量走了非 Wi-Fi 网卡（本机出口 $usedLocal），相机 192.168.1.x 收不到。请关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试"
-                                e is java.net.ConnectException && onCameraNet == null ->
-                                    "手机不在相机网段（本机 ${CameraLanProbe.localNetworkSummary()}，相机 $cameraIp）。请确认已连上相机显示的 Wi-Fi 热点，并关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试；若相机 Wi-Fi 已自动关闭，请在相机上重新进入「连接至智能设备 → Wi-Fi 连接」"
+                                    "流量走了非 Wi-Fi 网卡（本机出口 $usedLocal），相机收不到。请关闭 VPN / Wi-Fi 双网加速 / 移动数据后重试"
                                 e is java.net.ConnectException ->
-                                    "已在相机网段（本机 $onCameraNet），但 $cameraIp:$PTP_PORT 不通。相机可能在等待超时后自行关闭了 Wi-Fi，请在相机上重新进入 Wi-Fi 连接画面后再试"
+                                    "相机 Wi-Fi 已连上（本机 $onCameraNet），但 $cameraIp:$PTP_PORT 没有开放。相机可能已休眠或退出了「连接至智能设备」：在相机上重新进入 Wi-Fi 连接画面，再点重试"
+                                e is java.net.SocketTimeoutException ->
+                                    "相机 Wi-Fi 已连上、端口 $PTP_PORT 也可达，但 ${CONNECT_BUDGET_MS / 1000} 秒内没完成 PTP/IP 握手。多半是相机被别的设备占着（SnapBridge、Imaging Console 或另一台手机）：在相机「已配对设备」里断开它们后再点重试"
                                 else -> e.message ?: "连接失败"
                             }
                             DoukLog.e("NikonPtp", "CONNECT_FAIL", "stage" to _connectionStage.value,
@@ -480,6 +571,9 @@ class NikonPtpClient {
             runCatching { network.bindSocket(socket) }
                 .onFailure { DoukLog.w("NikonPtp", "NET_BIND_FAIL", "error" to (it.message ?: it::class.java.simpleName)) }
         }
+        // 长连接：相机进休眠/路由器 NAT 超时后，没有 TCP keepalive 的半开连接会「看着在线、
+        // 发出去没回」，用户得手动断开重连。开启探测让系统较早收回死连接，交给重连逻辑处理。
+        runCatching { socket.keepAlive = true }
         return socket
     }
 
@@ -512,6 +606,13 @@ class NikonPtpClient {
             _cameraLabel.value = ""
             storageCache = null
         }
+    }
+
+    /** 系统通知网络没了：直接把当前会话按掉线处理，不等下一次命令超时。 */
+    fun notifyNetworkLost(reason: String) {
+        val c = synchronized(lifecycle) { connection } ?: return
+        c.trace?.note("${c.label} NETWORK_LOST $reason")
+        transportFailed(c, reason)
     }
 
     private fun transportFailed(c: Connection, reason: String) {
@@ -551,7 +652,15 @@ class NikonPtpClient {
                     val sampled = code != 0x9203 || c.transaction % 30 == 0
                     val startedAt = System.nanoTime()
                     if (sampled) c.trace?.note("${c.label} OP_BEGIN opcode=0x${code.toString(16)} transaction=${c.transaction} params=${params.joinToString()} outbound=${data?.size ?: 0}")
-                    val timeout = when (code) { 0x9203 -> 4000L; 0x1009 -> 90000L; else -> 12000L }
+                    // 握手期的 OpenSession(0x1002) / GetDeviceInfo(0x1001) 单独给 6 秒：
+                    // 相机真在应答就是毫秒级，超过 6 秒基本等于「端口通了但机身不应答」，
+                    // 早点失败比让用户干等 12 秒更接近官方 App 的反馈速度。
+                    val timeout = when (code) {
+                        0x9203 -> 4000L
+                        0x1009 -> 90000L
+                        0x1002, 0x1001 -> 6_000L
+                        else -> DEFAULT_OP_TIMEOUT_MS
+                    }
                     val deadline = System.nanoTime() + timeout * 1_000_000
                     val result = PtpIpWire.transaction(c.command.inputStream, c.command.outputStream,
                         c.transaction++, code, params, data,
@@ -617,37 +726,90 @@ class NikonPtpClient {
      * 旧线程读到 EOF 时 generation 已变，不能再把这次主动关闭当成相机掉线。
      */
     private suspend fun listenEvents(c: Connection, token: Long) {
-        try {
-            while (connection === c && !c.events.isClosed) {
-                val packet = PtpIpWire.read(c.events.inputStream, trace = c.record("event"))
-                when (PtpIpWire.type(packet)) {
-                    8 -> {
-                        val event = PtpIpWire.response(packet, 8)
-                        event.parameters.firstOrNull()?.let { photoEvent(c, event.code, it) }
+        while (connection === c) {
+            val socket = c.events
+            try {
+                while (connection === c && !socket.isClosed) {
+                    val packet = PtpIpWire.read(socket.inputStream, trace = c.record("event"))
+                    when (PtpIpWire.type(packet)) {
+                        8 -> {
+                            val event = PtpIpWire.response(packet, 8)
+                            event.parameters.firstOrNull()?.let { photoEvent(c, event.code, it) }
+                        }
+                        13 -> { c.send(socket, "event", PtpIpWire.packet(14)); socket.outputStream.flush() }
                     }
-                    13 -> { c.send(c.events, "event", PtpIpWire.packet(14)); c.events.outputStream.flush() }
                 }
-            }
-        } catch (e: Exception) {
-            c.trace?.note("${c.label} EVENT_ERROR\n${e.stackTraceToString()}")
-            val stillCurrent = synchronized(lifecycle) {
-                connection === c && generation == token
-            }
-            if (!stillCurrent) {
-                c.trace?.note("${c.label} EVENT_CLOSED_SUPERSEDED token=$token generation=$generation")
-                return
-            }
-            // 只有事件通道断了、命令通道还活着：不判整条连接死亡，避免界面反复横跳。
-            // 真掉线时下一条命令会自己失败并走 transportFailed。
-            val commandAlive = runCatching { probeCommandAlive(c) }.getOrDefault(false)
-            if (commandAlive) {
+                // socket 被主动关闭且没有被替换（退出会话）：直接结束，避免空转。
+                if (c.events === socket && socket.isClosed) return
+                continue
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 事件通道被我们自己换掉时，旧 socket 会抛 "Socket closed"，这不是故障。
+                if (c.events !== socket) continue
+                c.trace?.note("${c.label} EVENT_ERROR\n${e.stackTraceToString()}")
+                val stillCurrent = synchronized(lifecycle) {
+                    connection === c && generation == token
+                }
+                if (!stillCurrent) {
+                    c.trace?.note("${c.label} EVENT_CLOSED_SUPERSEDED token=$token generation=$generation")
+                    return
+                }
+                // 只有事件通道断了、命令通道还活着：不判整条连接死亡，避免界面反复横跳。
+                // 真掉线时下一条命令会自己失败并走 transportFailed。
+                val commandAlive = runCatching { probeCommandAlive(c) }.getOrDefault(false)
+                if (!commandAlive) {
+                    transportFailed(c, "事件通道中断：${e.message}")
+                    return
+                }
+                // 关键：PTP/IP 允许用同一个 session id 重新 Init_Event_Request。
+                // 以前这里只降级成 0x90C7 轮询，每 2 秒唤醒一次机身和 Wi‑Fi，回传也变慢。
+                if (reopenEventChannel(c)) {
+                    activeListener?.onLog("事件通道已断开，已按原会话重建，照片回传恢复即时通知")
+                    continue
+                }
                 c.trace?.note("${c.label} EVENT_CHANNEL_LOST command=alive reason=${e.message}")
                 DoukLog.w("NikonPtp", "EVENT_CHANNEL_LOST", "reason" to (e.message ?: ""))
                 activeListener?.onLog("事件通道已断开，控制通道仍在线；拍摄回传改由轮询兜底")
-            } else {
-                transportFailed(c, "事件通道中断：${e.message}")
+                return
             }
         }
+    }
+
+    /**
+     * 命令通道还活着、只有事件通道断了时，用同一个会话号重开事件通道。
+     * 三次退避（立即 / 1s / 2s），成功后把旧 socket 换掉，读循环下一轮自动接上新 socket。
+     */
+    private suspend fun reopenEventChannel(c: Connection): Boolean = withContext(Dispatchers.IO) {
+        val remote = c.remote ?: return@withContext false
+        for (attempt in 0 until 3) {
+            if (attempt > 0) delay(1_000L * (1 shl (attempt - 1)))
+            if (connection !== c) return@withContext false
+            val fresh = runCatching {
+                val s = openCameraSocket(c.network)
+                s.tcpNoDelay = true
+                s.soTimeout = HANDSHAKE_SO_TIMEOUT_MS
+                s.connect(remote, EVENT_CONNECT_TIMEOUT_MS)
+                c.send(s, "event", PtpIpWire.packet(3, ByteBuffer.allocate(4)
+                    .order(ByteOrder.LITTLE_ENDIAN).putInt(c.sessionId).array()))
+                if (PtpIpWire.type(PtpIpWire.read(s.inputStream, trace = c.record("event"))) != 4)
+                    throw IOException("事件通道重建被拒绝")
+                // 空闲事件通道不该超时；close() 会打断阻塞读。
+                s.soTimeout = 0
+                s
+            }.onFailure {
+                c.trace?.note("${c.label} EVENT_REOPEN_FAIL attempt=${attempt + 1} reason=${it.message}")
+            }.getOrNull()
+            if (fresh != null) {
+                val old = c.events
+                c.events = fresh
+                runCatching { old.close() }
+                c.trace?.note("${c.label} EVENT_REOPEN_OK attempt=${attempt + 1} session=${c.sessionId}")
+                DoukLog.i("NikonPtp", "EVENT_REOPEN", "attempt" to (attempt + 1), "sessionId" to c.sessionId)
+                return@withContext true
+            }
+        }
+        false
     }
 
     /** 事件通道断掉后，用一次最轻的 GetDeviceInfo 判断命令通道是否还活着。 */
@@ -658,7 +820,8 @@ class NikonPtpClient {
                 c.transaction++, 0x1001, intArrayOf(), null, PtpIpWire.MAX_DATA, trace = { _, _ -> })
             result.response.code == 0x2001
         } finally {
-            c.command.soTimeout = 6000
+            // 和 operation() 的默认预算保持一致，别让两套超时值互相打架。
+            c.command.soTimeout = DEFAULT_OP_TIMEOUT_MS.toInt()
         }
     }
 
@@ -882,9 +1045,30 @@ class NikonPtpClient {
         val requestNanos = AtomicLong(); val decodeNanos = AtomicLong()
         var width = 0; var height = 0
         val decoder = launch(Dispatchers.Default) {
+            // 两块缓冲交替复用：第 N 帧写 B 时，A 还在屏幕上（或刚被换下），不会边画边改。
+            // 之前每帧新建位图，标准档 RGB_565 也有 3.5MB/帧、15fps 就是 50MB/s 的分配，
+            // 长时间监看时 GC 抖动比解码本身更伤帧率。
+            val buffers = arrayOfNulls<Bitmap>(2)
+            var slot = 0
             for (jpeg in frames) {
                 val start = System.nanoTime()
-                val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, LiveViewQuality.decodeOptions()) ?: continue
+                val options = LiveViewQuality.decodeOptions()
+                val prev = buffers[slot]
+                var bitmap: Bitmap? = null
+                if (prev != null && !prev.isRecycled && prev.width > 0) {
+                    // 尺寸/配置不一致时 BitmapFactory 会拒绝复合并抛异常，此时清掉重解一次。
+                    options.inBitmap = prev
+                    options.inMutable = true
+                    bitmap = runCatching {
+                        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, options)
+                    }.getOrNull()
+                    if (bitmap == null) options.inBitmap = null
+                }
+                if (bitmap == null) {
+                    bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, options) ?: continue
+                }
+                buffers[slot] = bitmap
+                slot = 1 - slot
                 decodeNanos.addAndGet(System.nanoTime() - start)
                 decoded.incrementAndGet()
                 width = bitmap.width; height = bitmap.height

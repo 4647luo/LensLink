@@ -71,6 +71,14 @@ class UsbPtpClient {
     /** 当前取景取帧操作码：Z 系 0x9428，不支持时自动降级 0x9203。 */
     private var frameCommand = 0x9428
 
+    // 自动恢复用：记住这台设备与上下文，bulk 通道挂掉后不用用户拔线重插
+    private var lastDevice: UsbDevice? = null
+    private var appContext: Context? = null
+    @Volatile
+    private var recovering = false
+    private var recoverAttempts = 0
+    private val maxRecoverAttempts = 3
+
     /**
      * 连接 USB 相机并初始化 PTP 会话     */
     fun connectDevice(
@@ -79,6 +87,9 @@ class UsbPtpClient {
         eventListener: UsbEventListener? = null
     ): Boolean {
         this.listener = eventListener
+        // 记住设备和上下文：bulk 通道挂掉时可以自己重开会话，不必等用户拔线
+        appContext = context.applicationContext
+        lastDevice = device
         disconnect()
 
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -139,6 +150,9 @@ class UsbPtpClient {
             return false
         }
 
+        // 新会话开始前先清掉三个端点上可能残留的 halt 状态，否则第一包就会读失败
+        UsbBulk.resetEndpoints(conn, listOfNotNull(inEp, outEp, intEp))
+
         usbConnection = conn
         usbInterface = matchedInterface
         bulkInEndpoint = inEp
@@ -153,6 +167,7 @@ class UsbPtpClient {
                 Log.d(TAG, "USB OpenSession success: ${resp.size} bytes")
 
                 _isConnected.value = true
+                recoverAttempts = 0
                 val cameraName = device.productName ?: "USB 尼康相机"
                 withContext(Dispatchers.Main) {
                     listener?.onConnected(cameraName)
@@ -186,14 +201,73 @@ class UsbPtpClient {
         scope.launch(Dispatchers.IO) {
             synchronized(bufferLock) {
                 try {
+                    // 释放接口前清 halt：这颗接口重新 claim 之后端点可能仍停在 halt，
+                    // 不清的话下一次连接第一包就超时（表现是"必须重新插拔"）。
+                    listOfNotNull(bulkInEndpoint, bulkOutEndpoint, interruptEndpoint).forEach { ep ->
+                        runCatching { usbConnection?.let { UsbBulk.clearHalt(it, ep) } }
+                    }
                     usbInterface?.let { usbConnection?.releaseInterface(it) }
                     usbConnection?.close()
-                } catch (e: Exception) {}
+                } catch (e: Exception) {
+                    Log.w(TAG, "USB cleanup error", e)
+                }
+                UsbBulk.resetFailures()
                 usbConnection = null
                 usbInterface = null
                 bulkInEndpoint = null
                 bulkOutEndpoint = null
                 interruptEndpoint = null
+            }
+        }
+    }
+
+    /**
+     * bulk 通道连续失败（端点被 halt、相机切了模式、线材接触不良）时自动重开会话。
+     * 以前这类故障只能拔线重插；现在在会话层自愈，最多重试 [maxRecoverAttempts] 次。
+     */
+    private fun scheduleRecover() {
+        if (recovering) return
+        val device = lastDevice
+        val ctx = appContext
+        if (device == null || ctx == null) return
+        if (recoverAttempts >= maxRecoverAttempts) {
+            _isConnected.value = false
+            listener?.onDisconnected("USB 通道连续失败，已停止自动恢复（请重新插拔相机）")
+            return
+        }
+        recovering = true
+        recoverAttempts++
+        _isConnected.value = false
+        _isLiveViewActive.value = false
+        liveViewJob?.cancel()
+        liveViewJob = null
+        interruptJob?.cancel()
+        interruptJob = null
+        scope.launch(Dispatchers.IO) {
+            try {
+                listener?.onLog("♻️ USB 通道异常，正在自动恢复（第 $recoverAttempts 次）")
+                // 必须放掉旧句柄：同一个接口被两个 connection 抢会直接 open 失败
+                synchronized(bufferLock) {
+                    runCatching { usbInterface?.let { usbConnection?.releaseInterface(it) } }
+                    runCatching { usbConnection?.close() }
+                    usbConnection = null
+                    usbInterface = null
+                    bulkInEndpoint = null
+                    bulkOutEndpoint = null
+                    interruptEndpoint = null
+                }
+                UsbBulk.resetFailures()
+                delay(1500)
+                val started = connectDevice(ctx, device, listener)
+                withContext(Dispatchers.Main) {
+                    if (!started) listener?.onDisconnected("USB 通道恢复失败：相机没有响应")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    listener?.onDisconnected("USB 通道恢复异常：${e.message}")
+                }
+            } finally {
+                recovering = false
             }
         }
     }
@@ -240,6 +314,14 @@ class UsbPtpClient {
                         }
                     }
                     delay(30) // ~30 fps 极速回传
+                    // 取景是这条通道最频繁的读写：连续失败就自愈，不要死循环刷超时
+                    if (UsbBulk.consecutiveFailures >= 5) {
+                        withContext(Dispatchers.Main) {
+                            listener?.onLog("⚠️ USB bulk 连续失败，准备恢复通道")
+                        }
+                        scheduleRecover()
+                        break
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "USB LiveView 轮询异常: ${e.message}")
@@ -261,7 +343,9 @@ class UsbPtpClient {
                 // 把控制权交还机身
                 sendPtpCommand(0x90c2.toShort(), intArrayOf(0))
                 readPtpResponse()
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "USB exit liveview fallback", e)
+            }
         }
     }
 
@@ -386,7 +470,7 @@ class UsbPtpClient {
         interruptJob = scope.launch(Dispatchers.IO) {
             val buffer = ByteArray(64)
             while (isActive && _isConnected.value) {
-                val len = conn.bulkTransfer(intEp, buffer, buffer.size, 1000)
+                val len = UsbBulk.bulkIn(conn, intEp, buffer, buffer.size, UsbBulk.EVENT_TIMEOUT)
                 if (len >= 12) {
                     val eventBuffer = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN)
                     val eventCode = eventBuffer.getShort(6)
@@ -444,15 +528,19 @@ class UsbPtpClient {
         buffer.putInt(transId)
         for (p in params) buffer.putInt(p)
 
-        conn.bulkTransfer(outEp, buffer.array(), length, 3000)
+        UsbBulk.bulkOut(conn, outEp, buffer.array(), length, UsbBulk.CMD_TIMEOUT)
     }
 
     private fun readPtpResponse(): ByteArray {
         val conn = usbConnection ?: return ByteArray(0)
         val inEp = bulkInEndpoint ?: return ByteArray(0)
         val buffer = ByteArray(512)
-        val len = conn.bulkTransfer(inEp, buffer, buffer.size, 3000)
-        if (len <= 0) return ByteArray(0)
+        val len = UsbBulk.bulkIn(conn, inEp, buffer, buffer.size, UsbBulk.CMD_TIMEOUT)
+        if (len <= 0) {
+            // 连续读空说明通道已经不健康（halt 或掉线），交给恢复逻辑，别让上层一直空转
+            if (UsbBulk.consecutiveFailures >= 4) scheduleRecover()
+            return ByteArray(0)
+        }
         return buffer.copyOf(len)
     }
 
@@ -461,7 +549,7 @@ class UsbPtpClient {
         val inEp = bulkInEndpoint ?: return null
 
         val headerBuffer = ByteArray(512)
-        val firstLen = conn.bulkTransfer(inEp, headerBuffer, headerBuffer.size, 1500)
+        val firstLen = UsbBulk.bulkIn(conn, inEp, headerBuffer, headerBuffer.size, UsbBulk.FRAME_TIMEOUT)
         if (firstLen < 12) return null
 
         val byteBuffer = ByteBuffer.wrap(headerBuffer).order(ByteOrder.LITTLE_ENDIAN)
@@ -484,7 +572,7 @@ class UsbPtpClient {
         val chunk = ByteArray(16 * 1024)
         while (readBytes < totalLength) {
             val want = (totalLength - readBytes).coerceAtMost(chunk.size)
-            val read = conn.bulkTransfer(inEp, chunk, want, 1500)
+            val read = UsbBulk.bulkIn(conn, inEp, chunk, want, UsbBulk.DATA_TIMEOUT)
             if (read <= 0) break
             System.arraycopy(chunk, 0, fullData, readBytes, read)
             readBytes += read
@@ -492,8 +580,8 @@ class UsbPtpClient {
 
         if (containerType != USB_CONTAINER_RESPONSE) {
             // 读取随后的 Response 容器
-                val respBuffer = ByteArray(64)
-            conn.bulkTransfer(inEp, respBuffer, respBuffer.size, 500)
+            val respBuffer = ByteArray(64)
+            UsbBulk.bulkIn(conn, inEp, respBuffer, respBuffer.size, UsbBulk.CMD_TIMEOUT)
         }
 
         return fullData
@@ -512,7 +600,7 @@ class UsbPtpClient {
         cmdBuffer.putShort(opCode)
         cmdBuffer.putInt(transId)
         for (p in params) cmdBuffer.putInt(p)
-        conn.bulkTransfer(outEp, cmdBuffer.array(), cmdLength, 3000)
+        UsbBulk.bulkOut(conn, outEp, cmdBuffer.array(), cmdLength, UsbBulk.CMD_TIMEOUT)
 
         // 2. 发送 Data 容器
                 val dataLength = 12 + data.size
@@ -522,7 +610,7 @@ class UsbPtpClient {
         dataBuffer.putShort(opCode)
         dataBuffer.putInt(transId)
         dataBuffer.put(data)
-        conn.bulkTransfer(outEp, dataBuffer.array(), dataLength, 3000)
+        UsbBulk.bulkOut(conn, outEp, dataBuffer.array(), dataLength, UsbBulk.DATA_TIMEOUT)
     }
 
     // ========== 🎛️ 相机属性 读取/设置/描述 (PTP 标准操作码) ==========
@@ -599,7 +687,9 @@ class UsbPtpClient {
                     val value = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getShort(0).toInt() and 0xFFFF
                     result[prop] = value
                 }
-            } catch (e: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "USB prop read skip", e)
+            }
         }
         return result
     }

@@ -2,6 +2,7 @@ package com.lutcamera.lutcamerapro.ui.douk
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.lutcamera.lutcamerapro.util.SecureStore
 import java.io.File
 
 /** 连接过的相机记录 */
@@ -31,6 +32,42 @@ object DoukPrefs {
     private fun putInt(key: String, value: Int) { ensure(); sp.edit().putInt(key, value).apply() }
     private fun getFloat(key: String, def: Float): Float { ensure(); return sp.getFloat(key, def) }
     private fun putFloat(key: String, value: Float) { ensure(); sp.edit().putFloat(key, value).apply() }
+
+    // ===== 通用 =====
+    /** 给其它模块存取自定义 JSON 串，不直接暴露 SharedPreferences 实例 */
+    fun raw(key: String): String? { ensure(); return sp.getString(key, null) }
+    fun putRaw(key: String, value: String) { ensure(); sp.edit().putString(key, value).apply() }
+
+    /**
+     * 敏感字符串（相机热点口令）用 Keystore 加密后落盘。
+     *
+     * 兼容旧数据：1.1.25 及以前写的是明文，读到时返回原文并顺手覆盖成密文，
+     * 用户不需要重新输一遍密码。Keystore 异常时退回明文，功能优先。
+     */
+    fun secureRaw(key: String): String? {
+        val stored = raw(key) ?: return null
+        if (stored.isEmpty()) return ""
+        if (!SecureStore.isEncrypted(stored)) {
+            SecureStore.encrypt(stored)?.let { putRaw(key, it) }
+            return stored
+        }
+        val plain = SecureStore.decrypt(stored)
+        if (plain == null) {
+            com.lutcamera.lutcamerapro.log.DoukLog.w("Prefs", "SECURE_DECRYPT_FAILED", "key" to key)
+        }
+        return plain
+    }
+
+    fun putSecureRaw(key: String, value: String) {
+        if (value.isEmpty()) { putRaw(key, ""); return }
+        val encrypted = SecureStore.encrypt(value)
+        if (encrypted == null) {
+            com.lutcamera.lutcamerapro.log.DoukLog.w("Prefs", "SECURE_ENCRYPT_FALLBACK", "key" to key)
+            putRaw(key, value)
+        } else {
+            putRaw(key, encrypted)
+        }
+    }
 
     // ===== 设备 =====
     /** 识别到连接过的相机时自动连接（默认开启：断线后每 20 秒探测一次历史相机） */
@@ -290,6 +327,33 @@ object DoukPrefs {
     var gpsAttachBle: Boolean
         get() = flag("gps_ble", false)
         set(v) = putFlag("gps_ble", v)
+    /** 缺海拔时是否允许调用在线高程服务（会把经纬度发到公开高程接口）；关闭后只用 GPS/气压计/本地缓存。 */
+    var onlineElevationEnabled: Boolean
+        get() = flag("online_elevation", true)
+        set(v) = putFlag("online_elevation", v)
+
+    // ===== 版权 / IPTC =====
+    /** 照片落盘后是否写入作者与版权（EXIF + IPTC），只对 JPG 生效 */
+    var iptcEnabled: Boolean
+        get() = flag("iptc_enabled", true)
+        set(v) = putFlag("iptc_enabled", v)
+    /** 当前生效的那套值，切换模板时整体覆盖 */
+    var iptcTemplateName: String
+        get() = str("iptc_template_name", "")
+        set(v) = putStr("iptc_template_name", v)
+    var iptcArtist: String
+        get() = str("iptc_artist", "")
+        set(v) = putStr("iptc_artist", v)
+    var iptcCopyright: String
+        get() = str("iptc_copyright", "")
+        set(v) = putStr("iptc_copyright", v)
+    var iptcCredit: String
+        get() = str("iptc_credit", "")
+        set(v) = putStr("iptc_credit", v)
+    /** 关键词用逗号分隔，写入时拆成 IPTC 多个 2:25 */
+    var iptcKeywords: String
+        get() = str("iptc_keywords", "")
+        set(v) = putStr("iptc_keywords", v)
 
     /** 外观：跟随系统 / 浅色 / 深色 */
     var darkMode: String

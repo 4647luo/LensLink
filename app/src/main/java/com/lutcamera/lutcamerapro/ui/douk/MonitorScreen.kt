@@ -20,6 +20,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -53,9 +56,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AccessTime
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.BlurOn
 import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ColorLens
@@ -68,13 +73,17 @@ import androidx.compose.material.icons.rounded.GridOn
 import androidx.compose.material.icons.rounded.Iso
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Movie
+import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PhotoFilter
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material.icons.rounded.RotateRight
+import androidx.compose.material.icons.rounded.Schedule
 import androidx.compose.material.icons.rounded.ShowChart
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.Straighten
 import androidx.compose.material.icons.rounded.Timer
+import androidx.compose.material.icons.rounded.Timelapse
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.WbSunny
@@ -101,6 +110,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -113,6 +123,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import com.lutcamera.lutcamerapro.ui.screens.monitor.MonitorTextureView
+import com.lutcamera.lutcamerapro.lut.LutData
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -134,13 +147,36 @@ import kotlin.math.sin
 
 private enum class MonitorDeck { NONE, TOOLS, CAMERA }
 
-private data class FrameAnalysis(
+/**
+ * 直方图数据。四个数组按内容比较：data class 默认只比引用，
+ * 每帧新数组会让「值没变」也判成变化，直方图面板因此被迫每 150ms 重组一次。
+ */
+@androidx.compose.runtime.Immutable
+private class FrameAnalysis(
     val histR: IntArray? = null,
     val histG: IntArray? = null,
     val histB: IntArray? = null,
-    val histL: IntArray? = null,
-    val waveform: ImageBitmap? = null
-)
+    val histL: IntArray? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (other !is FrameAnalysis) return false
+        return histR.contentEqualsNullable(other.histR) &&
+            histG.contentEqualsNullable(other.histG) &&
+            histB.contentEqualsNullable(other.histB) &&
+            histL.contentEqualsNullable(other.histL)
+    }
+
+    override fun hashCode(): Int {
+        var result = histR?.contentHashCode() ?: 0
+        result = 31 * result + (histG?.contentHashCode() ?: 0)
+        result = 31 * result + (histB?.contentHashCode() ?: 0)
+        result = 31 * result + (histL?.contentHashCode() ?: 0)
+        return result
+    }
+}
+
+private fun IntArray?.contentEqualsNullable(other: IntArray?): Boolean =
+    if (this == null) other == null else other != null && contentEquals(other)
 
 /** 全屏监视：点击画面对焦、顶部曝光参数、上下/左右滑出两组圆形工具。 */
 @Composable
@@ -215,7 +251,6 @@ fun MonitorFullscreen(state: DoukState) {
     var lutLoading by remember { mutableStateOf(false) }
     var lutReload by remember { mutableIntStateOf(0) }
     var lutBrokenIds by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var lutFrame by remember { mutableStateOf<ImageBitmap?>(null) }
     var analysis by remember { mutableStateOf(FrameAnalysis()) }
     var viewRotation by remember { mutableIntStateOf(0) }
     var mirror by remember { mutableStateOf(false) }
@@ -238,17 +273,74 @@ fun MonitorFullscreen(state: DoukState) {
     var railConfigOpen by remember { mutableStateOf(false) }
     var qualityCardOpen by remember { mutableStateOf(false) }
     var paramToast by remember { mutableStateOf<String?>(null) }
+    // 曝光监看 / 自动化：
+    // falseColorOn 伪色、levelOn 水平仪、audioOn 音频电平、tcOn 时间码、
+    // guideStyle 构图线样式（0=关闭）、autoOpen 间隔/包围/自拍面板
+    var falseColorOn by remember { mutableStateOf(false) }
+    // 峰值对焦：GPU 边缘检测，伪色开启时自动让位
+    var peakingOn by remember { mutableStateOf(false) }
+    var levelOn by remember { mutableStateOf(false) }
+    var audioOn by remember { mutableStateOf(false) }
+    var tcOn by remember { mutableStateOf(false) }
+    var autoOpen by remember { mutableStateOf(false) }
+    var guideStyle by remember { mutableIntStateOf(0) }
+    var clockText by remember { mutableStateOf("") }
+    var clockBusy by remember { mutableStateOf(false) }
+    var tcText by remember { mutableStateOf("00:00:00:00") }
+    // AF 锁定用可变状态包一层：手势协程里读的是最新的值，不需要重启 pointerInput
+    val afLocked = remember { mutableStateOf(false) }
+    val afLockBadge = remember { mutableStateOf<String?>(null) }
+    // 本次手势是我们自己的「下划锁 AF」，就别再让同一串拖动去开工具箱
+    val afDragSuppress = remember { mutableStateOf(false) }
     val uiScope = rememberCoroutineScope()
 
     val context = LocalContext.current
     val density = LocalDensity.current
     val latestFrame by rememberUpdatedState(frame)
 
+    // 音频电平只读手机麦克风做参考，不录制：首次开启时才请求权限
+    var audioGranted by remember {
+        mutableStateOf(
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.RECORD_AUDIO
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val audioPermLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        audioGranted = granted
+        if (!granted) {
+            audioOn = false
+            paramToast = "未授予麦克风权限，音频电平不可用"
+        }
+    }
+    val audioMeter = rememberAudioLevel(audioOn && audioGranted, audioGranted)
+    val tiltDeg = rememberTiltDegrees(levelOn)
+
     // 对焦点标记 1.8 秒后自己消失，和取景页一致
     LaunchedEffect(focusTick) {
         if (focusMarker != null) {
             delay(1800)
             focusMarker = null
+        }
+    }
+
+    // AF 状态提示（已对焦 / 已锁定 / 已解锁）短提示，1.4 秒后自己消失
+    LaunchedEffect(afLockBadge.value) {
+        val badge = afLockBadge.value ?: return@LaunchedEffect
+        delay(1400)
+        if (afLockBadge.value == badge) afLockBadge.value = null
+    }
+
+    // 时间码：从打开显示（或切到录制）起累计，录制中前面亮红点
+    LaunchedEffect(tcOn, state.isRecordingNow) {
+        if (!tcOn) return@LaunchedEffect
+        val base = android.os.SystemClock.elapsedRealtime()
+        while (isActive) {
+            tcText = formatTimecode(android.os.SystemClock.elapsedRealtime() - base, 30)
+            delay(33)
         }
     }
 
@@ -366,36 +458,19 @@ fun MonitorFullscreen(state: DoukState) {
         while (isActive) {
             val frameBmp = latestFrame
             val bmp = frameBmp?.asImageBitmap()
-            val selectedLutId = lutId
-            val anyOn = histOn || waveOn || (lutOn && selectedLutId != null)
-            // 同一帧不重复算：30fps 取景时缓存命中能省掉绝大部分 CPU/GPU 开销，
+            // 伪色 / LUT / 波形都已经在 GL 着色器里跑，CPU 这边只剩直方图
+            val anyOn = histOn
+            // 同一帧不重复算：30fps 取景时缓存命中能省掉绝大部分 CPU 开销，
             // 也是监看不烫手、不掉电的关键之一。
             val sameFrame = frameBmp != null && frameBmp === lastAnalyzedFrame
             if (bmp != null && anyOn && !sameFrame) {
                 lastAnalyzedFrame = frameBmp
-                val result = withContext(Dispatchers.IO) { analyzeFrame(bmp, histOn, waveOn) }
-                analysis = result
-                var processed: ImageBitmap? = null
-                if (lutOn && selectedLutId != null) {
-                    val lut = lutRuntime?.lut(selectedLutId)
-                    if (lut != null) processed = withContext(Dispatchers.IO) { renderLut(bmp, lut) }
-                }
-                lutFrame = processed
+                analysis = withContext(Dispatchers.IO) { analyzeFrame(bmp) }
             } else if (!anyOn) {
                 lastAnalyzedFrame = null
                 analysis = FrameAnalysis()
-                lutFrame = null
             }
-            delay(
-                when {
-                    // 预览 LUT 降频：全尺寸帧每 100ms 复制一次会制造 GC 峰值，
-                    // 画面看起来仍是实时刷新，但计算不再和取景帧抢 CPU。
-                    lutOn && selectedLutId != null -> 200L
-                    anyOn -> 150L
-                    // 没开任何监看叠加时低频空转，避免无意义地唤醒线程耗电
-                    else -> 900L
-                }
-            )
+            delay(if (anyOn) 150L else 900L)
         }
     }
 
@@ -421,6 +496,16 @@ fun MonitorFullscreen(state: DoukState) {
             } else 3
             val sourceBmp = frame
             val source = remember(sourceBmp) { sourceBmp?.asImageBitmap() }
+            // 监看 LUT 交给 GL 渲染：把内部 Lut3D 包成 LutData，只在 LUT 切换时才重建，
+            // 避免每帧重组都重新上传一张 3D 纹理
+            val monitorLutData = remember(lutRuntime, lutId, lutOn) {
+                if (!lutOn) {
+                    null
+                } else {
+                    lutId?.let { id -> lutRuntime?.lut(id) }
+                        ?.let { LutData("监看预览", it.size, it.data) }
+                }
+            }
             // 取景画面按相机实际输出的方向显示，不再按手机横竖自动旋转；
             // 需要旋转时由用户在「视图 → 旋转视图 90°」里手动切换，避免同一场景忽横忽竖。
             val baseRotation = 0f
@@ -455,6 +540,10 @@ fun MonitorFullscreen(state: DoukState) {
             }
 
             if (source != null) {
+                // 波形窗口在画面坐标系里的归一化大小（GL 里按 viewport 画，不依赖 Compose 布局）
+                val waveRectW = with(density) { 220.dp.roundToPx() }.toFloat() / dispWpx
+                val waveRectH = with(density) { 116.dp.roundToPx() }.toFloat() / dispHpx
+                val glRotation = ((rotation.toInt() % 360) + 360) % 360
                 Box(
                     modifier = Modifier
                         .align(Alignment.Center)
@@ -462,18 +551,33 @@ fun MonitorFullscreen(state: DoukState) {
                             with(density) { dispWpx.toDp() },
                             with(density) { dispHpx.toDp() }
                         )
-                        .graphicsLayer {
-                            rotationZ = rotation
-                            scaleX = if (mirror) -1f else 1f
-                        }
                 ) {
-                    val processed = lutFrame
-                    val shown: ImageBitmap = processed ?: source
-                    Image(
-                        bitmap = shown,
-                        contentDescription = "相机实时取景全屏",
+                    AndroidView(
+                        factory = { ctx -> MonitorTextureView(ctx) },
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit
+                        update = { view ->
+                            // 取景帧直接进 GL 纹理；LUT / 伪色 / 旋转镜像 / 波形全在着色器里跑
+                            frame?.let { view.updateLiveFrame(it) }
+                            val previewLut = monitorLutData
+                            view.setLut(previewLut, 1f)
+                            view.setFalseColor(falseColorOn)
+                            view.setPeaking(peakingOn && !falseColorOn)
+                            // SurfaceView 不吃 graphicsLayer，旋转/镜像交给着色器反解 UV
+                            view.setUvTransform(glRotation, mirror)
+                            // 波形位置：叠加层的屏幕坐标换算成画面内的归一化矩形
+                            val left = (rootW - dispWpx) / 2f
+                            val top = (rootH - dispHpx) / 2f
+                            val rect = waveOffset?.let { off ->
+                                floatArrayOf(
+                                    (off.x - left) / dispWpx,
+                                    (off.y - top) / dispHpx,
+                                    waveRectW,
+                                    waveRectH
+                                )
+                            }
+                            view.setWaveform(waveOn && rect != null, rect)
+                            view.setWarnings(false, false)
+                        }
                     )
                 }
             } else {
@@ -490,28 +594,66 @@ fun MonitorFullscreen(state: DoukState) {
                 }
             }
 
-            if (gridOn) {
-                Canvas(
+            // 构图辅助线：三分 / 三分+十字 / 对角线 / 安全框 / 中心十字，统一走这里画
+            if (guideStyle > 0) {
+                CompositionGuides(
+                    style = guideStyle,
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(
                             start = if (landscape) railLeftWidth else 0.dp,
                             end = if (landscape) railRightWidth else 0.dp
                         )
-                ) {
-                    val thirdW = size.width / 3f
-                    val thirdH = size.height / 3f
-                    for (i in 1..2) {
-                        drawLine(Color.White.copy(alpha = 0.22f), androidx.compose.ui.geometry.Offset(thirdW * i, 0f), androidx.compose.ui.geometry.Offset(thirdW * i, size.height), 1f)
-                        drawLine(Color.White.copy(alpha = 0.22f), androidx.compose.ui.geometry.Offset(0f, thirdH * i), androidx.compose.ui.geometry.Offset(size.width, thirdH * i), 1f)
-                    }
-                }
+                )
             }
 
             // 手势层：上滑/左滑=监看工具，下滑/右滑=相机参数（竖横构图都可用）
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    // AF 手势：按住对焦 → 继续下滑锁定 AF-L → 已锁定时点一下解除。
+                    // 和机身「半按 → AF-L → 再按」的顺序一致，比点击对焦更接近实拍手感。
+                    .pointerInput(source, rotation, mirror, dispWpx, dispHpx, deck) {
+                        if (source == null) return@pointerInput
+                        val lockThreshold = 56.dp.toPx()
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            if (deck != MonitorDeck.NONE) return@awaitEachGesture
+                            // 已锁定：单击即解除，不用再长按
+                            if (afLocked.value) {
+                                afLocked.value = false
+                                afDragSuppress.value = false
+                                afLockBadge.value = "AF 解锁"
+                                focusMarker = null
+                                // awaitEachGesture 会在块末自行等待手指抬起，这里不用再等 up
+                                return@awaitEachGesture
+                            }
+                            // 按住到长按阈值才下发对焦；快速点击与滑动手势在这里直接放回给下面
+                            val hold = awaitLongPressOrCancellation(down.id)
+                            if (hold == null) return@awaitEachGesture
+                            mapTap(hold.position)?.let { (nx, ny) ->
+                                state.vm.setFocusPoint(nx, ny)
+                                focusMarker = hold.position
+                                focusTick++
+                                afLockBadge.value = "AF 已对焦"
+                            }
+                            var locked = false
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (change.changedToUpIgnoreConsumed()) break
+                                val dy = change.position.y - hold.position.y
+                                if (!locked && dy > lockThreshold) {
+                                    locked = true
+                                    afLocked.value = true
+                                    afDragSuppress.value = true
+                                    afLockBadge.value = "AF 已锁定"
+                                }
+                                // 锁 AF 的下滑由这里吞掉，避免同一串拖动再被下面判定成开工具箱
+                                if (dy > 0f) change.consume()
+                            }
+                        }
+                    }
                     .pointerInput(Unit) {
                         var dx = 0f
                         var dy = 0f
@@ -519,6 +661,11 @@ fun MonitorFullscreen(state: DoukState) {
                             onDragStart = { dx = 0f; dy = 0f },
                             onDragCancel = { dx = 0f; dy = 0f },
                             onDragEnd = {
+                                if (afDragSuppress.value) {
+                                    afDragSuppress.value = false
+                                    dx = 0f; dy = 0f
+                                    return@detectDragGestures
+                                }
                                 val horizontal = kotlin.math.abs(dx) > kotlin.math.abs(dy)
                                 if (deck == MonitorDeck.NONE) {
                                     if (horizontal) {
@@ -671,17 +818,68 @@ fun MonitorFullscreen(state: DoukState) {
             val edge = with(density) { 10.dp.roundToPx() }
 
             // 首次进入/横竖切换时把叠加层放到画面内的默认角落，之后用户长按拖到哪就停在哪
-            LaunchedEffect(rootW, rootH) {
-                histOffset = Offset((railLeftPx + edge).toFloat(), edge.toFloat())
+            // 注意波形窗口现在由 GPU 画在取景画面里，默认位置必须落在画面矩形内，
+            // 否则会跑到画面外的黑边上
+            LaunchedEffect(rootW, rootH, dispWpx, dispHpx) {
+                val viewLeft = (rootW - dispWpx) / 2
+                val viewTop = (rootH - dispHpx) / 2
+                histOffset = Offset((viewLeft + edge).toFloat(), (viewTop + edge).toFloat())
                 waveOffset = Offset(
-                    (railLeftPx + edge).toFloat(),
-                    (edge + histHpx + edge).toFloat()
+                    (viewLeft + edge).toFloat(),
+                    (viewTop + edge + histHpx + edge).toFloat()
                 )
+            }
+
+            // 构图线依次循环：关 → 三分 → 三分+十字 → 对角线 → 安全框 → 中心十字
+            fun cycleGuide() {
+                guideStyle = (guideStyle + 1) % (GUIDE_STYLE_LABELS.size + 1)
+                gridOn = guideStyle > 0
+            }
+
+            // 校时：读一次机身时间 → 写入手机时间 → 再读回确认
+            fun syncClock() {
+                if (clockBusy) return
+                clockBusy = true
+                uiScope.launch {
+                    val before = state.readCameraClock()
+                    val ok = state.syncCameraClock()
+                    val after = if (ok) state.readCameraClock() else null
+                    clockBusy = false
+                    clockText = after ?: ""
+                    paramToast = when {
+                        !state.isConnected -> "相机未连接，无法校时"
+                        !ok -> "机身拒绝写入时钟，请用机身菜单手动对时"
+                        after != null -> "机身时钟已同步：$after"
+                        before != null -> "已写入手机时间（原为 $before）"
+                        else -> "已写入手机时间"
+                    }
+                }
+            }
+
+            fun toggleAudio() {
+                if (audioOn) {
+                    audioOn = false
+                } else if (audioGranted) {
+                    audioOn = true
+                } else {
+                    paramToast = "麦克风仅用于监看音频电平参考，不录音、不上传"
+                    audioPermLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                }
             }
 
             fun onRailAction(id: String) {
                 when (id) {
-                    "grid" -> gridOn = !gridOn
+                    "grid" -> cycleGuide()
+                    "falseCol" -> {
+                        falseColorOn = !falseColorOn
+                        if (falseColorOn) lutOn = false
+                    }
+                    "level" -> levelOn = !levelOn
+                    "audio" -> toggleAudio()
+                    "tc" -> tcOn = !tcOn
+                    "auto" -> autoOpen = !autoOpen
+                    "clock" -> syncClock()
+                    "guide" -> cycleGuide()
                     "hist" -> histOn = !histOn
                     "wave" -> waveOn = !waveOn
                     "lut" -> {
@@ -733,7 +931,16 @@ fun MonitorFullscreen(state: DoukState) {
                                 id = id,
                                 state = state,
                                 video = video,
-                                active = railActionActive(id, histOn, waveOn, gridOn, perspectiveOn = viewCard, lutOn = lutOn),
+                                active = railActionActive(
+                                    id, histOn, waveOn, gridOn,
+                                    perspectiveOn = viewCard,
+                                    lutOn = lutOn,
+                                    falseColorOn = falseColorOn,
+                                    levelOn = levelOn,
+                                    audioOn = audioOn,
+                                    tcOn = tcOn,
+                                    autoOpen = autoOpen
+                                ),
                                 onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
                                 onAction = ::onRailAction
                             )
@@ -809,7 +1016,16 @@ fun MonitorFullscreen(state: DoukState) {
                                         id = id,
                                         state = state,
                                         video = video,
-                                        active = railActionActive(id, histOn, waveOn, gridOn, perspectiveOn = viewCard, lutOn = lutOn),
+                                        active = railActionActive(
+                                    id, histOn, waveOn, gridOn,
+                                    perspectiveOn = viewCard,
+                                    lutOn = lutOn,
+                                    falseColorOn = falseColorOn,
+                                    levelOn = levelOn,
+                                    audioOn = audioOn,
+                                    tcOn = tcOn,
+                                    autoOpen = autoOpen
+                                ),
                                         onOpen = { key, anchor -> pickerAnchor = anchor; pickerKey = key },
                                         onAction = ::onRailAction
                                     )
@@ -1085,7 +1301,30 @@ fun MonitorFullscreen(state: DoukState) {
                     }
                     MonitorTool("直方图", Icons.Rounded.BarChart, histOn) { histOn = !histOn }
                     MonitorTool("波形图", Icons.Rounded.ShowChart, waveOn) { waveOn = !waveOn }
-                    MonitorTool("网格", Icons.Rounded.GridOn, gridOn) { gridOn = !gridOn }
+                    MonitorTool("伪色", Icons.Rounded.Palette, falseColorOn) {
+                        falseColorOn = !falseColorOn
+                        // 伪色会整屏换色，和 LUT 预览抢同一张画面，开伪色就顺手关掉 LUT
+                        if (falseColorOn) lutOn = false
+                    }
+                    MonitorTool("峰值对焦", Icons.Rounded.BlurOn, peakingOn) {
+                        peakingOn = !peakingOn
+                        // 峰值是边缘染色，伪色是整屏换色，两个同时开看不清
+                        if (peakingOn) falseColorOn = false
+                    }
+                    MonitorTool("水平仪", Icons.Rounded.Straighten, levelOn) { levelOn = !levelOn }
+                    MonitorTool(
+                        label = "音频电平",
+                        icon = Icons.Rounded.GraphicEq,
+                        active = audioOn
+                    ) { toggleAudio() }
+                    MonitorTool("时间码", Icons.Rounded.AccessTime, tcOn) { tcOn = !tcOn }
+                    MonitorTool(
+                        label = "构图线 " + if (guideStyle > 0) GUIDE_STYLE_LABELS[guideStyle - 1] else "关",
+                        icon = Icons.Rounded.GridOn,
+                        active = guideStyle > 0
+                    ) { cycleGuide() }
+                    MonitorTool("间隔/包围", Icons.Rounded.Timelapse, autoOpen) { autoOpen = !autoOpen }
+                    MonitorTool("相机时钟", Icons.Rounded.Schedule, false) { syncClock() }
                     MonitorTool("预览画质", Icons.Rounded.Speed, false, onClick = {
                         qualityCardOpen = !qualityCardOpen
                         if (qualityCardOpen) deck = MonitorDeck.NONE
@@ -1223,14 +1462,14 @@ fun MonitorFullscreen(state: DoukState) {
                     HistogramPanel(analysis, modifier = Modifier.fillMaxSize())
                 }
             }
+            // 波形本体由 GPU 直接画在取景画面上，这里只保留透明的拖动/边框层
             if (waveOn) waveOffset?.let { off ->
                 Box(
                     modifier = Modifier
                         .offset { IntOffset(off.x.toInt(), off.y.toInt()) }
                         .size(220.dp, 116.dp)
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0xE6101114))
-                        .border(1.dp, Color.White.copy(alpha = 0.10f), RoundedCornerShape(16.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(16.dp))
                         .pointerInput(rootW, rootH) {
                             detectDragGesturesAfterLongPress(
                                 onDrag = { change, drag ->
@@ -1243,14 +1482,107 @@ fun MonitorFullscreen(state: DoukState) {
                                 }
                             )
                         }
+                )
+            }
+
+            // 伪色图例：只标黑场 / 18% / 过曝三个判断点，贴在画面下沿
+            if (falseColorOn) {
+                FalseColorLegend(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(
+                            start = if (landscape) railLeftWidth + 8.dp else 8.dp,
+                            bottom = if (landscape) 12.dp else 100.dp
+                        )
+                )
+            }
+
+            // 水平仪：画面正中，跟着重力传感器转；±1.2° 内变绿表示已摆平
+            if (levelOn) {
+                HorizonLevel(
+                    tiltDeg = tiltDeg,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(
+                            start = if (landscape) railLeftWidth else 0.dp,
+                            end = if (landscape) railRightWidth else 0.dp
+                        )
+                )
+            }
+
+            // 音频电平：右下角，横屏时让开右栏；读的是手机麦克风参考值
+            if (audioOn) {
+                AudioMeter(
+                    level = audioMeter.first,
+                    peak = audioMeter.second,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(
+                            end = if (landscape) railRightWidth + 8.dp else 8.dp,
+                            bottom = if (landscape) 12.dp else 168.dp
+                        )
+                )
+            }
+
+            // 时间码：画面顶部中间，录制中前面带红点
+            if (tcOn) {
+                TimecodeBadge(
+                    text = tcText,
+                    recording = state.isRecordingNow,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                )
+            }
+
+            // AF 锁定时右上角常驻 AF-L 徽标
+            if (afLocked.value) {
+                Text(
+                    "AF-L",
+                    color = Color(0xFF9BFF6A),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(
+                            end = if (landscape) railRightWidth + 8.dp else 12.dp,
+                            top = 12.dp
+                        )
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xE6101114))
+                        .border(1.dp, Color(0xFF9BFF6A).copy(alpha = 0.45f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+            afLockBadge.value?.let { badge ->
+                Text(
+                    badge,
+                    color = Color.White.copy(alpha = 0.92f),
+                    fontSize = 11.sp,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(top = 90.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color(0xF0121315))
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                )
+            }
+
+            // 自动化拍摄：间隔 / 包围 / 自拍计时，点遮罩空白处关闭
+            if (autoOpen) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            autoOpen = false
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
-                    if (analysis.waveform != null) {
-                        Image(analysis.waveform!!, null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                    } else {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("等待波形…", color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
-                        }
-                    }
+                    AutoCapturePanel(state = state, onClose = { autoOpen = false })
                 }
             }
 
@@ -1567,7 +1899,8 @@ private val RAIL_ACTION_IDS = listOf(
     "iso", "shutter", "aperture", "ev", "expMode", "metering", "focusMode",
     "afAreaMode", "wb", "drive", "imageFormat", "resolution", "rawCompression",
     "activeD", "vr", "imageArea", "isoAuto",
-    "lut", "grid", "hist", "wave", "focus", "quality", "toneMode", "view", "rails"
+    "lut", "grid", "hist", "wave", "focus", "quality", "toneMode", "view", "rails",
+    "falseCol", "level", "audio", "tc", "auto", "clock", "guide"
 )
 
 private fun parseRailActions(raw: String, defaults: List<String>): List<String> {
@@ -1641,6 +1974,13 @@ private fun railActionLabel(id: String): String = when (id) {
     "toneMode" -> "色调模式"
     "view" -> "视图"
     "rails" -> "左右栏"
+    "falseCol" -> "伪色"
+    "level" -> "水平仪"
+    "audio" -> "音频电平"
+    "tc" -> "时间码"
+    "auto" -> "间隔/包围"
+    "clock" -> "相机时钟"
+    "guide" -> "构图线"
     else -> id
 }
 
@@ -1670,6 +2010,13 @@ private fun railActionIcon(id: String): androidx.compose.ui.graphics.vector.Imag
     "quality" -> Icons.Rounded.Speed
     "toneMode" -> Icons.Rounded.ColorLens
     "view" -> Icons.Rounded.RotateRight
+    "falseCol" -> Icons.Rounded.Palette
+    "level" -> Icons.Rounded.Straighten
+    "audio" -> Icons.Rounded.GraphicEq
+    "tc" -> Icons.Rounded.AccessTime
+    "auto" -> Icons.Rounded.Timelapse
+    "clock" -> Icons.Rounded.Schedule
+    "guide" -> Icons.Rounded.GridOn
     else -> Icons.Rounded.Tune
 }
 
@@ -1679,13 +2026,23 @@ private fun railActionActive(
     waveOn: Boolean,
     gridOn: Boolean,
     perspectiveOn: Boolean,
-    lutOn: Boolean
+    lutOn: Boolean,
+    falseColorOn: Boolean = false,
+    levelOn: Boolean = false,
+    audioOn: Boolean = false,
+    tcOn: Boolean = false,
+    autoOpen: Boolean = false
 ): Boolean = when (id) {
     "hist" -> histOn
     "wave" -> waveOn
-    "grid" -> gridOn
+    "grid", "guide" -> gridOn
     "lut" -> lutOn
     "view" -> perspectiveOn
+    "falseCol" -> falseColorOn
+    "level" -> levelOn
+    "audio" -> audioOn
+    "tc" -> tcOn
+    "auto" -> autoOpen
     else -> false
 }
 
@@ -2056,7 +2413,7 @@ private fun Modifier.offsetPx(x: Int, y: Int): Modifier = this.then(
 
 /* ------------------------------------------------------------------ 图像分析 */
 
-private fun analyzeFrame(src: ImageBitmap, hist: Boolean, wave: Boolean): FrameAnalysis {
+private fun analyzeFrame(src: ImageBitmap): FrameAnalysis {
     val android = src.asAndroidBitmap()
     val maxW = 360
     val scale = min(1f, maxW.toFloat() / android.width)
@@ -2066,72 +2423,28 @@ private fun analyzeFrame(src: ImageBitmap, hist: Boolean, wave: Boolean): FrameA
     val pixels = IntArray(w * h)
     small.getPixels(pixels, 0, w, 0, 0, w, h)
 
-    val rBins = if (hist) IntArray(256) else null
-    val gBins = if (hist) IntArray(256) else null
-    val bBins = if (hist) IntArray(256) else null
-    val lBins = if (hist) IntArray(256) else null
-    var waveDensity: IntArray? = if (wave) IntArray(256 * 128) else null
+    val rBins = IntArray(256)
+    val gBins = IntArray(256)
+    val bBins = IntArray(256)
+    val lBins = IntArray(256)
 
-    for (y in 0 until h) {
-        for (x in 0 until w) {
+    // 跨 2 像素取样：360px 缩略图上直方图形状几乎不变，计算量降到 1/4，
+    // 监看 15fps 时不再和取景解码抢 CPU。
+    for (y in 0 until h step 2) {
+        for (x in 0 until w step 2) {
             val c = pixels[y * w + x]
             val r = AndroidColor.red(c)
             val g = AndroidColor.green(c)
             val b = AndroidColor.blue(c)
-            if (hist && rBins != null && gBins != null && bBins != null && lBins != null) {
-                rBins[r]++
-                gBins[g]++
-                bBins[b]++
-                lBins[((r * 0.299f + g * 0.587f + b * 0.114f).toInt()).coerceIn(0, 255)]++
-            }
-            if (waveDensity != null && x % 2 == 0 && y % 2 == 0) {
-                val l = (r * 299 + g * 587 + b * 114) / 1000
-                val bx = (x * 255 / (w - 1).coerceAtLeast(1)).coerceIn(0, 255)
-                val by = ((255 - l) * 127 / 255).coerceIn(0, 127)
-                waveDensity[by * 256 + bx] += 1
-            }
+            rBins[r]++
+            gBins[g]++
+            bBins[b]++
+            lBins[(r * 0.299f + g * 0.587f + b * 0.114f).toInt().coerceIn(0, 255)]++
         }
     }
 
-    val waveformBmp = waveDensity?.let { density ->
-        val out = IntArray(256 * 128)
-        val maxV = max(1, density.maxOrNull() ?: 1)
-        for (i in out.indices) {
-            val a = (density[i].toFloat() / maxV * 255).toInt().coerceIn(0, 255)
-            out[i] = (a shl 24) or 0x00E8FF9A
-        }
-        Bitmap.createBitmap(out, 256, 128, Bitmap.Config.ARGB_8888).asImageBitmap()
-    }
-
-    return FrameAnalysis(rBins, gBins, bBins, lBins, waveformBmp)
+    return FrameAnalysis(rBins, gBins, bBins, lBins)
 }
 
-private fun renderLut(src: ImageBitmap, lut: Lut3D): ImageBitmap? = runCatching {
-    val android = src.asAndroidBitmap()
-    // 以前是 420px + 64 级最近邻查表，灰片还原出来糊、还有色阶断层；
-    // 现在按原 LUT 做真三线性插值（Lut3D.map），并把预览尺寸提到 640px，
-    // 监看能看出真实的还原效果，而不是一块发灰的糊图。
-    val maxW = 640
-    val scale = min(1f, maxW.toFloat() / android.width)
-    val w = max(1, ceil(android.width * scale).toInt())
-    val h = max(1, ceil(android.height * scale).toInt())
-    val small = if (android.width == w && android.height == h) android else Bitmap.createScaledBitmap(android, w, h, true)
-    val pixels = IntArray(w * h)
-    small.getPixels(pixels, 0, w, 0, 0, w, h)
-    val out = FloatArray(3)
-    for (i in pixels.indices) {
-        val c = pixels[i]
-        val a = c ushr 24
-        lut.map(
-            AndroidColor.red(c) / 255f,
-            AndroidColor.green(c) / 255f,
-            AndroidColor.blue(c) / 255f,
-            out
-        )
-        val r = (out[0].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-        val g = (out[1].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-        val b = (out[2].coerceIn(0f, 1f) * 255f + 0.5f).toInt()
-        pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
-    }
-    Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
-}.getOrNull()
+// 监看 LUT 预览也搬到 GL 了（LutRenderer 的三维 LUT 四面体插值是全分辨率、每帧实时），
+// 之前的 640px CPU 三线性预览不再需要。

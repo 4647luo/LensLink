@@ -83,6 +83,16 @@ class DoukApplication : Application(), ImageLoaderFactory {
         super.onCreate()
         initFileLogger()
         DoukLog.install(this)
+        DoukLog.installCrashHandler()
+        DoukLog.section("启动")
+        DoukLog.i(
+            "App", "START",
+            "version" to BuildConfig.VERSION_NAME,
+            "code" to BuildConfig.VERSION_CODE,
+            "model" to android.os.Build.MODEL,
+            "sdk" to android.os.Build.VERSION.SDK_INT,
+            "pid" to android.os.Process.myPid()
+        )
         DoukPrefs.init(this)
         com.lutcamera.lutcamerapro.network.FtpPushReceiver.init(this)
         com.lutcamera.lutcamerapro.ui.douk.TransferCenter.init(this)

@@ -77,6 +77,8 @@ fun AddDeviceScreen(
     var manualExpanded by remember { mutableStateOf(false) }
     // 连接教程收进右上角弹窗，页面正文只留选方式与连接按钮。
     var showHint by remember { mutableStateOf(false) }
+    // 应用内直接加入相机热点：以前挂在设备页空态，现在跟着「Wi‑Fi AP 直连」走
+    var showHotspot by remember { mutableStateOf(false) }
     LaunchedEffect(selectedMode) {
         when (selectedMode) {
             ConnectMode.WIFI_AP -> if (manualIp.isBlank()) manualIp = "192.168.1.1"
@@ -281,6 +283,39 @@ fun AddDeviceScreen(
                         color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold
                     )
                 }
+            }
+
+            // AP 直连的配套动作：搜不到相机（多半是手机还没连上相机热点）时，
+            // 由应用直接把手机接到相机热点，省掉跳系统设置那一步。
+            if (selectedMode == ConnectMode.WIFI_AP) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { showHotspot = true },
+                    modifier = Modifier.fillMaxWidth().height(46.dp),
+                    shape = DoukShapes.cardSmall,
+                    colors = ButtonDefaults.buttonColors(containerColor = DoukColors.surfaceMuted)
+                ) {
+                    Icon(
+                        Icons.Rounded.Wifi,
+                        contentDescription = null,
+                        tint = DoukColors.accent,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text(
+                        "连接相机热点（备用）",
+                        color = DoukColors.textPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "手机还没连上相机 Wi‑Fi 时用这个：点一下直接加入相机热点，不用去系统设置里手动连。",
+                    fontSize = 11.sp,
+                    color = DoukColors.textTertiary,
+                    lineHeight = 16.sp
+                )
             }
 
             // 搜索进度与结果紧跟搜索按钮，搜完立刻能看到
@@ -553,21 +588,52 @@ fun AddDeviceScreen(
                 }
             }
 
-            // 只在「正在连接」时回显一句进度；失败原因一律不铺在界面上（日志文件里都有）
-            val liveHint = if (!state.isConnected) state.connectionStage else ""
-            val shownHint = if (state.isConnecting) {
-                listOf(state.lastHint, liveHint)
+            // 连接中显示进度，失败后把原因留在界面上并给「重试」。
+            // 旧实现只在 isConnecting 期间显示一行进度，失败瞬间 isConnecting 变 false，
+            // 提示跟着一起消失 —— 用户体感就是「点一下什么都没发生」。现在失败原因常驻，
+            // 直到用户重试或翻过这一页，和 Imaging Console 失败后直接摊开原因一致。
+            val failed = !state.isConnected && !state.isConnecting &&
+                (state.connectionStage.startsWith("连接失败") || state.lastHint.startsWith("连接失败"))
+            val shownHint = when {
+                state.isConnecting -> listOf(state.lastHint, state.connectionStage)
                     .firstOrNull { it.isNotBlank() && it != "未连接" && !it.startsWith("未连接 ") }
                     .orEmpty()
-            } else ""
+                failed -> listOf(state.connectionStage, state.lastHint)
+                    .firstOrNull { it.startsWith("连接失败") }
+                    ?: "连接失败：相机没有应答"
+                else -> ""
+            }
             if (shownHint.isNotBlank()) {
                 Spacer(modifier = Modifier.height(10.dp))
-                Text(
-                    shownHint,
-                    fontSize = 12.sp,
-                    color = DoukColors.textSecondary,
-                    lineHeight = 19.sp
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(DoukShapes.cardSmall)
+                        .background(if (failed) DoukColors.dangerSoft else Color.Transparent)
+                        .padding(if (failed) 12.dp else 0.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        shownHint,
+                        fontSize = 12.sp,
+                        color = if (failed) DoukColors.danger else DoukColors.textSecondary,
+                        lineHeight = 19.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (failed) {
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Button(
+                            onClick = { state.connectDirect(context, state.lastTargetIp) },
+                            enabled = state.lastTargetIp.isNotBlank(),
+                            modifier = Modifier.height(36.dp),
+                            contentPadding = PaddingValues(horizontal = 16.dp),
+                            shape = DoukShapes.cardSmall,
+                            colors = ButtonDefaults.buttonColors(containerColor = DoukColors.danger)
+                        ) {
+                            Text("重试", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
             }
 
             // 相机只给最小能力集 = 尼康的「待配对」状态。只保留标题和一个确认按钮，
@@ -610,6 +676,12 @@ fun AddDeviceScreen(
         }
     }
 
+    if (showHotspot) {
+        // 关掉弹窗就回到 AP 直连这一页；加入成功后进度/结果由 state.lastHint 常驻显示，
+        // 不在这里覆盖 hint，避免把上一次的「未连接」文本又贴回来。
+        CameraHotspotDialog(state) { showHotspot = false }
+    }
+
     if (showHint) {
         AlertDialog(
             onDismissRequest = { showHint = false },
@@ -649,19 +721,18 @@ private fun ModeCard(
         ConnectMode.USB_PTP -> Icons.Rounded.Usb
         ConnectMode.BLUETOOTH -> Icons.Rounded.Bluetooth
     }
+    val cardShape = DoukShapes.cardSmall
+    // 卡面本身已经带描边（doukCardSurface），这里只在选中时再压一圈主色，
+    // 未选中不再叠第二条线 —— 否则看起来像一张卡片套在另一张卡片里。
+    val surface = Modifier
+        .fillMaxWidth()
+        .clip(cardShape)
+        .doukCardSurface(
+            cardShape,
+            tint = if (selected) DoukColors.accentSoft else Color.Transparent
+        )
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(DoukShapes.cardSmall)
-            .doukCardSurface(
-                DoukShapes.cardSmall,
-                tint = if (selected) DoukColors.accentSoft else Color.Transparent
-            )
-            .border(
-                width = 1.5.dp,
-                color = if (selected) DoukColors.accent else DoukColors.divider,
-                shape = DoukShapes.cardSmall
-            )
+        modifier = (if (selected) surface.border(1.5.dp, DoukColors.accent, cardShape) else surface)
             .clickable(onClick = onClick)
             .padding(14.dp),
         verticalAlignment = Alignment.CenterVertically

@@ -67,11 +67,41 @@ object CameraLanProbe {
         val out = LinkedHashSet<String>()
         out.addAll(gatewayAddresses(context))
         known.map { it.trim() }.filter { it.isNotEmpty() }.forEach { out.add(it) }
+        // 当前网段里的低号地址：机身当 DHCP 客户端时常见 .2 / .10，网关有时是路由器而不是相机
+        out.addAll(lowSubnetTargets(context))
         // Nikon 机身默认 AP 地址；不同机型还会走网关，两个都并发探。
-        out.add("192.168.1.1")
-        out.add("192.168.0.1")
+        // 一代（WU‑1a/D5300）几乎固定 192.168.1.1，二代浮动到 .10，
+        // 三代（Z8/Z9/Zf）又回到 .1；另有固件把热点开在 192.168.122/125 段。
+        NIKON_AP_CANDIDATES.forEach { out.add(it) }
         return out.filter { isValidIpv4(it) }
     }
+
+    /**
+     * 当前局域网网段内最像相机的低号地址（x.1–x.8）。
+     *
+     * 相机在 STA 模式下是普通 DHCP 客户端，地址可能被路由器分到 .2/.5/.10；
+     * 只探网关会漏掉。这里只取 8 个地址，和网关一起并发探，不会压到机身热点。
+     */
+    private fun lowSubnetTargets(context: Context): List<String> {
+        val out = ArrayList<String>()
+        for (net in activeLanNetworks(context)) {
+            val prefix = net.ip.split('.').take(3).joinToString(".")
+            for (last in 1..8) out.add("$prefix.$last")
+        }
+        return out
+    }
+
+    private val NIKON_AP_CANDIDATES = listOf(
+        // 一代 / 三代：默认热点地址
+        "192.168.1.1", "192.168.1.10",
+        // 二代：DHCP 常常从 .10 起分配
+        "192.168.0.1", "192.168.0.2", "192.168.0.10",
+        // 部分固件把热点开在 122/125 段（Z6II/Z7II 与个别 D 系列）
+        "192.168.122.1", "192.168.122.2",
+        "192.168.125.1", "192.168.125.2",
+        // 老机型/第三方热点
+        "172.16.0.1", "172.16.1.1", "10.0.0.1"
+    )
 
     /**
      * AP 直连时确认相机真实地址：把用户填的地址和当前 Wi‑Fi 网关/DHCP 服务器并发探一遍，
@@ -88,7 +118,7 @@ object CameraLanProbe {
         timeoutMs: Int = 700
     ): String? {
         val nets = activeLanNetworks(context)
-        val ips = (listOf(preferred.trim()) + gatewayAddresses(context))
+        val ips = (listOf(preferred.trim()) + gatewayAddresses(context) + NIKON_AP_CANDIDATES)
             .filter { isValidIpv4(it) }
             .distinct()
         return probeCandidates(context, ips, timeoutMs, nets).firstOrNull()?.ip

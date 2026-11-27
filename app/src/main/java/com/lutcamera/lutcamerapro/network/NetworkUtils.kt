@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import com.lutcamera.lutcamerapro.log.DoukLog
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.Collections
@@ -41,7 +42,7 @@ object NetworkUtils {
                 }
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            DoukLog.w("Net", "LOCAL_IP_FAIL", "error" to (e.message ?: "?"))
         }
         return "192.168.1.2"
     }
@@ -58,7 +59,7 @@ object NetworkUtils {
                 return "${gateway and 0xFF}.${(gateway shr 8) and 0xFF}.${(gateway shr 16) and 0xFF}.${(gateway shr 24) and 0xFF}"
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            DoukLog.w("Net", "GATEWAY_FAIL", "error" to (e.message ?: "?"))
         }
         return "192.168.122.1"
     }

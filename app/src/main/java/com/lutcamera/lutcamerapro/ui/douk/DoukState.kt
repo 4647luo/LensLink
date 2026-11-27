@@ -17,9 +17,13 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.lutcamera.lutcamerapro.log.DoukLog
 import com.lutcamera.lutcamerapro.model.CameraStorageFile
+import com.lutcamera.lutcamerapro.network.CameraHotspot
 import com.lutcamera.lutcamerapro.network.CameraLanProbe
 import com.lutcamera.lutcamerapro.network.LiveViewQuality
+import com.lutcamera.lutcamerapro.network.NikonGeneration
 import com.lutcamera.lutcamerapro.network.NikonPtpClient
+import com.lutcamera.lutcamerapro.network.PtpIpDiscovery
+import com.lutcamera.lutcamerapro.network.SoftApDetector
 import com.lutcamera.lutcamerapro.network.UsbPtpClient
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleGpsClient
 import com.lutcamera.lutcamerapro.network.nikon.ble.NikonBleRemoteClient
@@ -31,6 +35,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -516,6 +521,28 @@ class DoukState(
             GalleryFileOps.applyExifOrientation(bmp, GalleryFileOps.exifOrientationOf(bytes)).asImageBitmap()
         }.getOrNull()
     }
+
+    /**
+     * 看图页的分级预览：相机里的图先拉机身 0x90C4 大预览（约 1600×1200）顶上来，
+     * 翻页不用为 45MP 原图干等；失败再回落 0x100A 小缩略图。USB 通道同理。
+     */
+    suspend fun cameraPreviewBitmap(handle: Int, fromUsb: Boolean): ImageBitmap? {
+        if (fromUsb) return usbThumbBitmap(handle)
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val bytes = vm.ptpClient.readBigThumbnail(handle)
+                    ?: vm.ptpClient.readThumbnail(handle)
+                    ?: return@runCatching null
+                decodeThumb(bytes)
+            }.getOrNull()
+        }
+    }
+
+    /** 监看页校时卡片：读机身时间（格式化后的字符串）。 */
+    suspend fun readCameraClock(): String? = vm.readCameraClock()
+
+    /** 接上一条：把手机时间写进机身并读回确认。 */
+    suspend fun syncCameraClock(): Boolean = vm.syncCameraClock()
 
     /** 「保存到」用：按句柄从机身拉完整文件字节（JPG / NEF 原文件，不做解码） */
     suspend fun cameraPhotoBytes(handle: Int): ByteArray? = withContext(Dispatchers.IO) {
@@ -1549,88 +1576,113 @@ class DoukState(
         if (skipPreflight) {
             lastHint = "$target 已确认可达，正在建立 PTP/IP 会话…"
             DoukLog.i("Connect", "FAST_CONNECT", "target" to target, "mode" to connectMode)
-            vm.connect(context.applicationContext, target)
+            vm.connect(context.applicationContext, target, skipPreflight = true)
             return
         }
         lastHint = "正在验证 $target:${CameraLanProbe.PTP_PORT} …"
         DoukLog.i("Connect", "PRECHECK_BEGIN", "target" to "$target:${CameraLanProbe.PTP_PORT}", "mode" to connectMode)
         ioScope.launch {
-            // 相机热点模式下，机身要先把热点服务从「配对」切到「传输」，端口会晚几秒才开；
-            // 二代机（Z6II/Z7II 等）尤其慢。多给几次机会，别一次探测失败就判死刑。
+            // 相机热点模式下机身要先把服务从「配对」切到「传输」，端口偶尔晚几秒才开；
+            // 这段只在点连接时跑一次，不再靠多次串行重试把等待时间拉长。
             val apMode = detectedWifiRole == ConnectMode.WIFI_AP || connectMode == ConnectMode.WIFI_AP
-            var reachable = false
-            // AP 下机身只有一个 PTP/IP 客户端槽，每探一次就占一次、关掉还要等机身回收。
-            // 参考 N-link / Z Console 的做法：少探、探到就等久一点再正式握手（不是 400ms）。
-            val tries = if (apMode) attempts.coerceAtLeast(1).coerceAtMost(3) else attempts.coerceAtLeast(1)
-            for (i in 1..tries) {
-                reachable = CameraLanProbe.isOpen(target, if (apMode) 900 else 1500)
-                DoukLog.i("Connect", "PRECHECK_PROBE", "attempt" to i, "of" to tries,
-                    "target" to target, "open" to reachable)
-                if (reachable) break
-                if (i < tries) {
-                    val wait = (2000L * i).coerceAtMost(4000L)
-                    withContext(Dispatchers.Main) {
-                        lastHint = "$target:${CameraLanProbe.PTP_PORT} 暂时没开（第 $i/$tries 次）" +
-                            "，${wait / 1000} 秒后再试…"
-                    }
-                    delay(wait)
-                }
+            // 只做「一次并发短探测」，不再串行重试 3 次 + 2s/4s 退避。
+            // 旧实现点一下要先白等 8 秒才进握手，失败后还要再等握手超时，用户看到的就是
+            // 长时间没反应。AP 模式把 target、网关、历史 IP 一起并发探一次，
+            // 总耗时 ≈ 一个 900ms 窗口；探不到就立刻给结论。
+            val knownIps = DoukPrefs.knownDevices().map { it.ip }
+            val probeIps = CameraLanProbe.priorityTargets(context.applicationContext, listOf(target) + knownIps)
+            // 按机身上报过的型号取代际：决定探测窗口和失败提示，未知时按二代保守处理
+            val generation = NikonGeneration.from(
+                DoukPrefs.knownDevices().firstOrNull { it.ip == target }?.model?.takeIf { it.isNotBlank() }
+                    ?: vm.cameraModel.takeIf { it.isNotBlank() }
+            )
+            // mDNS 与端口探测同时跑：机身广播 `_ptpip._tcp` 时能直接拿到真实地址，
+            // 比猜网关可靠（二代换网段、路由器不按 .1 分配时尤其有用）。
+            val mdns = async(Dispatchers.IO) {
+                PtpIpDiscovery.endpoints(context.applicationContext, if (apMode) 1200L else 1600L)
             }
-            if (reachable) {
-                // 探测只做 TCP 建链后立刻 close，但机身只有一个 PTP/IP 客户端槽，
-                // 关掉的连接在相机侧还要一小段时间回收。立刻发真实握手会撞在满的
-                // accept 队列上，表现就是「端口可达却连接失败」。AP 机型回收更慢，
-                // 留 1.2 秒；STA（家用路由）400ms 足够。
-                delay(if (apMode) 1200 else 400)
+            val hits = CameraLanProbe.probePreferred(
+                context = context.applicationContext,
+                ips = probeIps,
+                timeoutMs = if (apMode) generation.probeTimeoutMs else 1500
+            )
+            val probed = hits.map { it.ip }.toSet()
+            val mdnsIps = mdns.await().filter { it !in probed }
+            val extraHits = if (mdnsIps.isNotEmpty()) {
+                CameraLanProbe.probePreferred(context.applicationContext, mdnsIps, 700)
+            } else emptyList()
+            val allHits = hits + extraHits
+            DoukLog.i("Connect", "PRECHECK_ONCE", "target" to "$target:${CameraLanProbe.PTP_PORT}",
+                "ap" to apMode, "gen" to generation.name,
+                "hits" to allHits.joinToString(",") { it.ip },
+                "mdns" to mdnsIps.joinToString(","), "attemptsHint" to attempts)
+            // 优先用用户点的地址；它不通就用同一批探测里活着的相机地址。
+            val reachable = allHits.firstOrNull { it.ip == target } ?: allHits.firstOrNull()
+            if (reachable != null) {
+                // 探测只做 TCP 建链立刻 close，机身单客户端槽要回收一会儿才能发真实握手，
+                // 否则会撞在满的 accept 队列上，表现就是「端口可达却连接失败」。
+                // 这个等待按机型代际给：一代热点栈慢，给到 900ms。
+                delay(generation.settleDelayMs)
+                val useIp = reachable.ip
                 withContext(Dispatchers.Main) {
-                    DoukLog.i("Connect", "PREFLIGHT_OK", "target" to "$target:${CameraLanProbe.PTP_PORT}")
-                    lastHint = "$target 端口可达，正在建立 PTP/IP 会话…"
-                    vm.connect(context.applicationContext, target)
+                    if (useIp != target) {
+                        lastHotIp = useIp
+                        lastHint = "原来的 $target 不通，改用网段里探到的相机 $useIp，正在建立 PTP/IP 会话…"
+                        DoukLog.i("Connect", "PREFLIGHT_RECOVER", "old" to target, "new" to useIp)
+                    } else {
+                        lastHint = "$target 端口可达，正在建立 PTP/IP 会话…"
+                    }
+                    DoukLog.i("Connect", "PREFLIGHT_OK", "target" to "$useIp:${CameraLanProbe.PTP_PORT}")
+                    vm.connect(context.applicationContext, useIp, skipPreflight = true)
                 }
                 return@launch
             }
-
-            // 端口一直不通：STA 模式下相机重新加入热点后很可能被 DHCP 换地址，才需要扫 /24；
-            // AP 模式下绝不能扫整个网段 —— 相机热点的 Wi‑Fi 栈扛不住两百多个并发 SYN，
-            // 扫一轮就会把热点压断，相机上直接显示「连接失败」。
-            val hits = if (apMode) {
-                CameraLanProbe.probePreferred(
-                    context = context.applicationContext,
-                    ips = CameraLanProbe.priorityTargets(
-                        context,
-                        listOf(target) + DoukPrefs.knownDevices().map { it.ip }
-                    ),
-                    timeoutMs = 700
-                )
-            } else if (connectMode == ConnectMode.WIFI_STA) {
-                CameraLanProbe.scan(
+            // STA（家路由）下相机重新入网可能被 DHCP 换地址，才值得扫 /24；
+            // AP 模式绝不能扫整个网段 —— 相机热点扛不住两百多个并发 SYN，会把热点压断。
+            if (!apMode && connectMode == ConnectMode.WIFI_STA) {
+                val wide = CameraLanProbe.scan(
                     context = context.applicationContext,
                     timeoutMs = 350,
-                    preferred = CameraLanProbe.priorityTargets(
-                        context,
-                        listOf(target) + DoukPrefs.knownDevices().map { it.ip }
-                    )
+                    preferred = probeIps
                 )
-            } else emptyList()
-            val hit = hits.firstOrNull { it.ip != target } ?: hits.firstOrNull()
-            withContext(Dispatchers.Main) {
+                val hit = wide.firstOrNull { it.ip != target } ?: wide.firstOrNull()
                 if (hit != null) {
-                    DoukLog.i("Connect", "PREFLIGHT_RECOVER", "old" to target, "new" to hit.ip)
-                    lastHotIp = hit.ip
-                    lastHint = "原来的 $target 不通，但网段里扫到了相机 ${hit.ip}，正在用它连接…"
-                    vm.connect(context.applicationContext, hit.ip)
-                } else {
-                    DoukLog.e("Connect", "PREFLIGHT_FAIL", "target" to "$target:${CameraLanProbe.PTP_PORT}",
-                        "localNets" to CameraLanProbe.localNetworkSummary())
-                    lastHint = when (connectMode) {
-                        ConnectMode.WIFI_STA -> "$target 不可达。"
-                        else -> "$target 不可达。"
+                    withContext(Dispatchers.Main) {
+                        lastHotIp = hit.ip
+                        lastHint = "网段里扫到了相机 ${hit.ip}，正在用它连接…"
+                        vm.connect(context.applicationContext, hit.ip, skipPreflight = true)
                     }
+                    return@launch
                 }
+            }
+            // 一个地址都探不通：按「手机在不在相机网段」把原因直接说清楚，不让界面停在「正在验证」。
+            val onCameraNet = CameraLanProbe.localIpForSubnet(target)
+            val nets = CameraLanProbe.localNetworkSummary()
+            DoukLog.e("Connect", "PREFLIGHT_FAIL", "target" to "$target:${CameraLanProbe.PTP_PORT}",
+                "localNets" to nets, "onCameraNet" to (onCameraNet ?: "-"), "ap" to apMode,
+                "gen" to generation.name)
+            withContext(Dispatchers.Main) {
+                val dropMs = CameraHotspot.lastDropAfterMs()
+                val softAp = if (apMode) SoftApDetector.describe(context.applicationContext) else null
+                val base = when {
+                    // 本机热点在跑：相机热点已经被系统收回，用户该关的是个人热点
+                    apMode && softAp != null ->
+                        "连接失败：本机「个人热点」还开着（$softAp），它和相机热点抢同一张 Wi-Fi 网卡，" +
+                            "加入的相机热点会被系统收回。请先在 设置 › 连接与共享 › 个人热点 关闭热点，再点「连接相机热点」重试"
+                    // 入网成功过却又立刻被系统收回：不是相机的问题，是本机在同一个网卡上开了热点
+                    apMode && dropMs in 1..20_000L ->
+                        "连接失败：相机热点入网约 ${(dropMs / 1000).coerceAtLeast(1)} 秒就被系统断开了（本机 $nets）。" +
+                            "平板自己开着「个人热点」时会占住同一张 Wi-Fi 网卡，请先在系统设置里关闭个人热点" +
+                            "（设置 › 热点与连接 › 个人热点），再点「连接相机热点」重试"
+                    onCameraNet == null ->
+                        "连接失败：手机不在相机网段（本机 $nets，相机 $target）。先在设备页点「连接相机 Wi‑Fi」或到系统 WLAN 里连上相机显示的热点，出现「无法访问互联网」提示时选保持连接，再点重试"
+                    else ->
+                        "连接失败：相机 Wi-Fi 已连上，但 $target:${CameraLanProbe.PTP_PORT} 没有开放。相机可能已休眠或退出了「连接至智能设备」，在相机上重新进入 Wi-Fi 连接画面后再点重试"
+                }
+                lastHint = "$base\n${generation.hint}"
             }
         }
     }
-
     /** 按当前选中的连接方式，把网络模式映射到 PTP 客户端 */
     private fun applyNetworkMode(ip: String) {
         // 实际拓扑优先：能判断出手机连着相机热点，就不按枚举里的默认 STA 走。
@@ -1691,6 +1743,72 @@ class DoukState(
         connectSafely(context, ip)
     }
 
+    /**
+     * 在应用内直接加入相机热点（不跳系统设置），成功后自动探端口并连 PTP。
+     *
+     * 系统对「无外网热点」会弹一次确认框，确认后由 [CameraHotspot] 持有这条网络；
+     * 用户断开连接时再释放，避免相机热点被系统提前踢掉。
+     */
+    fun joinCameraHotspot(context: Context, ssid: String, password: String) {
+        val app = context.applicationContext
+        CameraHotspot.attach(app)
+        val clean = ssid.trim()
+        if (clean.isBlank()) {
+            lastHint = "请先选择或填写相机热点名称"
+            return
+        }
+        lastHint = "正在加入相机热点「$clean」…（系统弹窗出现时选「连接」）"
+        // 单射频机型：本机热点还开着时，加入相机热点必然被系统收回。
+        // 与其让用户等一轮 DHCP 再看到「不在相机网段」，不如直接说清楚要关什么。
+        SoftApDetector.active(app)?.let { ap ->
+            DoukLog.w("CameraHotspot", "JOIN_BLOCKED_SOFTAP",
+                "iface" to ap.iface, "ip" to ap.ip, "ssid" to clean)
+            lastHint = "连接失败：本机「个人热点」还开着（${ap.iface} ${ap.ip}），它和相机热点要抢同一张 Wi‑Fi 网卡，" +
+                "加入后会被系统立刻收回。\n请先到 设置 › 连接与共享 › 个人热点 把它关掉（下拉控制中心里也要确认图标已灭），" +
+                "再回来点一次连接。"
+            return
+        }
+        DoukLog.i("CameraHotspot", "JOIN_BEGIN", "ssid" to clean, "hasPassword" to password.isNotBlank())
+        ioScope.launch {
+            when (val result = CameraHotspot.join(app, CameraHotspot.Credential(clean, password))) {
+                is CameraHotspot.Result.Failed -> withContext(Dispatchers.Main) {
+                    lastHint = "连接失败：${result.message}"
+                }
+                is CameraHotspot.Result.Joined -> {
+                    withContext(Dispatchers.Main) {
+                        lastHint = "已加入「$clean」，正在确认相机的 PTP 端口…"
+                    }
+                    // 热点的 DHCP / 相机端口开放有几秒延迟，这里给一次短探测窗口
+                    delay(1200)
+                    val hits = CameraLanProbe.probePreferred(
+                        context = app,
+                        ips = result.cameraIps + CameraLanProbe.priorityTargets(app, emptyList()),
+                        timeoutMs = 1200
+                    )
+                    val ip = hits.firstOrNull()?.ip
+                    withContext(Dispatchers.Main) {
+                        if (ip == null) {
+                            val dropMs = CameraHotspot.lastDropAfterMs()
+                            lastHint = if (dropMs in 1..20_000L)
+                                "连接失败：相机热点入网后被系统断开了（约 ${(dropMs / 1000).coerceAtLeast(1)} 秒）。" +
+                                    "请先关闭本机「个人热点」再点连接；同时确认相机仍停在「连接至智能设备」的等待画面。"
+                            else "连接失败：热点已连上，但 15740 没有回应。请在相机上确认已进入「连接至智能设备」的等待画面，" +
+                                "相机屏幕不再显示等待时把 Wi‑Fi 关一次再开，然后重新点「连接相机热点（备用）」。"
+                        } else {
+                            lastTargetIp = ip
+                            lastHint = "热点已连上，相机在 $ip，正在建立 PTP/IP 会话…"
+                            DoukLog.i("CameraHotspot", "HOTSPOT_TARGET", "ip" to ip)
+                            connectSafely(context, ip, skipPreflight = true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** 上次成功入网的热点，设备页用它做一键重连的默认值。 */
+    fun savedCameraHotspot(): CameraHotspot.Credential? = CameraHotspot.saved()
+
     fun confirmLockedImport() {
         lockedImportPrompt = false
         vm.importLockedPhotos(onlyAfterConnect = DoukPrefs.lockedNewOnly)
@@ -1708,6 +1826,9 @@ class DoukState(
         vm.disconnect()
         usb.disconnect()
         ble.disconnect()
+        // 主动断开时把应用内加入的相机热点一起放掉，否则系统会一直把这条无外网
+        // 网络挂着，用户回到有网环境也会被它拖住
+        CameraHotspot.release()
         previewVisible = true
         pairingRequired = false
         pairingCode = null
@@ -1800,7 +1921,7 @@ class DoukState(
                 lastHotIp = ip
                 withContext(Dispatchers.Main) {
                     lastHint = "相机端口已恢复，正在用 $ip 建立新会话…"
-                    vm.connect(context.applicationContext, ip)
+                    vm.connect(context.applicationContext, ip, skipPreflight = true)
                 }
                 if (awaitConnected(9000)) {
                     withContext(Dispatchers.Main) {
@@ -1824,7 +1945,7 @@ class DoukState(
                     DoukLog.i("Pair", "HANDOFF_NEW_IP", "ip" to ip)
                     withContext(Dispatchers.Main) {
                         lastHint = "相机换到了 $ip，正在用它重连…"
-                        vm.connect(context.applicationContext, ip)
+                        vm.connect(context.applicationContext, ip, skipPreflight = true)
                     }
                     if (awaitConnected(9000)) {
                         withContext(Dispatchers.Main) { pairingMessage = "" }

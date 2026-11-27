@@ -379,6 +379,17 @@ internal fun PhotoViewerScreen(
                 }
             }
         }
+        // 分级下载：相机里的图先拉 0x90C4 大预览（≈1600×1200）顶上来，翻页不用为 45MP 原图干等；
+        // 真正要原图仍由用户点「原图」触发，下载同时会进传输中心队列。
+        if (item.origin == "cam" && !item.isVideo && !showOriginal && fullCache[item.stableKey] == null) {
+            val preview = withContext(Dispatchers.IO) {
+                state.cameraPreviewBitmap(item.key, item.fromUsb)
+            }
+            if (preview != null && hdKey == item.stableKey) {
+                hd = preview
+                message = null
+            }
+        }
         // Live 图探测：只读文件头，几十毫秒；真正播放再抽视频
         isLive = withContext(Dispatchers.IO) { LivePhoto.probe(context, item) }
 
@@ -585,10 +596,20 @@ internal fun PhotoViewerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     // 一个手势状态机管完：双指缩放、单指横滑换图、单指上滑分享、单击收 UI、双击放大
-                    .pointerInput(item.stableKey, isLive) {
+                    .pointerInput(item.stableKey, isLive, liveOpen) {
                         coroutineScope {
                         awaitEachGesture {
                             awaitFirstDown(requireUnconsumed = false)
+                            // Live 正在原图上播：这一手完全交给播放层（轻点结束），
+                            // 不参与横滑换图/缩放，否则播到一半画面会被滑走。
+                            if (liveOpen) {
+                                var up = false
+                                while (!up) {
+                                    val ev = awaitPointerEvent()
+                                    up = ev.changes.none { it.pressed }
+                                }
+                                return@awaitEachGesture
+                            }
                             val downAt = System.currentTimeMillis()
                             var pointers = 1
                             // 已经放大时，这一手改成单指平移，而不是横滑换图。
@@ -903,37 +924,45 @@ internal fun PhotoViewerScreen(
                 }
             }
 
-            // Live 播放层：系统 VideoView 足够播这段几秒的片段
+            // Live 播放层：盖在原图同一块位置上播，不另开全屏窗口。
+            // 以前用 Dialog 会先黑一屏再跳回来，长按的瞬间观感很差。
             if (liveOpen && liveFile != null) {
-                Dialog(
-                    onDismissRequest = { liveOpen = false },
-                    properties = DialogProperties(usePlatformDefaultWidth = false)
-                ) {
-                    Box(
-                        modifier = Modifier.fillMaxSize().background(Color.Black),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        AndroidView(
-                            factory = { ctx ->
-                                android.widget.VideoView(ctx).apply {
-                                    setVideoPath(liveFile!!.absolutePath)
-                                    setOnCompletionListener { liveOpen = false }
-                                    start()
+                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                    val quarter = (rotation % 180f) != 0f
+                    val rawW = (bitmap?.width ?: item.width ?: 1).toFloat()
+                    val rawH = (bitmap?.height ?: item.height ?: 1).toFloat()
+                    val aspect = if (quarter && rawW > 0f) rawH / rawW else rawW / rawH
+                    val availW = maxWidth
+                    val availH = maxHeight
+                    val viewAspect = if (availH.value > 0f) availW.value / availH.value else 1f
+                    val fitW = if (aspect > viewAspect) availW else availH * aspect
+                    val fitH = if (aspect > viewAspect) availW / aspect else availH
+                    AndroidView(
+                        factory = { ctx ->
+                            LiveClipView(ctx).apply {
+                                // 首帧上屏后才淡入，静帧与视频之间没有黑场
+                                onFinished = { liveOpen = false }
+                                onError = {
+                                    liveOpen = false
+                                    message = "这段 Live 视频播不出来，可能编码不被支持"
                                 }
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 640.dp)
-                        )
-                        IconButton(
-                            onClick = { liveOpen = false },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .statusBarsPadding()
-                        ) {
-                            Icon(Icons.Rounded.ArrowBack, contentDescription = "关闭", tint = Color.White)
-                        }
-                    }
+                            }
+                        },
+                        update = { view ->
+                            // 同一个片段只 play 一次，重组时不重新起播
+                            if (view.tag != liveFile) {
+                                view.tag = liveFile
+                                liveFile?.let { view.play(it) }
+                            }
+                        },
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(fitW, fitH)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null
+                            ) { liveOpen = false }
+                    )
                 }
             }
 

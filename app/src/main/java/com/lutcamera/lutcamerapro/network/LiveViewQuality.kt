@@ -26,6 +26,8 @@ object LiveViewQuality {
         FLUENT -> BitmapFactory.Options().apply {
             inSampleSize = 2
             inPreferredConfig = Bitmap.Config.RGB_565
+            // 复用作 inBitmap 需要可变位图
+            inMutable = true
         }
         HD -> BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -33,6 +35,7 @@ object LiveViewQuality {
         }
         else -> BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.RGB_565
+            inMutable = true
         }
     }
 

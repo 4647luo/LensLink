@@ -488,17 +488,21 @@ internal object VideoLutExporter {
                     if (pendingOffset < pending.size) {
                         val inIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
                         if (inIndex >= 0) {
-                            val ib = encoder.getInputBuffer(inIndex)!!
-                            ib.clear()
-                            val take = minOf(ib.remaining(), pending.size - pendingOffset) / frameBytes * frameBytes
-                            if (take > 0) {
-                                ib.put(pending, pendingOffset, take)
-                                val ptsUs = framesFed * 1_000_000L / sampleRate
-                                framesFed += take / frameBytes
-                                pendingOffset += take
-                                encoder.queueInputBuffer(inIndex, 0, take, ptsUs, 0)
+                            val ib = encoder.getInputBuffer(inIndex)
+                            if (ib == null) {
+                                DoukLog.w("VideoLut", "AUDIO_INPUT_BUFFER_NULL")
                             } else {
-                                encoder.queueInputBuffer(inIndex, 0, 0, 0, 0)
+                                ib.clear()
+                                val take = minOf(ib.remaining(), pending.size - pendingOffset) / frameBytes * frameBytes
+                                if (take > 0) {
+                                    ib.put(pending, pendingOffset, take)
+                                    val ptsUs = framesFed * 1_000_000L / sampleRate
+                                    framesFed += take / frameBytes
+                                    pendingOffset += take
+                                    encoder.queueInputBuffer(inIndex, 0, take, ptsUs, 0)
+                                } else {
+                                    encoder.queueInputBuffer(inIndex, 0, 0, 0, 0)
+                                }
                             }
                         }
                     }
@@ -874,25 +878,33 @@ internal object VideoLutExporter {
                 if (!inputDone) {
                     val inIndex = decoder.dequeueInputBuffer(TIMEOUT_US)
                     if (inIndex >= 0) {
-                        val buffer = decoder.getInputBuffer(inIndex)!!
-                        val sampleTime = extractor.sampleTime
-                        if (sampleTime < 0 || sampleTime > segmentEndUs) {
+                        val buffer = decoder.getInputBuffer(inIndex)
+                        if (buffer == null) {
+                            DoukLog.w("VideoLut", "VIDEO_INPUT_BUFFER_NULL")
                             decoder.queueInputBuffer(
                                 inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                             )
                             inputDone = true
                         } else {
-                            val size = extractor.readSampleData(buffer, 0)
-                            if (size < 0) {
+                            val sampleTime = extractor.sampleTime
+                            if (sampleTime < 0 || sampleTime > segmentEndUs) {
                                 decoder.queueInputBuffer(
                                     inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                 )
                                 inputDone = true
                             } else {
-                                decoder.queueInputBuffer(
-                                    inIndex, 0, size, sampleTime, 0
-                                )
-                                extractor.advance()
+                                val size = extractor.readSampleData(buffer, 0)
+                                if (size < 0) {
+                                    decoder.queueInputBuffer(
+                                        inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                    )
+                                    inputDone = true
+                                } else {
+                                    decoder.queueInputBuffer(
+                                        inIndex, 0, size, sampleTime, 0
+                                    )
+                                    extractor.advance()
+                                }
                             }
                         }
                     }

@@ -19,6 +19,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -27,6 +31,7 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
+import com.lutcamera.lutcamerapro.network.ElevationLookup
 import com.lutcamera.lutcamerapro.ui.douk.DoukPrefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.UUID
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -143,6 +149,10 @@ class NikonBleGpsClient(private val context: Context) {
 
     private val _lastPayloadAltitude = MutableStateFlow<Int?>(null)
     val lastPayloadAltitude = _lastPayloadAltitude.asStateFlow()
+
+    /** 上一包海拔的来源（本次 / 气压计 / 缓存 / GPS 最近），设备页直接显示，便于排查推 0 的问题 */
+    private val _lastAltitudeSource = MutableStateFlow("")
+    val lastAltitudeSource = _lastAltitudeSource.asStateFlow()
 
     /** null=还没推过；true=相机回执确认；false=写入失败/被拒收 */
     private val _lastPushConfirmed = MutableStateFlow<Boolean?>(null)
@@ -254,6 +264,19 @@ class NikonBleGpsClient(private val context: Context) {
     private var autoReconnectAttempts = 0
     private var manualDisconnect = false
     private var lastGoodAltitude: Double? = null
+    private var lastGoodAltitudeAt = 0L
+    /** 在线高程（没有气压计的设备靠它补海拔），按位置缓存 */
+    private var remoteAltitude: Double? = null
+    private var remoteLat = 0.0
+    private var remoteLon = 0.0
+    private var elevationJob: Job? = null
+    private var lastElevationAttemptAt = 0L
+    /** 气压计：网络定位拿不到海拔时用它兜底，海平面气压由 GPS 海拔标定 */
+    private var barometer: Sensor? = null
+    private var baroListener: SensorEventListener? = null
+    private var baroPressureHpa: Float? = null
+    private var seaLevelPressureHpa: Float? = null
+    private var baroAltitudeM: Double? = null
     private var placeLat = 0.0
     private var placeLon = 0.0
     private var placeAt = 0L
@@ -262,6 +285,13 @@ class NikonBleGpsClient(private val context: Context) {
     /** 智能设备 GPS 是用户主动点的例外：允许在 Wi‑Fi 会话中临时扫一次蓝牙 */
     @Volatile private var allowScanDuringWifi = false
 
+    /**
+     * Wi‑Fi / USB 会话状态变化。
+     *
+     * 相机一旦进入「连接至智能设备」的 Wi‑Fi 会话，机身的蓝牙广播/服务就不再是可靠链路，
+     * 所以这里不做「Wi‑Fi 期间继续扫蓝牙推 GPS」：连上 Wi‑Fi 就把蓝牙扫描停掉省电，
+     * GPS 推送只在蓝牙模式（设备页切到「蓝牙」）下进行。
+     */
     fun setWifiSessionActive(active: Boolean) {
         wifiSessionActive = active
         if (active && _phase.value != Phase.READY) stopScan()
@@ -419,6 +449,7 @@ class NikonBleGpsClient(private val context: Context) {
         val altitude = resolved?.first?.roundToInt() ?: 0
         _lastPayloadSatellites.value = satellites
         _lastPayloadAltitude.value = altitude
+        _lastAltitudeSource.value = resolved?.second ?: "无"
         val payload = NikonGeoPayload.build(location.latitude, location.longitude, altitude, satellites)
         log(
             "GEO 载荷 sat=$satellites alt=$altitude src=${resolved?.second ?: "无"} " +
@@ -431,15 +462,32 @@ class NikonBleGpsClient(private val context: Context) {
     /**
      * 取海拔。Android 的网络定位（NETWORK_PROVIDER）通常不带海拔，
      * 低精度模式下只开网络定位时相机会一直收到 0，机身上就看不到海拔。
-     * 这里按「当前 fix → 最近一次有效海拔 → 最近一次 GPS fix」兜底，
-     * 保证只要这台手机曾经拿到过 GPS 海拔，后续网络 fix 也能继续推送。
+     * 优先级：当前 fix 自带 → 气压计（用 GPS 海拔标定过）→ 最近一次有效 GPS 海拔 → 最近一次 GPS fix。
+     * 气压计只需相对稳定，标定一次海平面气压就能给出连续、抗漂移的高度。
      */
     private fun resolveAltitude(location: Location): Pair<Double, String>? {
         if (location.hasAltitude()) {
             lastGoodAltitude = location.altitude
+            lastGoodAltitudeAt = System.currentTimeMillis()
+            calibrateBarometer(location.altitude)
             return location.altitude to "本次"
         }
-        lastGoodAltitude?.let { return it to "缓存" }
+        val now = System.currentTimeMillis()
+        // 20 分钟内拿到的 GPS 海拔仍然可信，优先于气压计（气压计只做相对测量，会随天气漂）
+        lastGoodAltitude?.takeIf { now - lastGoodAltitudeAt <= 20 * 60 * 1000L }?.let {
+            return it to "缓存"
+        }
+        baroAltitudeM?.let { return it to "气压计" }
+        // 没有气压计的平板（这台 Tab 就没有 TYPE_PRESSURE）靠在线高程兜底：
+        // rememberFix 里已经按位置预取，这里只做本地判断，不在推送线程上发网络请求。
+        // 用户关闭在线高程时不使用缓存的在线值。
+        if (DoukPrefs.onlineElevationEnabled) {
+            remoteAltitude?.let { altitude ->
+                val d = FloatArray(1)
+                Location.distanceBetween(remoteLat, remoteLon, location.latitude, location.longitude, d)
+                if (d[0] <= 1500f) return altitude to "在线高程"
+            }
+        }
         val manager = gpsManager
             ?: (context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager)
         val gps = runCatching { manager?.getLastKnownLocation(LocationManager.GPS_PROVIDER) }.getOrNull()
@@ -448,10 +496,94 @@ class NikonBleGpsClient(private val context: Context) {
             // 30 分钟内的 GPS 海拔仍有参考价值；再久就当作失效，避免把旧位置的高度带进来
             if (age <= 30 * 60 * 1000L) {
                 lastGoodAltitude = gps.altitude
+                lastGoodAltitudeAt = System.currentTimeMillis()
+                calibrateBarometer(gps.altitude)
                 return gps.altitude to "GPS 最近"
             }
         }
         return null
+    }
+
+    /**
+     * 没有海拔的定位 fix 到来时，后台查一次该点的地面高程。
+     * 同一位置 1.5km 内直接复用，失败也只在日志里留痕，不打扰推送。
+     */
+    private fun prefetchElevation(location: Location) {
+        if (!DoukPrefs.onlineElevationEnabled) return
+        if (location.latitude == 0.0 && location.longitude == 0.0) return
+        val now = System.currentTimeMillis()
+        if (elevationJob?.isActive == true) return
+        if (now - lastElevationAttemptAt < 60_000L) return
+        remoteAltitude?.let { _ ->
+            val d = FloatArray(1)
+            Location.distanceBetween(remoteLat, remoteLon, location.latitude, location.longitude, d)
+            if (d[0] <= 1500f) return
+        }
+        lastElevationAttemptAt = now
+        val lat = location.latitude
+        val lon = location.longitude
+        elevationJob = scope.launch {
+            val altitude = ElevationLookup.fetch(context, lat, lon) ?: return@launch
+            remoteAltitude = altitude
+            remoteLat = lat
+            remoteLon = lon
+            log("在线高程：${altitude.roundToInt()} m（$lat, $lon），用于补海拔")
+        }
+    }
+
+    // ---------------------------------------------------------------- 气压计
+
+    /**
+     * 气压计读数不是绝对高度，需要「海平面气压」这个基准。
+     * 拿到一个带海拔的 GPS fix 时反推基准：p0 = p / (1 - h/44330)^5.255，
+     * 之后网络定位的每个 fix 都能用气压计算出高度（同一地点漂移只有几十厘米）。
+     */
+    private fun calibrateBarometer(gpsAltitude: Double) {
+        val pressure = baroPressureHpa ?: return
+        val ratio = 1.0 - gpsAltitude / 44330.0
+        if (ratio <= 0.05) return
+        val sea = (pressure / ratio.pow(1.0 / 5.255)).toFloat()
+        if (sea < 800f || sea > 1100f) return
+        seaLevelPressureHpa = sea
+        baroAltitudeM = gpsAltitude
+        log("气压计标定：海平面气压 ${"%.2f".format(sea)}hPa（GPS 海拔 ${gpsAltitude.roundToInt()}m）")
+    }
+
+    private fun startBarometer() {
+        if (baroListener != null) return
+        val manager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager ?: return
+        val sensor = manager.getDefaultSensor(Sensor.TYPE_PRESSURE) ?: run {
+            log("这台设备没有气压计，海拔只能靠 GPS")
+            return
+        }
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val hpa = event.values.firstOrNull() ?: return
+                if (hpa < 300f || hpa > 1100f) return
+                baroPressureHpa = hpa
+                val sea = seaLevelPressureHpa ?: return
+                if (sea <= 0f) return
+                baroAltitudeM = 44330.0 * (1.0 - (hpa / sea).toDouble().pow(1.0 / 5.255))
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+        val ok = manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        if (!ok) {
+            log("气压计注册失败")
+            return
+        }
+        barometer = sensor
+        baroListener = listener
+        log("气压计已接入：${sensor.name}，用于补海拔")
+    }
+
+    private fun stopBarometer() {
+        val manager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        baroListener?.let { manager?.unregisterListener(it) }
+        baroListener = null
+        barometer = null
+        baroAltitudeM = null
     }
 
     /**
@@ -477,6 +609,8 @@ class NikonBleGpsClient(private val context: Context) {
             java.util.Locale.US, "%.6f, %.6f%s",
             location.latitude, location.longitude, accuracyText
         )
+        // 网络定位通常不带海拔：后台按位置查一次地面高程，下一包 GEO 就能带上高度
+        if (!location.hasAltitude()) prefetchElevation(location)
     }
 
     private fun runLastKnownLocation(): Location? {
@@ -500,6 +634,8 @@ class NikonBleGpsClient(private val context: Context) {
             log("已连接/连接中，忽略重复扫描")
             return
         }
+        // 相机在「连接至智能设备」的 Wi‑Fi 会话里时，机身蓝牙不作为可靠链路，
+        // 不在这里继续扫；要推 GPS 请切到设备页的「蓝牙」模式。
         if (wifiSessionActive && !allowWifiOnce) {
             _statusDetail.value = "相机正通过 Wi‑Fi 连接，蓝牙扫描已暂停（省电）；要推 GPS 请先断开 Wi‑Fi"
             log("Wi‑Fi 会话占用中，跳过蓝牙扫描")
@@ -1083,8 +1219,15 @@ class NikonBleGpsClient(private val context: Context) {
     // ---------------------------------------------------------------- 握手
 
     private fun sendStage1() {
-        val savedDevice = prefs.getLong("device", 0L).takeIf { it != 0L }
-        val savedNonce = prefs.getLong("nonce", 0L).takeIf { it != 0L }
+        // 身份按机身分开存：一台手机连多台机身时，共用一个 device/nonce 会让
+        // 相机 B 把从 A 学到的身份当成「另一台设备」，表现为握手无回应。
+        // 旧版本的单份 device/nonce 继续作为兜底，升级后第一次连接不会要求重配对。
+        val keyPrefix = prefs.getString("name", "")?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { "id_${it.hashCode()}_" }.orEmpty()
+        val savedDevice = prefs.getLong(keyPrefix + "device", 0L).takeIf { it != 0L }
+            ?: prefs.getLong("device", 0L).takeIf { it != 0L }
+        val savedNonce = prefs.getLong(keyPrefix + "nonce", 0L).takeIf { it != 0L }
+            ?: prefs.getLong("nonce", 0L).takeIf { it != 0L }
         val identity = advertisedDeviceId ?: savedDevice
         // nsg 的规则：身份来源从已保存 device 切到相机广播 device 时，必须重新生成 nonce；
         // 继续复用旧 nonce 会让相机把 8 字节身份判成另一台设备，后续 GEO 被拒。
@@ -1092,7 +1235,12 @@ class NikonBleGpsClient(private val context: Context) {
         val message = handshake.createStage1(identity, nonce)
         stage1 = message
         // 记住本次身份：配对完成后的重连要复用 device/nonce，否则相机会当新设备重新握手
-        prefs.edit().putLong("device", message.device).putLong("nonce", message.nonce).apply()
+        prefs.edit()
+            .putLong(keyPrefix + "device", message.device)
+            .putLong(keyPrefix + "nonce", message.nonce)
+            .putLong("device", message.device)
+            .putLong("nonce", message.nonce)
+            .apply()
         step = 1
         log("发送阶段 1：device=0x%08x nonce=0x%08x（identity=${if (identity == advertisedDeviceId) "广播" else "已保存"}）"
             .format(message.device, message.nonce))
@@ -1561,6 +1709,8 @@ class NikonBleGpsClient(private val context: Context) {
         manager.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let { rememberFix(it) }
         gpsManager = manager
         gpsListener = listener
+        // 网络定位不带海拔时靠气压计补，相机端才看得到高度
+        startBarometer()
 
         gpsJob = scope.launch {
             // 给相机一个稳定窗口：READY 后马上写 GEO 经常被回 128，尤其在刚配对完/刚重连时；
@@ -1579,8 +1729,9 @@ class NikonBleGpsClient(private val context: Context) {
                         log("还没拿到卫星定位，等待中…")
                     }
                 }
-                // 设置页可能改了间隔，每轮都重新读一次，下一次推送即生效
-                delay(prefs.getInt("interval_min", _intervalMinutes.value).coerceAtLeast(1) * 60_000L)
+                // 设置页可能改了间隔，每轮都重新读一次，下一次推送即生效。
+                val minutes = prefs.getInt("interval_min", _intervalMinutes.value).coerceAtLeast(1)
+                delay(minutes * 60_000L)
             }
         }
     }
@@ -1627,6 +1778,7 @@ class NikonBleGpsClient(private val context: Context) {
 
     private fun stopGpsLoop() {
         stopTimeKeepAlive()
+        stopBarometer()
         gpsJob?.cancel()
         gpsJob = null
         readyAt = 0L

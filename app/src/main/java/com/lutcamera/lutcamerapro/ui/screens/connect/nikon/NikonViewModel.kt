@@ -97,6 +97,27 @@ class NikonViewModel : ViewModel() {
     /** 首次连接失败后自动换 socket 重连的次数（对齐 Z Console 的 RefreshingSocketRoute）。 */
     private var connectRetryCount = 0
 
+    /**
+     * 连接单飞标记。
+     * 自动扫描、看门狗、配对后快速重连三个触发器会在同一秒里各自调一次 connect()，
+     * 机身 15740 只有一个会话槽：两条 Init 抢同一个槽，结果是一条成功、另一条
+     * InitFail，随后机身把两条都记成异常连接，用户看到的就是「刚连上就断、再也连不上」。
+     */
+    private val connectAttempt = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var connectAttemptAt = 0L
+
+    private fun acquireConnectSlot(): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        // 一次正常连接最长会走完 90 秒配对预算；超过 3 分钟还挂着说明回调丢了
+        //（用户手动断开 / 协程被取消），放行新的尝试，避免永久卡死。
+        if (connectAttempt.get() && now - connectAttemptAt > 180_000L) connectAttempt.set(false)
+        if (!connectAttempt.compareAndSet(false, true)) return false
+        connectAttemptAt = now
+        return true
+    }
+
+    private fun releaseConnectSlot() { connectAttempt.set(false) }
+
     var capturedCount by mutableIntStateOf(0)
         private set
 
@@ -916,6 +937,11 @@ class NikonViewModel : ViewModel() {
             return
         }
         this.cameraIp = target
+        // 并发握手会把机身唯一的会话槽顶坏（见 connectAttempt 注释），这里做单飞。
+        if (!acquireConnectSlot()) {
+            addLog("已有连接正在建立，忽略这次重复请求")
+            return
+        }
         // AP 模式留空就用默认热点地址（不同机型 .1.1 / .1.10 的差异交给下面的预检处理）。
         if (this.cameraIp.isBlank() && wirelessMode == WirelessSubMode.AP_DIRECT) {
             this.cameraIp = NikonPtpClient.DEFAULT_NIKON_AP_IP
@@ -949,10 +975,14 @@ class NikonViewModel : ViewModel() {
                 }
             if (!ok) {
                 isConnecting = false
+                releaseConnectSlot()
                 return@launch
             }
             // 预检期间用户点了「取消连接」：不要反过来又去连。
-            if (!isConnecting) return@launch
+            if (!isConnecting) {
+                releaseConnectSlot()
+                return@launch
+            }
             isConnecting = false
             startSession()
         }
@@ -1039,6 +1069,7 @@ class NikonViewModel : ViewModel() {
         )
         if (cameraIp.isBlank()) {
             addLog("Please enter a valid camera IP!")
+            releaseConnectSlot()
             return
         }
 
@@ -1060,6 +1091,7 @@ class NikonViewModel : ViewModel() {
             mode = connectionMode,
             listener = object : NikonPtpClient.NikonEventListener {
                 override fun onConnected() {
+                    releaseConnectSlot()
                     connectRetryCount = 0
                     viewModelScope.launch(Dispatchers.Main) {
                         isConnecting = false
@@ -1091,6 +1123,7 @@ class NikonViewModel : ViewModel() {
                 }
 
                 override fun onDisconnected(reason: String) {
+                    releaseConnectSlot()
                     // 握手阶段就失败（还没连上过）才值得自动重连；已经连上又掉线不算。
                     val failedWhileConnecting = isConnecting && !isConnected
                     stopParamPolling()
@@ -1611,7 +1644,7 @@ class NikonViewModel : ViewModel() {
         prepareTransfer: Boolean = false,
         force: Boolean = false,
         startIdx: Int = 0,
-        count: Int = 4000
+        count: Int = 60
     ) {
         if (isLoadingStorageFiles || downloadingPhotoHandles.isNotEmpty()) return
         if (!isConnected) {
@@ -1875,7 +1908,9 @@ class NikonViewModel : ViewModel() {
         lockedBaseline = baseline
         viewModelScope.launch(Dispatchers.IO) {
             val base = runCatching {
-                ptpClient.fetchCameraPhotos(startIdx = 0, count = 4000, force = false)
+                // 只需「连接时已锁定」的分界，读最新一页就够；全表 4000 张会让机身
+                // 连发几千条 ObjectInfo，把后面的控制命令全挤到超时。
+                ptpClient.fetchCameraPhotos(startIdx = 0, count = 120, force = false)
                     .filter { it.isLocked }
                     .map { it.handle }
                     .toSet()

@@ -1220,10 +1220,14 @@ class DoukState(
                     delay(4_000)
                     continue
                 }
-                // 刚启动/刚掉线先快速重试：第一次 1.5 秒内就搜一遍，前几次每 4 秒一次；
-                // 持续找不到设备后放慢到 8 秒（仍保持「隔几秒自动搜」），不会一直 4 秒空转耗电。
-                val retryMs = if (failStreak <= 5) 4_000L
-                    else minOf(DoukPrefs.autoReconnectSeconds * 1000L, 8_000L)
+                // 刚掉线先快速补连一次（4 秒），但连续失败必须退避：
+                // 机身 15740 只有一个会话槽，前一轮的槽还没回收完就再握手，
+                // 只会得到 InitFail 1，而且越试越久。前两次 4 秒，之后 10 秒、20 秒。
+                val retryMs = when {
+                    failStreak <= 2 -> 4_000L
+                    failStreak <= 4 -> 10_000L
+                    else -> 20_000L
+                }
                 val wait = if (failStreak == 0) 1_500L else retryMs
                 withTimeoutOrNull(wait) { autoConnectSignal.receive() }
                 try {
@@ -2255,9 +2259,11 @@ class DoukState(
     // ===== 图库：相机内照片（PTP 读取） =====
     val cameraPhotos: List<CameraStorageFile> get() = vm.cameraStoragePhotos
 
-    // 枚举本身要遍历所有目录，成本与 count 无关；一次读满整表，图库才不会「显示不全」。
-    fun loadCameraPhotos(count: Int = 4000) =
-        vm.loadStoragePhotos(prepareTransfer = true, count = maxOf(count, 4000))
+    // 枚举目录很便宜（只回句柄），真正贵的是逐张读 ObjectInfo：一次 4000 张等于连发
+    // 4000 条 PTP 事务，机身队列被塞满后属性轮询全部超时，整场会话被判掉线。
+    // 所以按页读，下拉再扩大窗口。
+    fun loadCameraPhotos(count: Int = DoukPrefs.galleryPageSize) =
+        vm.loadStoragePhotos(prepareTransfer = true, count = count.coerceAtMost(600))
     /** 用户主动刷新时才强制重枚举；进图库复用会话内缓存 */
     fun refreshCameraPhotos() = vm.loadStoragePhotos(prepareTransfer = true, force = true)
     val cameraPhotosHasMore: Boolean get() = vm.storageHasMore

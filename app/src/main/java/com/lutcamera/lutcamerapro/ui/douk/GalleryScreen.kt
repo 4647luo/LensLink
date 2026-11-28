@@ -942,9 +942,9 @@ private fun CameraGallery(
         }
         // 连接后预加载已经填过列表时不要重复整表重读，否则打开图库会闪一下
         if (!usbMode && state.isConnected && state.cameraPhotos.isEmpty()) {
-            // 「全部」页直接读整表，避免只显示最新一屏
-            val count = if (DoukPrefs.galleryLoadAll || albumFilter == null) 4000 else DoukPrefs.galleryPageSize
-            state.loadCameraPhotos(count = count)
+            // 只读最新一页：逐张读 ObjectInfo 才是贵的那一步，一次 4000 张会把机身
+            // PTP 队列塞满（属性轮询全部超时 → 整场会话被判掉线）。下拉再续。
+            state.loadCameraPhotos(count = DoukPrefs.galleryPageSize)
         }
     }
 
@@ -1003,27 +1003,18 @@ private fun CameraGallery(
         return
     }
 
-    // 没有指定相册（也就是「全部」）时直接把机身整表读完再显示：
-    // 以前只给前 60 张，用户以为相机里照片丢了。
-    val loadAll = DoukPrefs.galleryLoadAll || albumFilter == null
+    // 「全部」页默认也分页显示：整表逐张读 ObjectInfo 会把机身堵死，
+    // 只有用户在设置里明确打开「一次性加载全部」才自动续读到底。
+    val loadAll = DoukPrefs.galleryLoadAll
     val loaded = state.cameraPhotos
-    // 开启「加载全部」后，如果后台只预读了第一屏，这里继续把整表补上
     LaunchedEffect(loadAll, state.isConnected, loaded.size) {
         if (loadAll && state.isConnected && state.cameraPhotosHasMore && !state.vm.isLoadingStorageFiles) {
-            state.loadCameraPhotos(count = 4000)
+            state.loadCameraPhotos(count = state.cameraPhotos.size + DoukPrefs.galleryPageSize)
         }
     }
-    // 「全部」页补读：连接后后台只预读了第一屏时，这里把整表补满（最多重试 3 次），
-    // 免得用户看到「已读到 796 个文件，返回区间 [0 - 40]」却只有 40 张。
+    // 「全部」页的下拉续读：每页只多读一页，不再整表重扫。
     LaunchedEffect(albumFilter, state.isConnected, state.cameraPhotosHasMore) {
         if (usbMode || albumFilter != null || !state.isConnected) return@LaunchedEffect
-        repeat(3) {
-            if (!state.cameraPhotosHasMore) return@LaunchedEffect
-            if (!state.vm.isLoadingStorageFiles) {
-                state.loadCameraPhotos(count = 4000)
-            }
-            delay(900)
-        }
     }
 
     val displayed = if (loadAll) visibleItems else visibleItems.take(shownCount)
@@ -1041,9 +1032,9 @@ private fun CameraGallery(
         hasMore = hasMore,
         onLoadMore = {
             if (loadAll) {
-                state.loadCameraPhotos(count = 4000)
+                state.loadCameraPhotos(count = state.cameraPhotos.size + DoukPrefs.galleryPageSize)
             } else {
-                shownCount = (shownCount + pageSize).coerceAtMost(4000)
+                shownCount = (shownCount + pageSize).coerceAtMost(600)
                 if (state.cameraPhotosHasMore && !state.vm.isLoadingStorageFiles) {
                     state.loadCameraPhotos(count = shownCount)
                 }

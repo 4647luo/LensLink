@@ -49,8 +49,8 @@ android {
         minSdk = 29
         // 回退到 34
         targetSdk = 34
-        versionCode = 141
-        versionName = "1.2.1"
+        versionCode = 144
+        versionName = "1.3.0"
 
         // 手机端只打包 arm64；LibRaw 静态库按 ABI 单独编译，减少构建时间和包体。
         ndk {

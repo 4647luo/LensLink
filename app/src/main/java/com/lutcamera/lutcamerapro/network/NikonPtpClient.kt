@@ -50,7 +50,28 @@ class NikonPtpClient {
         private const val EVENT_CONNECT_TIMEOUT_MS = 2_500
         private const val HANDSHAKE_SO_TIMEOUT_MS = 4_000
         /** 单条命令的默认 socket 超时，也是 probeCommandAlive 结束后恢复的值。 */
-        private const val DEFAULT_OP_TIMEOUT_MS = 12_000L
+        private const val DEFAULT_OP_TIMEOUT_MS = 30_000L
+        /**
+         * 查询类命令（读属性描述 / 枚举对象 / 取缩略图）的超时。
+         * 机身热点模式下这几条要遍历存储卡，照片多的时候一条能跑十几秒；
+         * 给 12 秒只会得到一片「Read timed out」，用户看到的就是「连上了但图库全不能用」。
+         */
+        private const val QUERY_OP_TIMEOUT_MS = 45_000L
+        /**
+         * 这些操作超时只让本次失败，绝不当成掉线：
+         * 相机正在写卡或遍历存储，慢是常态，掐掉会话反而把后续所有功能一起废掉。
+         */
+        private val SOFT_TIMEOUT_OPS = setOf(
+            0x1004, // GetStorageIDs
+            0x1005, // GetStorageInfo
+            0x1006, // GetNumObjects
+            0x1007, // GetObjectHandles
+            0x1008, // GetObjectInfo
+            0x100a, // GetThumb
+            0x1014, // GetDevicePropDesc
+            0x1015, // GetDevicePropValue
+            0x90c4  // 尼康大缩略图
+        )
         /**
          * 命令通道 TCP 建链成功后、发 Init_Command_Request 之前必须停一下（毫秒）。
          * 机身热点侧的 accept 队列要等 TCP 三次握手稳定后才把这条连接交给 PTP/IP 服务线程，
@@ -108,7 +129,17 @@ class NikonPtpClient {
         @Volatile var restricted = false
         /** 机身是否公布 0x952B（PC 主机注册预备）。只有「连接至 PC」向导态才为 true。 */
         @Volatile var hostRegistration = false
-        fun close() { photos.close(); trace?.note("$label CLOSE sockets"); runCatching { command.close() }; runCatching { events.close() } }
+        fun close() {
+            photos.close()
+            trace?.note("$label CLOSE sockets")
+            // 先 shutdown 再 close：socket 里还有未读数据时直接 close() 会发 RST，
+            // 机身把这次会话记成「异常中断」留在槽里，紧接着的重连就吃 Init_Fail 1/2。
+            // 发 FIN 让它按正常断链收尾，会话槽回收得快得多。
+            runCatching { command.shutdownOutput() }
+            runCatching { command.shutdownInput() }
+            runCatching { command.close() }
+            runCatching { events.close() }
+        }
     }
     private class CameraResponse(val code: Int) : IOException("相机返回 0x${code.toString(16)}")
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -634,6 +665,11 @@ class NikonPtpClient {
         // 长连接：相机进休眠/路由器 NAT 超时后，没有 TCP keepalive 的半开连接会「看着在线、
         // 发出去没回」，用户得手动断开重连。开启探测让系统较早收回死连接，交给重连逻辑处理。
         runCatching { socket.keepAlive = true }
+        // 大包接收缓冲：取景 JPEG 与图库原图都是连续大包，系统默认约 64KB 窗口会让
+        // 机身发一段就停下来等窗口更新，在 AP 直连（本身吞吐就差）上表现为
+        // 「单张图取十几秒」甚至命令超时。
+        runCatching { socket.receiveBufferSize = 2 shl 20 }
+            .onFailure { DoukLog.w("NikonPtp", "SO_RCVBUF_FAIL", "error" to (it.message ?: "")) }
         return socket
     }
 
@@ -743,8 +779,9 @@ class NikonPtpClient {
                     // 早点失败比让用户干等 12 秒更接近官方 App 的反馈速度。
                     val timeout = when (code) {
                         0x9203 -> 4000L
-                        0x1009 -> 90000L
+                        0x1009 -> 90_000L
                         0x1002, 0x1001 -> 6_000L
+                        in SOFT_TIMEOUT_OPS -> QUERY_OP_TIMEOUT_MS
                         else -> DEFAULT_OP_TIMEOUT_MS
                     }
                     val deadline = System.nanoTime() + timeout * 1_000_000
@@ -770,7 +807,18 @@ class NikonPtpClient {
                     val timedOut = e is SocketTimeoutException ||
                         (e.message?.contains("timed out", true) == true) ||
                         (e.message?.contains("超时") == true)
-                    val streakLimit = if (c.restricted) 5 else 3
+                    // 查询类命令（枚举存储 / 读属性 / 取缩略图）超时只是「这一条慢」，
+                    // 绝不能因此判掉线：机身正在遍历存储卡时，后面排队的控制命令也会跟着
+                    // 一起超时，旧逻辑就这样把整场会话拆掉，用户看到的是「刚连上就断开、
+                    // 图库和控制全不能用」。
+                    if (timedOut && code in SOFT_TIMEOUT_OPS) {
+                        c.trace?.note("${c.label} OP_TIMEOUT_QUERY opcode=0x${code.toString(16)}")
+                        throw IOException("相机响应超时（会话保留，可重试）：${e.message}")
+                    }
+                    // 会话已建立时，超时只当「相机这一刻没回」，不当掉线：
+                    // 机身遍历存储卡 / 写卡时所有命令都会排队变慢，只有真正 EOF / RST
+                    // 才说明链路断了。连续 10 次真的一点不回（约几分钟）才按掉线处理。
+                    val streakLimit = if (_isConnected.value) 10 else 5
                     if (timedOut && ++ioTimeoutStreak < streakLimit) {
                         c.trace?.note("${c.label} OP_TIMEOUT_SOFT streak=$ioTimeoutStreak opcode=0x${code.toString(16)}")
                         throw IOException("相机响应超时（会话保留，可重试）：${e.message}")
@@ -1789,6 +1837,9 @@ class NikonPtpClient {
     suspend fun getDevicePropDesc(propCode: Short): ByteArray? = withContext(Dispatchers.IO) {
         if (!_isConnected.value) return@withContext null
         try {
+            // 机身热点侧是单线程事务循环：连续几十条属性描述会把队列塞满，
+            // 后面排队的控制命令跟着超时。每条之间留 40ms 让它收尾。
+            delay(40)
             val resp = sendOperation(0x1014.toShort(), intArrayOf(propCode.toInt() and 0xFFFF))
             if (resp != null && resp.isNotEmpty()) {
                 return@withContext resp
@@ -2132,28 +2183,38 @@ class NikonPtpClient {
             }
 
             suspend fun walk(handles: List<Int>, fallbackName: String?, depth: Int) {
+                if (handles.isEmpty() || depth > 3) return
+                // 内存卡是「DCIM / 100NIKON / 照片」这种一层一个类型：同一层要么全是文件夹，
+                // 要么全是照片。只探首个条目判断这一层的类型，就既不会把文件夹当照片、
+                // 漏掉里面的照片，也不会对上千张照片逐条发 0x1008 把机身队列塞满。
+                val first = handles.firstOrNull() ?: return
+                val firstPacket = infoOf(first)
+                val firstIsDir = firstPacket != null && firstPacket.size >= 6 &&
+                    ByteBuffer.wrap(firstPacket).order(ByteOrder.LITTLE_ENDIAN).getShort(4) == 0x3001.toShort()
+                if (!firstIsDir) {
+                    rootFiles.addAll(handles)
+                    return
+                }
                 for (h in handles) {
                     if (!visited.add(h)) continue
-                    val packet = infoOf(h) ?: continue
-                    if (packet.size < 53) continue
+                    val packet = if (h == first) firstPacket else infoOf(h)
+                    if (packet == null || packet.size < 53) continue
                     val fmt = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN).getShort(4)
-                    if (fmt == 0x3001.toShort()) {
-                        val dirName = runCatching {
-                            val strLen = packet[52].toInt() and 0xFF
-                            if (strLen > 0 && 53 + strLen * 2 <= packet.size)
-                                String(packet, 53, (strLen - 1) * 2, Charsets.UTF_16LE).trim()
-                            else ""
-                        }.getOrNull()?.takeIf { it.isNotBlank() } ?: fallbackName ?: "机身存储"
-                        DoukLog.i("Storage", "FOLDER_OPEN", "handle" to h, "depth" to depth, "dir" to dirName)
-                        dirs.add(h to dirName)
-                        if (depth < 6) {
-                            val children = ArrayList<Int>()
-                            for (sid in storageList) children.addAll(listHandles(sid, h))
-                            walk(children, dirName, depth + 1)
-                        }
-                    } else {
+                    if (fmt != 0x3001.toShort()) {
                         rootFiles.add(h)
+                        continue
                     }
+                    val dirName = runCatching {
+                        val strLen = packet[52].toInt() and 0xFF
+                        if (strLen > 0 && 53 + strLen * 2 <= packet.size)
+                            String(packet, 53, (strLen - 1) * 2, Charsets.UTF_16LE).trim()
+                        else ""
+                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: fallbackName ?: "机身存储"
+                    DoukLog.i("Storage", "FOLDER_OPEN", "handle" to h, "depth" to depth, "dir" to dirName)
+                    dirs.add(h to dirName)
+                    val children = ArrayList<Int>()
+                    for (sid in storageList) children.addAll(listHandles(sid, h))
+                    walk(children, dirName, depth + 1)
                 }
             }
             walk(rootHandles, null, 0)
@@ -2177,7 +2238,11 @@ class NikonPtpClient {
             val endIdx = minOf(validStart + count, total)
             hasMore = endIdx < total
 
+            var infoCount = 0
             ordered.subList(validStart, endIdx).forEach { handle ->
+                // 每 8 张歇 60ms：机身热点侧一次只处理一条事务，全速连发反而让整页更慢，
+                // 还会把后续控制命令挤到超时。
+                if (++infoCount % 8 == 0) delay(60)
                 val infoPacket = infoOf(handle) ?: return@forEach
                 if (infoPacket.size < 53) return@forEach
                 val infoBuf = ByteBuffer.wrap(infoPacket).order(ByteOrder.LITTLE_ENDIAN)
